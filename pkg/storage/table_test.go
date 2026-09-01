@@ -257,12 +257,63 @@ func TestSelectByIndexUsesPointReadsAfterBuild(t *testing.T) {
 		t.Fatalf("initial indexed select: len=%d err=%v", len(rows), err)
 	}
 	opensBefore, _, _ := kv.scanStats()
+	_, multiGetsBefore := kv.readStats()
 	if rows, err := tables.SelectByIndex("items", "idx_kind", "k1"); err != nil || len(rows) != 10 {
 		t.Fatalf("cached indexed select: len=%d err=%v", len(rows), err)
 	}
 	opensAfter, _, _ := kv.scanStats()
+	_, multiGetsAfter := kv.readStats()
 	if opensAfter != opensBefore {
 		t.Fatalf("indexed select opened %d table scans after index build", opensAfter-opensBefore)
+	}
+	if multiGetsAfter-multiGetsBefore != 1 {
+		t.Fatalf("indexed select issued %d multi-get requests, want 1", multiGetsAfter-multiGetsBefore)
+	}
+}
+
+func TestPrimaryKeyMutationsDoNotScan(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+	pool := newTestKVPool(kv, 4, 5*time.Second)
+	defer pool.Close()
+	schemas := NewSchemaManager(pool, "testdb")
+	tables := NewTableManager(pool, schemas, "testdb")
+	if err := schemas.CreateTable(&Schema{
+		Name: "items",
+		Columns: []Column{
+			{Name: "id", Type: "TEXT", PrimaryKey: true},
+			{Name: "value", Type: "INTEGER"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if err := tables.Insert("items", Row{"id": fmt.Sprintf("item-%d", i), "value": int64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	opensBefore, _, _ := kv.scanStats()
+	oldRow, updated, err := tables.UpdateByPK("items", "item-10", func(Row) (Row, error) {
+		return Row{"value": int64(99)}, nil
+	})
+	if err != nil || !updated || oldRow["value"] != int64(10) {
+		t.Fatalf("point update: updated=%v old=%v err=%v", updated, oldRow, err)
+	}
+	deletedRow, deleted, err := tables.DeleteByPK("items", "item-11")
+	if err != nil || !deleted || deletedRow["value"] != int64(11) {
+		t.Fatalf("point delete: deleted=%v old=%v err=%v", deleted, deletedRow, err)
+	}
+	opensAfter, _, _ := kv.scanStats()
+	if opensAfter != opensBefore {
+		t.Fatalf("primary-key mutations opened %d scans", opensAfter-opensBefore)
+	}
+	row, err := tables.GetByPK("items", "item-10")
+	if err != nil || row["value"] != int64(99) {
+		t.Fatalf("updated row=%v err=%v", row, err)
+	}
+	if _, err := tables.GetByPK("items", "item-11"); err != ErrKeyNotFound {
+		t.Fatalf("deleted row error=%v, want ErrKeyNotFound", err)
 	}
 }
 

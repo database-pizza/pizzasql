@@ -29,6 +29,8 @@ type testKVServer struct {
 	scanNexts    int
 	scanCloses   int
 	keyOnlyOpens int
+	gets         int
+	multiGets    int
 	closers      []net.Conn
 }
 
@@ -127,6 +129,12 @@ func (s *testKVServer) keyOnlyOpenCount() int {
 	return s.keyOnlyOpens
 }
 
+func (s *testKVServer) readStats() (gets, multiGets int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gets, s.multiGets
+}
+
 func (s *testKVServer) handle(conn net.Conn) {
 	defer conn.Close()
 
@@ -158,6 +166,7 @@ func (s *testKVServer) execute(opcode uint16, payload []byte, scans map[uint64]*
 			return errorBody("InvalidPayload")
 		}
 		s.mu.Lock()
+		s.gets++
 		value, found := s.data[string(key)]
 		lsn := s.lsns[string(key)]
 		s.mu.Unlock()
@@ -227,6 +236,7 @@ func (s *testKVServer) execute(opcode uint16, payload []byte, scans map[uint64]*
 		putU16(body[0:2], statusOK)
 		putU32(body[2:6], uint32(len(keys)))
 		s.mu.Lock()
+		s.multiGets++
 		for _, key := range keys {
 			value, found := s.data[string(key)]
 			if !found {
@@ -650,5 +660,47 @@ func TestIndexIsDerivedFromRowsAfterRestart(t *testing.T) {
 	}
 	if got := kv.writeCount(":idx:"); got != 0 {
 		t.Fatalf("expected no durable index entry writes, got %d", got)
+	}
+}
+
+func TestListTableIndexesCachesMetadata(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+	pool := newTestKVPool(kv, 2, 5*time.Second)
+	defer pool.Close()
+
+	schemas := NewSchemaManager(pool, "testdb")
+	if err := schemas.CreateTable(&Schema{
+		Name: "items",
+		Columns: []Column{
+			{Name: "id", Type: "INTEGER", PrimaryKey: true},
+			{Name: "kind", Type: "TEXT"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := schemas.CreateIndex(&Index{
+		Name: "idx_items_kind", Table: "items", Columns: []IndexColumn{{Name: "kind"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := NewSchemaManager(pool, "testdb")
+	getsBefore, _ := kv.readStats()
+	if indexes, err := restarted.ListTableIndexes("items"); err != nil || len(indexes) != 1 {
+		t.Fatalf("first list: indexes=%v err=%v", indexes, err)
+	}
+	getsAfterFirst, _ := kv.readStats()
+	if getsAfterFirst <= getsBefore {
+		t.Fatal("first index metadata lookup did not read durable metadata")
+	}
+	for i := 0; i < 10; i++ {
+		if indexes, err := restarted.ListTableIndexes("items"); err != nil || len(indexes) != 1 {
+			t.Fatalf("cached list %d: indexes=%v err=%v", i, indexes, err)
+		}
+	}
+	getsAfterCached, _ := kv.readStats()
+	if getsAfterCached != getsAfterFirst {
+		t.Fatalf("cached index metadata issued %d extra reads", getsAfterCached-getsAfterFirst)
 	}
 }

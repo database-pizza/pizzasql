@@ -826,6 +826,57 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 	return count, nil
 }
 
+// UpdateByPK updates one row without scanning the table.
+func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
+	tl := m.tableLock(table)
+	tl.Lock()
+	defer tl.Unlock()
+
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return nil, false, err
+	}
+	row, err := m.getByPKUnlocked(table, pk)
+	if err == ErrKeyNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	oldRow := cloneRow(row)
+	m.updateIndexesForRow(table, oldRow, false)
+	updates, err := updateFn(row)
+	if err != nil {
+		m.updateIndexesForRow(table, oldRow, true)
+		return nil, false, err
+	}
+	for name, value := range updates {
+		for _, column := range schema.Columns {
+			if strings.EqualFold(name, column.Name) {
+				row[column.Name] = value
+				break
+			}
+		}
+	}
+
+	data, err := encodeRow(row)
+	if err != nil {
+		m.updateIndexesForRow(table, oldRow, true)
+		return nil, false, err
+	}
+	err = m.pool.WithClient(func(client *KVClient) error {
+		_, err := client.Put([]byte(m.dataKey(table, pk)), data)
+		return err
+	})
+	if err != nil {
+		m.updateIndexesForRow(table, oldRow, true)
+		return nil, false, err
+	}
+	m.updateIndexesForRow(table, row, true)
+	return oldRow, true, nil
+}
+
 // Delete deletes rows matching the filter.
 func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) {
 	// Get all rows
@@ -867,6 +918,37 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 	return count, nil
 }
 
+// DeleteByPK deletes one row without scanning the table.
+func (m *TableManager) DeleteByPK(table, pk string) (Row, bool, error) {
+	tl := m.tableLock(table)
+	tl.Lock()
+	defer tl.Unlock()
+
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return nil, false, err
+	}
+	row, err := m.getByPKUnlocked(table, pk)
+	if err == ErrKeyNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	m.updateIndexesForRow(table, row, false)
+	err = m.pool.WithClient(func(client *KVClient) error {
+		_, err := client.Del([]byte(m.dataKey(table, pk)))
+		return err
+	})
+	if err != nil {
+		m.updateIndexesForRow(table, row, true)
+		return nil, false, err
+	}
+	m.incrCount(table, schema.CreatedAt, -1)
+	return row, true, nil
+}
+
 // GetByPK retrieves a row by primary key.
 func (m *TableManager) GetByPK(table string, pk string) (Row, error) {
 	tl := m.tableLock(table)
@@ -876,7 +958,10 @@ func (m *TableManager) GetByPK(table string, pk string) (Row, error) {
 	if !m.schema.TableExists(table) {
 		return nil, fmt.Errorf("table not found: %s", table)
 	}
+	return m.getByPKUnlocked(table, pk)
+}
 
+func (m *TableManager) getByPKUnlocked(table, pk string) (Row, error) {
 	key := m.dataKey(table, pk)
 	var value []byte
 
@@ -889,9 +974,6 @@ func (m *TableManager) GetByPK(table string, pk string) (Row, error) {
 		return nil
 	})
 	if err != nil {
-		if err == ErrKeyNotFound {
-			return nil, fmt.Errorf("row not found: %s", pk)
-		}
 		return nil, err
 	}
 
@@ -1274,13 +1356,18 @@ func (m *TableManager) SelectByIndex(table, indexName string, colValue interface
 
 	rows := make([]Row, 0, len(primaryKeys))
 	err = m.pool.WithClient(func(client *KVClient) error {
-		for _, primaryKey := range primaryKeys {
-			result, err := client.Get([]byte(m.dataKey(table, primaryKey)))
-			if err == ErrKeyNotFound {
+		keys := make([][]byte, len(primaryKeys))
+		for i, primaryKey := range primaryKeys {
+			keys[i] = []byte(m.dataKey(table, primaryKey))
+		}
+		results, err := client.MultiGet(keys)
+		if err != nil {
+			return err
+		}
+		for i, result := range results {
+			if !result.Found {
+				primaryKey := primaryKeys[i]
 				return fmt.Errorf("index %s references missing primary key %s", indexName, primaryKey)
-			}
-			if err != nil {
-				return err
 			}
 			row, err := decodeRow(result.Value)
 			if err != nil {

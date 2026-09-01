@@ -401,20 +401,32 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		// Check if we can use an index
 		colName, colValue, isEquality := e.extractIndexableCondition(stmt.Where)
 		if isEquality {
-			// Look for an index on this column
-			indexes, _ := e.schema.ListTableIndexes(tableName)
-			for _, idx := range indexes {
-				if len(idx.Columns) == 1 && strings.EqualFold(idx.Columns[0].Name, colName) {
-					// Use this index
-					rows, err = e.table.SelectByIndex(tableName, idx.Name, colValue)
-					if err == nil {
-						usedIndex = true
-						// Normalize rows from index
-						for i := range rows {
-							normalizeRowBySchema(rows[i], schema)
+			if strings.EqualFold(schema.PrimaryKey, colName) {
+				row, getErr := e.table.GetByPK(tableName, fmt.Sprintf("%v", colValue))
+				if getErr == nil {
+					normalizeRowBySchema(row, schema)
+					rows = []storage.Row{row}
+					usedIndex = true
+				} else if getErr == storage.ErrKeyNotFound {
+					rows = []storage.Row{}
+					usedIndex = true
+				} else {
+					return nil, getErr
+				}
+			} else {
+				// Look for an index on this column
+				indexes, _ := e.schema.ListTableIndexes(tableName)
+				for _, idx := range indexes {
+					if len(idx.Columns) == 1 && strings.EqualFold(idx.Columns[0].Name, colName) {
+						rows, err = e.table.SelectByIndex(tableName, idx.Name, colValue)
+						if err == nil {
+							usedIndex = true
+							for i := range rows {
+								normalizeRowBySchema(rows[i], schema)
+							}
 						}
+						break
 					}
-					break
 				}
 			}
 		}
@@ -2324,6 +2336,32 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		}
 		return updates, nil
 	}
+	if stmt.Where != nil {
+		column, value, equality := e.extractIndexableCondition(stmt.Where)
+		updatesPrimaryKey := false
+		for _, assignment := range stmt.Set {
+			if strings.EqualFold(assignment.Column, schema.PrimaryKey) {
+				updatesPrimaryKey = true
+				break
+			}
+		}
+		if equality && strings.EqualFold(column, schema.PrimaryKey) && !updatesPrimaryKey {
+			oldRow, updated, err := e.table.UpdateByPK(tableName, fmt.Sprintf("%v", value), updateFn)
+			if err != nil {
+				return nil, err
+			}
+			count := 0
+			if updated {
+				count = 1
+				if e.inTransaction {
+					e.txLog = append(e.txLog, txLogEntry{operation: "UPDATE", table: tableName, key: fmt.Sprintf("%v", oldRow[schema.PrimaryKey]), oldData: oldRow})
+				}
+			}
+			result := NewResult("UPDATE")
+			result.SetRowCount(count)
+			return result, nil
+		}
+	}
 
 	var oldRows []storage.Row
 	if e.inTransaction {
@@ -2362,6 +2400,25 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 				return false
 			}
 			return toBool(val)
+		}
+	}
+	if stmt.Where != nil {
+		column, value, equality := e.extractIndexableCondition(stmt.Where)
+		if equality && strings.EqualFold(column, schema.PrimaryKey) {
+			oldRow, deleted, err := e.table.DeleteByPK(tableName, fmt.Sprintf("%v", value))
+			if err != nil {
+				return nil, err
+			}
+			count := 0
+			if deleted {
+				count = 1
+				if e.inTransaction {
+					e.txLog = append(e.txLog, txLogEntry{operation: "DELETE", table: tableName, key: fmt.Sprintf("%v", oldRow[schema.PrimaryKey]), oldData: oldRow})
+				}
+			}
+			result := NewResult("DELETE")
+			result.SetRowCount(count)
+			return result, nil
 		}
 	}
 

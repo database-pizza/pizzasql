@@ -50,6 +50,9 @@ type SchemaManager struct {
 	pool             *KVPool
 	database         string
 	cache            map[string]*Schema
+	indexCache       map[string]*Index
+	indexListCache   []string
+	indexListCached  bool
 	rowIDInitialized map[string]bool
 	version          uint64
 	mu               sync.RWMutex
@@ -77,6 +80,7 @@ func NewSchemaManager(pool *KVPool, database string) *SchemaManager {
 		pool:             pool,
 		database:         database,
 		cache:            make(map[string]*Schema),
+		indexCache:       make(map[string]*Index),
 		rowIDInitialized: make(map[string]bool),
 		tableLocks:       make(map[string]*sync.RWMutex),
 	}
@@ -300,6 +304,15 @@ func cloneSchema(schema *Schema) *Schema {
 	}
 	cloned := *schema
 	cloned.Columns = append([]Column(nil), schema.Columns...)
+	return &cloned
+}
+
+func cloneIndex(index *Index) *Index {
+	if index == nil {
+		return nil
+	}
+	cloned := *index
+	cloned.Columns = append([]IndexColumn(nil), index.Columns...)
 	return &cloned
 }
 
@@ -694,6 +707,7 @@ func (m *SchemaManager) CreateIndex(index *Index) error {
 	if err := m.addToIndexList(index.Name); err != nil {
 		return err
 	}
+	m.indexCache[strings.ToLower(index.Name)] = cloneIndex(index)
 	m.bumpVersionLocked()
 	return nil
 }
@@ -714,6 +728,7 @@ func (m *SchemaManager) DropIndex(name string) error {
 	if err := m.removeFromIndexList(name); err != nil {
 		return err
 	}
+	delete(m.indexCache, strings.ToLower(name))
 	m.bumpVersionLocked()
 	return nil
 }
@@ -722,6 +737,9 @@ func (m *SchemaManager) DropIndex(name string) error {
 func (m *SchemaManager) IndexExists(name string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if _, ok := m.indexCache[strings.ToLower(name)]; ok {
+		return true
+	}
 
 	key := m.indexKey(name)
 	err := m.pool.WithClient(func(c *KVClient) error {
@@ -733,8 +751,12 @@ func (m *SchemaManager) IndexExists(name string) bool {
 
 // GetIndex retrieves an index by name.
 func (m *SchemaManager) GetIndex(name string) (*Index, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cacheKey := strings.ToLower(name)
+	if index, ok := m.indexCache[cacheKey]; ok {
+		return cloneIndex(index), nil
+	}
 
 	key := m.indexKey(name)
 	var data string
@@ -752,13 +774,17 @@ func (m *SchemaManager) GetIndex(name string) (*Index, error) {
 		return nil, fmt.Errorf("failed to parse index: %w", err)
 	}
 
-	return &index, nil
+	m.indexCache[cacheKey] = &index
+	return cloneIndex(&index), nil
 }
 
 // ListIndexes returns all index names.
 func (m *SchemaManager) ListIndexes() ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.indexListCached {
+		return append([]string(nil), m.indexListCache...), nil
+	}
 
 	key := m.indexListKey()
 	var data string
@@ -767,8 +793,13 @@ func (m *SchemaManager) ListIndexes() ([]string, error) {
 		data, err = c.Read(key)
 		return err
 	})
-	if err != nil {
+	if err == ErrKeyNotFound {
+		m.indexListCache = nil
+		m.indexListCached = true
 		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	var indexes []string
@@ -776,6 +807,8 @@ func (m *SchemaManager) ListIndexes() ([]string, error) {
 		return []string{}, nil
 	}
 
+	m.indexListCache = append([]string(nil), indexes...)
+	m.indexListCached = true
 	return indexes, nil
 }
 
@@ -818,9 +851,14 @@ func (m *SchemaManager) addToIndexList(name string) error {
 	indexes = append(indexes, name)
 	newData, _ := json.Marshal(indexes)
 
-	return m.pool.WithClient(func(c *KVClient) error {
+	err = m.pool.WithClient(func(c *KVClient) error {
 		return c.Write(key, string(newData))
 	})
+	if err == nil {
+		m.indexListCache = append([]string(nil), indexes...)
+		m.indexListCached = true
+	}
+	return err
 }
 
 // removeFromIndexList removes an index name from the list.
@@ -847,9 +885,14 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 	}
 
 	newData, _ := json.Marshal(newIndexes)
-	return m.pool.WithClient(func(c *KVClient) error {
+	err = m.pool.WithClient(func(c *KVClient) error {
 		return c.Write(key, string(newData))
 	})
+	if err == nil {
+		m.indexListCache = append([]string(nil), newIndexes...)
+		m.indexListCached = true
+	}
+	return err
 }
 
 // AddColumn adds a new column to a table.
