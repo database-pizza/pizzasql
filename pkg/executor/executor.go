@@ -2480,13 +2480,11 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 			e.schema.DropIndex(idx.Name)
 		}
 
-		// Then, truncate all data rows
-		e.table.Truncate(tableRef.Name)
-
-		// Finally, drop the table schema
+		// DropTable removes durable rows and schema state together.
 		if err := e.schema.DropTable(tableRef.Name); err != nil {
 			return nil, err
 		}
+		e.table.InvalidateCache(tableRef.Name)
 
 	}
 	if err := e.SyncCatalog(); err != nil {
@@ -2745,6 +2743,8 @@ func (e *Executor) executeAlterTableRename(table string, action *parser.RenameTa
 	if err := e.schema.RenameTable(table, action.NewName); err != nil {
 		return nil, err
 	}
+	e.table.InvalidateCache(table)
+	e.table.InvalidateCache(action.NewName)
 
 	// Update catalog
 	e.SyncCatalog()

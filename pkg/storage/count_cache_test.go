@@ -126,9 +126,8 @@ func TestCountFastDerivedAfterRestart(t *testing.T) {
 	}
 }
 
-// TestIncrementalCacheAndIndexMaintenance verifies that writes keep the row
-// cache and already-built in-memory indexes coherent without full-table cache
-// invalidation.
+// TestIncrementalCacheAndIndexMaintenance verifies that writes keep
+// already-built in-memory indexes coherent without full-table invalidation.
 func TestIncrementalCacheAndIndexMaintenance(t *testing.T) {
 	kv := newTestKVServer(t)
 	defer kv.close()
@@ -168,7 +167,7 @@ func TestIncrementalCacheAndIndexMaintenance(t *testing.T) {
 		t.Fatalf("insert 2: %v", err)
 	}
 
-	// Load the row cache and the index.
+	// Build the in-memory index (Select only streams rows).
 	all, err := tables.Select("users", nil)
 	if err != nil || len(all) != 2 {
 		t.Fatalf("initial select: len=%d err=%v", len(all), err)
@@ -314,9 +313,9 @@ func TestConcurrentDuplicateInsertKeepsCountExact(t *testing.T) {
 	}
 }
 
-// TestConcurrentFirstLoadAndInsert runs the first cache load (Select on an
-// unloaded table) concurrently with inserts, then verifies the cache ends up
-// coherent with durable rows. Run under -race to detect map/slice data races.
+// TestConcurrentFirstLoadAndInsert runs a first scan (Select on a table)
+// concurrently with inserts, then verifies the table ends up coherent with
+// durable rows. Run under -race to detect map/slice data races.
 func TestConcurrentFirstLoadAndInsert(t *testing.T) {
 	kv := newTestKVServer(t)
 	defer kv.close()

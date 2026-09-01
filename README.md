@@ -31,8 +31,8 @@ PizzaSQL passes **100% of the SQLite SQLLogicTest suite** — over 5 million ind
 ### Architecture
 
 - **Hand-Written Lexer & Parser** — Pure Go implementation
-- **PizzaKV Storage** — Custom high-performance Zig backend with radix trie indexes
-- **Unix Socket Transport** — Low-latency communication between PizzaSQL and PizzaKV via Unix domain sockets
+- **PizzaKV Storage** — Durable append-only `.pkvdb` backend implemented in Zig
+- **PKBFI Transport** — Checksummed binary frames over TCP or Unix domain sockets
 - **Thread-Safe** — Concurrent query execution with mutex-based locking
 
 ---
@@ -149,7 +149,9 @@ pizzasql -kv -http -pg
 pizzasql -kv
 ```
 
-The `-kv` flag auto-launches a PizzaKV storage process connected via Unix socket (`.pizzakv.sock` in the working directory). PizzaSQL writes its runtime state to `/tmp/pizzasql/<pid>/runtime.json` and cleans up on exit.
+The `-kv` flag auto-launches a PizzaKV storage process connected via Unix socket (`.pizzakv.sock` in the working directory). PizzaKV stores data in `.pkvdb` by default. PizzaSQL writes its runtime state to `/tmp/pizzasql/<pid>/runtime.json` and cleans up on exit.
+
+PizzaSQL requires a PKBFI-capable PizzaKV. Existing legacy `.db` files must be migrated once before upgrading. See [`PKBFI_STORAGE_MIGRATION.md`](PKBFI_STORAGE_MIGRATION.md).
 
 ### Your First Query
 
@@ -208,7 +210,7 @@ PizzaSQL uses a per-instance runtime directory at `/tmp/pizzasql/<pid>/` to trac
     runtime.json
 ```
 
-**Multiple instances** are supported as long as each runs from a different working directory (each needs its own `.db` and `.pizzakv.sock` file). If you try to launch `-kv` in a directory that already has a `.db` file and another instance is running, PizzaSQL will refuse and tell you the conflicting PID.
+**Multiple instances** are supported as long as each runs from a different working directory (each needs its own `.pkvdb` and `.pizzakv.sock` file).
 
 **Stale entries** (from crashed processes) are cleaned up automatically on the next startup.
 
@@ -241,9 +243,7 @@ Performance on an M2 MacBook Air, 10,000-row table, 200 repetitions.
 | **Category scan (indexed)** | 0.537 ms | 0.279 ms | **0.108 ms** |
 | Value range (indexed) | 2.456 ms | 0.828 ms | 17.854 ms |
 
-Raw PizzaKV single-key read: **0.024 ms**. Full-table prefix scan (10k rows): **0.791 ms**. The dominant cost for full-scan queries is JSON deserialization (~15 ms for 10k rows).
-
-Indexed equality lookups are faster than both SQLite and PostgreSQL because PizzaKV's radix trie resolves the index directly to rowids with no B-tree traversal overhead.
+These figures predate the `.pkvdb`/PKBFI storage integration and are retained as a legacy baseline. Current PizzaSQL uses paginated binary scans and versioned binary row tuples; rerun the suite on the target hardware before using these numbers for capacity planning.
 
 ### Run Benchmarks
 

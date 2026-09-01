@@ -54,6 +54,8 @@ type SchemaManager struct {
 	version          uint64
 	mu               sync.RWMutex
 	txMu             sync.RWMutex
+	tableLocksMu     sync.Mutex
+	tableLocks       map[string]*sync.RWMutex
 }
 
 // BeginTransaction prevents other connections from observing intermediate
@@ -76,7 +78,20 @@ func NewSchemaManager(pool *KVPool, database string) *SchemaManager {
 		database:         database,
 		cache:            make(map[string]*Schema),
 		rowIDInitialized: make(map[string]bool),
+		tableLocks:       make(map[string]*sync.RWMutex),
 	}
+}
+
+func (m *SchemaManager) tableLock(table string) *sync.RWMutex {
+	key := strings.ToLower(table)
+	m.tableLocksMu.Lock()
+	lock, ok := m.tableLocks[key]
+	if !ok {
+		lock = &sync.RWMutex{}
+		m.tableLocks[key] = lock
+	}
+	m.tableLocksMu.Unlock()
+	return lock
 }
 
 // GetDatabaseName returns the database name.
@@ -184,6 +199,10 @@ func (m *SchemaManager) CreateTable(schema *Schema) error {
 
 // DropTable drops a table.
 func (m *SchemaManager) DropTable(name string) error {
+	tableLock := m.tableLock(name)
+	tableLock.Lock()
+	defer tableLock.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -198,20 +217,11 @@ func (m *SchemaManager) DropTable(name string) error {
 		return fmt.Errorf("table not found: %s", name)
 	}
 
-	// Delete all rows
-	dataPrefix := fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(name))
-	err = m.pool.WithClient(func(c *KVClient) error {
-		// Get all keys with this prefix and delete them
-		// Note: This is a simplified version - in production you'd want batch delete
-		values, err := c.Reads(dataPrefix)
-		if err != nil {
-			return err
-		}
-		// The Reads command returns values, not keys, so we can't delete them directly
-		// In a real implementation, we'd need a keys scan command
-		_ = values
-		return nil
-	})
+	// Delete all rows by scanning their actual keys and batch-deleting them, so
+	// a table drop no longer leaks durable rows.
+	if err := m.deleteKeysWithPrefix([]byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(name)))); err != nil {
+		return err
+	}
 
 	// Delete schema
 	err = m.pool.WithClient(func(c *KVClient) error {
@@ -482,32 +492,95 @@ func (m *SchemaManager) getNextRowIDLocked(schema *Schema) (int64, error) {
 	return schema.NextRowID, nil
 }
 
-// deriveNextRowIDLocked scans durable row values to recover max(rowid)+1.
+// deriveNextRowIDLocked scans durable row keys to recover max(rowid)+1,
+// streaming each page through decodeRow instead of materializing every value.
 func (m *SchemaManager) deriveNextRowIDLocked(schema *Schema) (int64, error) {
-	prefix := fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(schema.Name))
-	var values []string
-	err := m.pool.WithClient(func(c *KVClient) error {
-		var err error
-		values, err = c.Reads(prefix)
-		return err
+	prefix := []byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(schema.Name)))
+	var maxRowID int64
+	err := m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.Scan(prefix)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cursor.Close(); retErr == nil {
+				retErr = err
+			}
+		}()
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				row, err := decodeRow(e.Value)
+				if err != nil {
+					return fmt.Errorf("failed to parse row while deriving ROWID: %w", err)
+				}
+				if rowid, ok := valueAsInt64(row["_rowid_"]); ok && rowid > maxRowID {
+					maxRowID = rowid
+				}
+			}
+			if done {
+				return nil
+			}
+		}
 	})
 	if err != nil {
 		return 0, err
 	}
-
-	var maxRowID int64
-	for _, value := range values {
-		var row Row
-		if err := json.Unmarshal([]byte(value), &row); err != nil {
-			return 0, fmt.Errorf("failed to parse row while deriving ROWID: %w", err)
-		}
-
-		if rowid, ok := valueAsInt64(row["_rowid_"]); ok && rowid > maxRowID {
-			maxRowID = rowid
-		}
-	}
-
 	return maxRowID + 1, nil
+}
+
+// deleteKeysWithPrefix streams the keys with the given prefix one page at a
+// time and atomically batch-deletes them, so a bulk operation never leaves
+// durable rows behind.
+func (m *SchemaManager) deleteKeysWithPrefix(prefix []byte) error {
+	return m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.ScanKeys(prefix)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cursor.Close(); retErr == nil {
+				retErr = err
+			}
+		}()
+
+		ops := make([]BatchOp, 0, scanPageSize)
+		batchBytes := 8
+		flush := func() error {
+			if len(ops) == 0 {
+				return nil
+			}
+			if _, err := client.BatchWrite(ops, nil); err != nil {
+				return err
+			}
+			ops = ops[:0]
+			batchBytes = 8
+			return nil
+		}
+
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				opBytes := 12 + len(e.Key)
+				if len(ops) == maxOperations || batchBytes+opBytes > bulkBatchByteBudget {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+				ops = append(ops, BatchOp{Op: batchDelete, Key: append([]byte(nil), e.Key...)})
+				batchBytes += opBytes
+			}
+			if done {
+				return flush()
+			}
+		}
+	})
 }
 
 func valueAsInt64(value interface{}) (int64, bool) {

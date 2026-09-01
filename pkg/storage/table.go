@@ -2,10 +2,10 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
-
-	"github.com/goccy/go-json"
+	"time"
 )
 
 // Row represents a database row.
@@ -17,12 +17,10 @@ type TableManager struct {
 	schema   *SchemaManager
 	database string
 
-	cacheMu  sync.RWMutex
-	rowCache map[string][]Row // table name → all rows (nil means not loaded)
-	rowIDMap map[string]map[int64]Row
-
-	indexCache map[string]map[string][]int64 // index name → indexed value → rowids
-	indexTable map[string]string             // index name → table name
+	cacheMu     sync.RWMutex
+	indexCache  map[string]map[string][]int64 // index name → indexed value → rowids
+	indexTable  map[string]string             // index name → table name
+	rowKeyCache map[string]map[int64]string   // table name → rowid → primary key
 	// disabledIndexes prevents a concurrent lookup from rebuilding an index
 	// after DROP has cleared it but before the schema entry is removed.
 	disabledIndexes map[string]bool
@@ -30,16 +28,9 @@ type TableManager struct {
 	// counts holds exact per-table row counts for the COUNT(*) fast path.
 	// It is derived lazily from durable rows on first use and maintained
 	// incrementally by Insert/InsertBulk/Delete thereafter.
-	counts     map[string]int
-	countsInit map[string]bool
-
-	// locks is a map of per-table mutexes used to serialize cache/count/index
-	// loading (KV scan + install) against writes to the same table, so a scan
-	// cannot miss or double-count a concurrent write. Operations on different
-	// tables proceed concurrently. locksMu guards only the map itself and is
-	// never held across I/O or row operations.
-	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex
+	counts          map[string]int
+	countsInit      map[string]bool
+	countGeneration map[string]time.Time
 }
 
 // NewTableManager creates a new table manager.
@@ -48,35 +39,28 @@ func NewTableManager(pool *KVPool, schema *SchemaManager, database string) *Tabl
 		pool:            pool,
 		schema:          schema,
 		database:        database,
-		rowCache:        make(map[string][]Row),
-		rowIDMap:        make(map[string]map[int64]Row),
 		indexCache:      make(map[string]map[string][]int64),
 		indexTable:      make(map[string]string),
+		rowKeyCache:     make(map[string]map[int64]string),
 		disabledIndexes: make(map[string]bool),
 		counts:          make(map[string]int),
 		countsInit:      make(map[string]bool),
-		locks:           make(map[string]*sync.Mutex),
+		countGeneration: make(map[string]time.Time),
 	}
 }
 
-// tableLock returns the per-table mutex keyed by lowercase table name.
-func (m *TableManager) tableLock(key string) *sync.Mutex {
-	m.locksMu.Lock()
-	l, ok := m.locks[key]
-	if !ok {
-		l = &sync.Mutex{}
-		m.locks[key] = l
-	}
-	m.locksMu.Unlock()
-	return l
+func (m *TableManager) tableLock(key string) *sync.RWMutex {
+	return m.schema.tableLock(key)
 }
 
-// invalidateCache removes a table's rows from the in-memory cache.
+// invalidateCache removes a table's derived in-memory indexes.
 func (m *TableManager) invalidateCache(table string) {
 	m.cacheMu.Lock()
 	key := strings.ToLower(table)
-	delete(m.rowCache, key)
-	delete(m.rowIDMap, key)
+	delete(m.rowKeyCache, key)
+	delete(m.counts, key)
+	delete(m.countsInit, key)
+	delete(m.countGeneration, key)
 	for indexName, tableName := range m.indexTable {
 		if tableName == key {
 			delete(m.indexCache, indexName)
@@ -91,57 +75,82 @@ func (m *TableManager) InvalidateCache(table string) {
 	m.invalidateCache(table)
 }
 
-// loadTableLocked ensures the row cache for key is populated from durable rows.
-// The caller must hold the table's per-table lock so a concurrent write cannot
-// slip between the KV scan and the cache install.
-func (m *TableManager) loadTableLocked(key, table string) error {
-	m.cacheMu.RLock()
-	_, ok := m.rowCache[key]
-	m.cacheMu.RUnlock()
-	if ok {
-		return nil
-	}
+// rowVisitFunc is invoked for each decoded row in a streaming scan. Return
+// stop=true to end the scan early; a non-nil error aborts the scan.
+type rowVisitFunc func(Row) (stop bool, err error)
 
-	prefix := m.dataPrefix(table)
-	var values []string
-	err := m.pool.WithClient(func(c *KVClient) error {
-		var err error
-		values, err = c.Reads(prefix)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
-	loaded := make([]Row, 0, len(values))
-	byRowID := make(map[int64]Row, len(values))
-	for _, data := range values {
-		var row Row
-		if err := json.Unmarshal([]byte(data), &row); err != nil {
-			continue
-		}
-		loaded = append(loaded, row)
-		if rowid, ok := valueAsInt64(row["_rowid_"]); ok {
-			byRowID[rowid] = row
-		}
-	}
-
-	m.cacheMu.Lock()
-	if _, ok := m.rowCache[key]; !ok {
-		m.rowCache[key] = loaded
-		m.rowIDMap[key] = byRowID
-	}
-	m.cacheMu.Unlock()
-
-	return nil
+// scanRows streams the rows of table by scanning durable KV rows one page at a
+// time under a single pooled client. Each page is decoded as it arrives and
+// passed to fn, which may stop the scan early. The cursor is always closed and
+// the client always returned to the pool, even on error.
+func (m *TableManager) scanRows(table string, fn rowVisitFunc) error {
+	return m.scanRowsWithPageSize(table, scanPageSize, fn)
 }
 
-// loadTable populates the row cache for table, acquiring the per-table lock.
-func (m *TableManager) loadTable(key, table string) error {
-	tl := m.tableLock(key)
-	tl.Lock()
-	defer tl.Unlock()
-	return m.loadTableLocked(key, table)
+func (m *TableManager) scanRowsWithPageSize(table string, pageSize uint32, fn rowVisitFunc) error {
+	return m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.ScanWithLimit([]byte(m.dataPrefix(table)), pageSize)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cursor.Close(); retErr == nil {
+				retErr = err
+			}
+		}()
+
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				row, err := decodeRow(e.Value)
+				if err != nil {
+					return err
+				}
+				stop, err := fn(row)
+				if err != nil {
+					return err
+				}
+				if stop {
+					return nil
+				}
+			}
+			if done {
+				return nil
+			}
+		}
+	})
+}
+
+// scanCountKeys counts the durable rows of table using a key-only scan so row
+// values are never pulled across the wire. It is used for first-time COUNT(*)
+// derivation.
+func (m *TableManager) scanCountKeys(table string) (int, error) {
+	count := 0
+	err := m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.ScanKeys([]byte(m.dataPrefix(table)))
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cursor.Close(); retErr == nil {
+				retErr = err
+			}
+		}()
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			count += len(entries)
+			if done {
+				return nil
+			}
+		}
+	})
+	return count, err
 }
 
 // CountFast returns the exact number of rows in a table. The count is derived
@@ -150,125 +159,59 @@ func (m *TableManager) loadTable(key, table string) error {
 // avoid a full table scan. It intentionally does not persist a counter to KV:
 // the KV layer has no atomic increment primitive, and a durable counter that
 // could diverge from the rows on crash would be worse than a lazily-derived,
-// always-exact value. The cost is one table scan the first time COUNT(*) is
+// always-exact value. The cost is one key-only scan the first time COUNT(*) is
 // issued after startup.
 func (m *TableManager) CountFast(table string) (int, error) {
 	key := strings.ToLower(table)
-
-	m.cacheMu.RLock()
-	init := m.countsInit[key]
-	n := m.counts[key]
-	m.cacheMu.RUnlock()
-	if init {
-		return n, nil
-	}
-
-	// Serialize first-time derivation against writes to this table so a
-	// concurrent insert/delete cannot be missed or double-counted.
 	tl := m.tableLock(key)
 	tl.Lock()
 	defer tl.Unlock()
-
-	m.cacheMu.RLock()
-	init = m.countsInit[key]
-	n = m.counts[key]
-	m.cacheMu.RUnlock()
-	if init {
-		return n, nil
-	}
-
-	prefix := m.dataPrefix(table)
-	var values []string
-	err := m.pool.WithClient(func(c *KVClient) error {
-		var err error
-		values, err = c.Reads(prefix)
-		return err
-	})
+	tableSchema, err := m.schema.GetSchema(table)
 	if err != nil {
 		return 0, err
 	}
 
 	m.cacheMu.Lock()
-	m.counts[key] = len(values)
+	if !m.countGeneration[key].Equal(tableSchema.CreatedAt) {
+		delete(m.counts, key)
+		delete(m.countsInit, key)
+		m.countGeneration[key] = tableSchema.CreatedAt
+	}
+	init := m.countsInit[key]
+	n := m.counts[key]
+	m.cacheMu.Unlock()
+	if init {
+		return n, nil
+	}
+
+	count, err := m.scanCountKeys(table)
+	if err != nil {
+		return 0, err
+	}
+
+	m.cacheMu.Lock()
+	m.counts[key] = count
 	m.countsInit[key] = true
 	m.cacheMu.Unlock()
 
-	return len(values), nil
+	return count, nil
 }
 
 // incrCount adjusts the derived per-table row count. It is a no-op until the
 // count has been initialized, since an uninitialized count is re-derived from
 // durable rows (which already reflect the write) on next use.
-func (m *TableManager) incrCount(table string, delta int) {
+func (m *TableManager) incrCount(table string, generation time.Time, delta int) {
 	key := strings.ToLower(table)
 	m.cacheMu.Lock()
+	if !m.countGeneration[key].Equal(generation) {
+		delete(m.counts, key)
+		delete(m.countsInit, key)
+		m.countGeneration[key] = generation
+	}
 	if m.countsInit[key] {
 		m.counts[key] += delta
 	}
 	m.cacheMu.Unlock()
-}
-
-// cacheInsert adds a row to the in-memory row cache if it is already loaded.
-// It is idempotent: a rowid already present is not appended twice, so a
-// partially-observed bulk insert cannot duplicate cache entries.
-func (m *TableManager) cacheInsert(table string, row Row) {
-	key := strings.ToLower(table)
-	rowid, ok := rowIDFromRow(row)
-	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
-	byRowID, loaded := m.rowIDMap[key]
-	if !loaded {
-		return
-	}
-	if ok {
-		if _, exists := byRowID[rowid]; exists {
-			return
-		}
-		byRowID[rowid] = row
-	}
-	m.rowCache[key] = append(m.rowCache[key], row)
-}
-
-// cacheDelete removes a row from the in-memory row cache if it is already loaded.
-func (m *TableManager) cacheDelete(table string, row Row) {
-	key := strings.ToLower(table)
-	rowid, ok := rowIDFromRow(row)
-	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
-	if ok {
-		if byRowID, exists := m.rowIDMap[key]; exists {
-			delete(byRowID, rowid)
-		}
-	}
-	if cached, exists := m.rowCache[key]; exists && ok {
-		for i, r := range cached {
-			if rid, rok := rowIDFromRow(r); rok && rid == rowid {
-				m.rowCache[key] = append(cached[:i], cached[i+1:]...)
-				break
-			}
-		}
-	}
-}
-
-// cacheUpdate replaces a row in the in-memory row cache if it is already loaded.
-func (m *TableManager) cacheUpdate(table string, row Row) {
-	key := strings.ToLower(table)
-	rowid, ok := rowIDFromRow(row)
-	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
-	if ok {
-		if byRowID, exists := m.rowIDMap[key]; exists {
-			byRowID[rowid] = row
-		}
-	}
-	if cached, exists := m.rowCache[key]; exists && ok {
-		for i, r := range cached {
-			if rid, rok := rowIDFromRow(r); rok && rid == rowid {
-				m.rowCache[key][i] = row
-				break
-			}
-		}
-	}
 }
 
 // dataKey returns the key for a row.
@@ -283,6 +226,10 @@ func (m *TableManager) dataPrefix(table string) string {
 
 // Insert inserts a new row.
 func (m *TableManager) Insert(table string, row Row) error {
+	tl := m.tableLock(table)
+	tl.Lock()
+	defer tl.Unlock()
+
 	schema, err := m.schema.GetSchema(table)
 	if err != nil {
 		return err
@@ -326,6 +273,9 @@ func (m *TableManager) Insert(table string, row Row) error {
 		case int64:
 			rowid = v
 		case float64:
+			if math.Trunc(v) != v {
+				return fmt.Errorf("invalid integer primary key: %v", v)
+			}
 			rowid = int64(v)
 		case int:
 			rowid = int64(v)
@@ -338,19 +288,21 @@ func (m *TableManager) Insert(table string, row Row) error {
 	}
 
 	pk := fmt.Sprintf("%v", pkValue)
-	tl := m.tableLock(strings.ToLower(table))
-	tl.Lock()
-	defer tl.Unlock()
 
 	// Keep the duplicate check and write in one per-table critical section so
-	// concurrent inserts of the same primary key cannot both update the cache
-	// and row count for a single durable row.
+	// concurrent inserts of the same primary key cannot both persist a single
+	// durable row and double-count it.
 	key := m.dataKey(table, pk)
+	var exists bool
 	err = m.pool.WithClient(func(c *KVClient) error {
-		_, err := c.Read(key)
-		return err
+		var e error
+		exists, e = c.Exists([]byte(key))
+		return e
 	})
-	if err == nil {
+	if err != nil {
+		return err
+	}
+	if exists {
 		return fmt.Errorf("duplicate primary key: %s", pk)
 	}
 
@@ -402,13 +354,14 @@ func (m *TableManager) Insert(table string, row Row) error {
 	}
 
 	// Serialize row
-	data, err := json.Marshal(normalizedRow)
+	data, err := encodeRow(normalizedRow)
 	if err != nil {
 		return fmt.Errorf("failed to serialize row: %w", err)
 	}
 
 	err = m.pool.WithClient(func(c *KVClient) error {
-		return c.Write(key, string(data))
+		_, err := c.Put([]byte(key), data)
+		return err
 	})
 	if err != nil {
 		return err
@@ -417,18 +370,54 @@ func (m *TableManager) Insert(table string, row Row) error {
 	// Update in-memory indexes only. Durable index entries are derived from rows.
 	m.updateIndexesForRow(table, normalizedRow, true)
 
-	m.cacheInsert(table, normalizedRow)
-	m.incrCount(table, 1)
+	m.incrCount(table, schema.CreatedAt, 1)
 	return nil
 }
 
-// InsertBulk inserts multiple rows efficiently, parallelizing KV writes across
-// the connection pool. Skips per-row duplicate checks (caller must ensure
-// uniqueness). Used by INSERT ... SELECT.
+// bulkBatchByteBudget bounds a single atomic BATCH_WRITE payload below the
+// PKBFI frame limit so a bulk insert never emits a frame the server rejects.
+// Each op contributes 12 header bytes plus its key and value.
+const bulkBatchByteBudget = 60 * 1024 * 1024
+
+// chunkBatchOps splits ops into atomic BATCH_WRITE chunks bounded by both the
+// PKBFI operation-count limit and the frame-size limit. Each chunk is a slice
+// of the backing array, valid until the next append to ops.
+func chunkBatchOps(ops []BatchOp) [][]BatchOp {
+	var chunks [][]BatchOp
+	for i := 0; i < len(ops); {
+		end := i + maxOperations
+		if end > len(ops) {
+			end = len(ops)
+		}
+		bytes := 0
+		j := i
+		for j < end {
+			sz := 12 + len(ops[j].Key) + len(ops[j].Value)
+			if j > i && bytes+sz > bulkBatchByteBudget {
+				break
+			}
+			bytes += sz
+			j++
+		}
+		if j == i {
+			j = i + 1
+		}
+		chunks = append(chunks, ops[i:j])
+		i = j
+	}
+	return chunks
+}
+
+// InsertBulk inserts multiple rows efficiently using atomic BATCH_WRITE chunks
+// bounded by the PKBFI operation-count and frame-size limits. Skips per-row
+// duplicate checks (caller must ensure uniqueness). Used by INSERT ... SELECT.
 func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	tl := m.tableLock(table)
+	tl.Lock()
+	defer tl.Unlock()
 
 	schema, err := m.schema.GetSchema(table)
 	if err != nil {
@@ -461,6 +450,9 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 		if isIntegerPK {
 			switch v := nr[schema.PrimaryKey].(type) {
 			case float64:
+				if math.Trunc(v) != v {
+					return 0, fmt.Errorf("invalid integer primary key: %v", v)
+				}
 				rowid = int64(v)
 				hasRowid = true
 			case int64:
@@ -472,11 +464,19 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 			}
 		}
 		if !hasRowid {
-			// Fall back to sequential insert for non-integer-pk rows.
-			if err := m.Insert(table, row); err != nil {
-				return len(normalized), err
+			if schema.PrimaryKey != "_rowid_" {
+				pk, ok := nr[schema.PrimaryKey]
+				if !ok || pk == nil {
+					return 0, fmt.Errorf("missing primary key: %s", schema.PrimaryKey)
+				}
 			}
-			continue
+			rowid, err = m.schema.GetNextRowID(table)
+			if err != nil {
+				return 0, err
+			}
+			if schema.PrimaryKey == "_rowid_" {
+				nr[schema.PrimaryKey] = rowid
+			}
 		}
 		nr["_rowid_"] = rowid
 		if rowid > maxRowID {
@@ -489,55 +489,75 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 		m.schema.UpdateMaxRowID(table, maxRowID)
 	}
 
-	// Serialize all rows.
-	type kv struct{ key, val string }
-	rowKVs := make([]kv, 0, len(normalized))
+	// Serialize all rows into batch operations. A parallel slice keeps the
+	// normalized Row for each op for index maintenance after the write.
+	ops := make([]BatchOp, 0, len(normalized))
+	encoded := make([]Row, 0, len(normalized))
 	for _, nr := range normalized {
 		pk := fmt.Sprintf("%v", nr[schema.PrimaryKey])
-		data, err := json.Marshal(nr)
+		data, err := encodeRow(nr)
 		if err != nil {
 			return 0, err
 		}
-		rowKVs = append(rowKVs, kv{m.dataKey(table, pk), string(data)})
+		ops = append(ops, BatchOp{Op: batchPut, Key: []byte(m.dataKey(table, pk)), Value: data})
+		encoded = append(encoded, nr)
+	}
+	keys := make([][]byte, len(ops))
+	seen := make(map[string]struct{}, len(ops))
+	for i, op := range ops {
+		key := string(op.Key)
+		if _, duplicate := seen[key]; duplicate {
+			return 0, fmt.Errorf("duplicate primary key: %s", key)
+		}
+		seen[key] = struct{}{}
+		keys[i] = op.Key
+	}
+	existing := make([]bool, len(keys))
+	if err := m.pool.WithClient(func(client *KVClient) error {
+		for start := 0; start < len(keys); start += maxOperations {
+			end := start + maxOperations
+			if end > len(keys) {
+				end = len(keys)
+			}
+			found, err := client.ExistsMany(keys[start:end])
+			if err != nil {
+				return err
+			}
+			copy(existing[start:end], found)
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	for i, found := range existing {
+		if found {
+			return 0, fmt.Errorf("duplicate primary key: %s", ops[i].Key)
+		}
 	}
 
-	// Hold the per-table lock for the whole write+maintain phase so a
-	// concurrent cache/count load cannot scan a partially-written table.
-	tl := m.tableLock(strings.ToLower(table))
-	tl.Lock()
-	defer tl.Unlock()
-
-	// Write rows concurrently.
-	errs := make([]error, len(rowKVs))
-	var wg sync.WaitGroup
-	for i, w := range rowKVs {
-		wg.Add(1)
-		i, w := i, w
-		go func() {
-			defer wg.Done()
-			errs[i] = m.pool.WithClient(func(c *KVClient) error {
-				return c.Write(w.key, w.val)
-			})
-		}()
-	}
-	wg.Wait()
-
-	// Maintain in-memory caches only for rows that actually persisted, so a
-	// partial failure cannot leave an already-loaded cache/count stale.
+	// Write rows in atomic BATCH_WRITE chunks. Maintain in-memory indexes only
+	// for rows that actually persisted, so a partial failure cannot leave an
+	// already-built index stale.
 	var firstErr error
 	numOK := 0
-	for i, e := range errs {
-		if e != nil {
+	for _, chunk := range chunkBatchOps(ops) {
+		err := m.pool.WithClient(func(c *KVClient) error {
+			_, err := c.BatchWrite(chunk, nil)
+			return err
+		})
+		if err != nil {
 			if firstErr == nil {
-				firstErr = e
+				firstErr = err
 			}
-			continue
+			break
 		}
-		m.updateIndexesForRow(table, normalized[i], true)
-		m.cacheInsert(table, normalized[i])
-		numOK++
+		numOK += len(chunk)
 	}
-	m.incrCount(table, numOK)
+	// Maintain indexes for the rows that persisted (the first numOK ops).
+	for i := 0; i < numOK; i++ {
+		m.updateIndexesForRow(table, encoded[i], true)
+	}
+	m.incrCount(table, schema.CreatedAt, numOK)
 
 	return numOK, firstErr
 }
@@ -554,6 +574,19 @@ func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) {
 	rowid, ok := rowIDFromRow(row)
 	if !ok {
 		return
+	}
+	tableKey := strings.ToLower(table)
+	tableSchema, schemaErr := m.schema.GetSchema(table)
+	if schemaErr == nil {
+		m.cacheMu.Lock()
+		if keys, initialized := m.rowKeyCache[tableKey]; initialized {
+			if add {
+				keys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
+			} else {
+				delete(keys, rowid)
+			}
+		}
+		m.cacheMu.Unlock()
 	}
 
 	for _, idx := range indexes {
@@ -579,38 +612,26 @@ func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) {
 	}
 }
 
-// Select retrieves rows from a table.
+// Select retrieves rows from a table by scanning durable rows and collecting
+// only matching rows.
 func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error) {
+	tl := m.tableLock(table)
+	tl.RLock()
+	defer tl.RUnlock()
+
 	if !m.schema.TableExists(table) {
 		return nil, fmt.Errorf("table not found: %s", table)
 	}
 
-	key := strings.ToLower(table)
-	if err := m.loadTable(key, table); err != nil {
+	rows := make([]Row, 0)
+	err := m.scanRows(table, func(row Row) (bool, error) {
+		if filter == nil || filter(row) {
+			rows = append(rows, row)
+		}
+		return false, nil
+	})
+	if err != nil {
 		return nil, err
-	}
-
-	// Snapshot row references under the read lock, then filter and clone only
-	// matching rows without holding a lock. Published cached rows are immutable:
-	// writers replace row references rather than mutating their maps in place.
-	// This keeps selective scans from allocating a map for every examined row.
-	m.cacheMu.RLock()
-	cached := m.rowCache[key]
-	snapshot := append([]Row(nil), cached...)
-	m.cacheMu.RUnlock()
-
-	if filter == nil {
-		rows := make([]Row, len(snapshot))
-		for i, row := range snapshot {
-			rows[i] = cloneRow(row)
-		}
-		return rows, nil
-	}
-	rows := make([]Row, 0, len(snapshot))
-	for _, row := range snapshot {
-		if filter(row) {
-			rows = append(rows, cloneRow(row))
-		}
 	}
 	return rows, nil
 }
@@ -626,36 +647,55 @@ func cloneRow(row Row) Row {
 	return cloned
 }
 
-// SelectWithLimit retrieves rows with limit and offset.
+// SelectWithLimit retrieves rows with limit and offset, applying filter/offset
+// while scanning and closing the scan early once the limit is reached.
 func (m *TableManager) SelectWithLimit(table string, filter func(Row) bool, limit, offset int) ([]Row, error) {
-	rows, err := m.Select(table, filter)
+	tl := m.tableLock(table)
+	tl.RLock()
+	defer tl.RUnlock()
+
+	if !m.schema.TableExists(table) {
+		return nil, fmt.Errorf("table not found: %s", table)
+	}
+
+	rows := make([]Row, 0)
+	skipped := 0
+	pageSize := scanPageSize
+	if limit > 0 {
+		desired := limit
+		if offset > 0 {
+			if offset >= scanPageSize-desired {
+				desired = scanPageSize
+			} else {
+				desired += offset
+			}
+		}
+		if desired < 1 {
+			desired = 1
+		}
+		if desired < pageSize {
+			pageSize = desired
+		}
+	}
+	err := m.scanRowsWithPageSize(table, uint32(pageSize), func(row Row) (bool, error) {
+		if filter != nil && !filter(row) {
+			return false, nil
+		}
+		if skipped < offset {
+			skipped++
+			return false, nil
+		}
+		rows = append(rows, row)
+		return limit > 0 && len(rows) >= limit, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	// Apply offset
-	if offset > 0 {
-		if offset >= len(rows) {
-			return nil, nil
-		}
-		rows = rows[offset:]
-	}
-
-	// Apply limit
-	if limit > 0 && limit < len(rows) {
-		rows = rows[:limit]
-	}
-
 	return rows, nil
 }
 
 // Update updates rows matching the filter.
 func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) (int, error) {
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
-		return 0, err
-	}
-
 	// Get all rows
 	rows, err := m.Select(table, filter)
 	if err != nil {
@@ -665,6 +705,10 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 	tl := m.tableLock(strings.ToLower(table))
 	tl.Lock()
 	defer tl.Unlock()
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return 0, err
+	}
 
 	count := 0
 	for _, row := range rows {
@@ -689,7 +733,7 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 		pk := fmt.Sprintf("%v", pkValue)
 
 		// Serialize row
-		data, err := json.Marshal(row)
+		data, err := encodeRow(row)
 		if err != nil {
 			m.updateIndexesForRow(table, oldRow, true)
 			continue
@@ -698,12 +742,12 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 		// Write back
 		key := m.dataKey(table, pk)
 		err = m.pool.WithClient(func(c *KVClient) error {
-			return c.Write(key, string(data))
+			_, err := c.Put([]byte(key), data)
+			return err
 		})
 		if err == nil {
 			// Add new index entries after update
 			m.updateIndexesForRow(table, row, true)
-			m.cacheUpdate(table, row)
 			count++
 		} else {
 			m.updateIndexesForRow(table, oldRow, true)
@@ -716,11 +760,6 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 // UpdateFunc updates rows matching the filter using a function to compute new values.
 // The updateFn receives the current row and returns the updates to apply.
 func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error), filter func(Row) bool) (int, error) {
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
-		return 0, err
-	}
-
 	// Get all rows
 	rows, err := m.Select(table, filter)
 	if err != nil {
@@ -730,6 +769,10 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 	tl := m.tableLock(strings.ToLower(table))
 	tl.Lock()
 	defer tl.Unlock()
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return 0, err
+	}
 
 	count := 0
 	for _, row := range rows {
@@ -759,7 +802,7 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 		pk := fmt.Sprintf("%v", pkValue)
 
 		// Serialize row
-		data, err := json.Marshal(row)
+		data, err := encodeRow(row)
 		if err != nil {
 			m.updateIndexesForRow(table, oldRow, true)
 			continue
@@ -768,12 +811,12 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 		// Write back
 		key := m.dataKey(table, pk)
 		err = m.pool.WithClient(func(c *KVClient) error {
-			return c.Write(key, string(data))
+			_, err := c.Put([]byte(key), data)
+			return err
 		})
 		if err == nil {
 			// Add new index entries after update
 			m.updateIndexesForRow(table, row, true)
-			m.cacheUpdate(table, row)
 			count++
 		} else {
 			m.updateIndexesForRow(table, oldRow, true)
@@ -785,11 +828,6 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 
 // Delete deletes rows matching the filter.
 func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) {
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
-		return 0, err
-	}
-
 	// Get all rows
 	rows, err := m.Select(table, filter)
 	if err != nil {
@@ -799,6 +837,10 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 	tl := m.tableLock(strings.ToLower(table))
 	tl.Lock()
 	defer tl.Unlock()
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return 0, err
+	}
 
 	count := 0
 	for _, row := range rows {
@@ -810,10 +852,10 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 		key := m.dataKey(table, pk)
 
 		err = m.pool.WithClient(func(c *KVClient) error {
-			return c.Delete(key)
+			_, err := c.Del([]byte(key))
+			return err
 		})
 		if err == nil {
-			m.cacheDelete(table, row)
 			count++
 		} else {
 			// Restore the index entries removed above.
@@ -821,23 +863,30 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 		}
 	}
 
-	m.incrCount(table, -count)
+	m.incrCount(table, schema.CreatedAt, -count)
 	return count, nil
 }
 
 // GetByPK retrieves a row by primary key.
 func (m *TableManager) GetByPK(table string, pk string) (Row, error) {
+	tl := m.tableLock(table)
+	tl.RLock()
+	defer tl.RUnlock()
+
 	if !m.schema.TableExists(table) {
 		return nil, fmt.Errorf("table not found: %s", table)
 	}
 
 	key := m.dataKey(table, pk)
-	var data string
+	var value []byte
 
 	err := m.pool.WithClient(func(c *KVClient) error {
-		var err error
-		data, err = c.Read(key)
-		return err
+		res, err := c.Get([]byte(key))
+		if err != nil {
+			return err
+		}
+		value = res.Value
+		return nil
 	})
 	if err != nil {
 		if err == ErrKeyNotFound {
@@ -846,21 +895,35 @@ func (m *TableManager) GetByPK(table string, pk string) (Row, error) {
 		return nil, err
 	}
 
-	var row Row
-	if err := json.Unmarshal([]byte(data), &row); err != nil {
+	row, err := decodeRow(value)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse row: %w", err)
 	}
 
 	return row, nil
 }
 
-// Count returns the number of rows in a table.
+// Count returns the number of rows in a table matching the filter.
 func (m *TableManager) Count(table string, filter func(Row) bool) (int, error) {
-	rows, err := m.Select(table, filter)
+	tl := m.tableLock(table)
+	tl.RLock()
+	defer tl.RUnlock()
+
+	if !m.schema.TableExists(table) {
+		return 0, fmt.Errorf("table not found: %s", table)
+	}
+
+	count := 0
+	err := m.scanRows(table, func(row Row) (bool, error) {
+		if filter == nil || filter(row) {
+			count++
+		}
+		return false, nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	return len(rows), nil
+	return count, nil
 }
 
 // Truncate removes all rows from a table.
@@ -958,33 +1021,36 @@ func (m *TableManager) ensureIndex(index *Index) error {
 		return nil
 	}
 
-	if err := m.loadTableLocked(key, table); err != nil {
-		return err
-	}
-
 	columns := make([]string, len(index.Columns))
 	for i, col := range index.Columns {
 		columns[i] = col.Name
 	}
+	tableSchema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return err
+	}
 
-	m.cacheMu.RLock()
-	rows := m.rowCache[key]
 	values := make(map[string][]int64)
-	for _, row := range rows {
+	rowKeys := make(map[int64]string)
+	if err := m.scanRows(table, func(row Row) (bool, error) {
 		rowid, ok := rowIDFromRow(row)
 		if !ok {
-			continue
+			return false, nil
 		}
 		colValue := m.buildIndexValue(row, columns)
 		valueKey := formatIndexValue(colValue)
 		values[valueKey] = append(values[valueKey], rowid)
+		rowKeys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
+		return false, nil
+	}); err != nil {
+		return err
 	}
-	m.cacheMu.RUnlock()
 
 	m.cacheMu.Lock()
 	if _, initialized := m.indexCache[indexKey]; !initialized {
 		m.indexCache[indexKey] = values
 		m.indexTable[indexKey] = key
+		m.rowKeyCache[key] = rowKeys
 	}
 	m.cacheMu.Unlock()
 
@@ -1062,28 +1128,28 @@ func (m *TableManager) LookupIndex(indexName string, colValue interface{}) ([]in
 	return rowids, nil
 }
 
-// ClearIndex removes all entries for an index by scanning table and removing entries.
+// ClearIndex removes an index's in-memory entries and marks it disabled so a
+// concurrent lookup cannot rebuild it after DROP but before the schema entry
+// is removed. Index entries are derived from durable rows, so there is nothing
+// durable to delete here.
 func (m *TableManager) ClearIndex(indexName, tableName string, columns []string) error {
 	indexKey := strings.ToLower(indexName)
+	tableKey := strings.ToLower(tableName)
 	m.cacheMu.Lock()
 	delete(m.indexCache, indexKey)
 	delete(m.indexTable, indexKey)
 	m.disabledIndexes[indexKey] = true
+	rowKeysNeeded := false
+	for _, indexedTable := range m.indexTable {
+		if indexedTable == tableKey {
+			rowKeysNeeded = true
+			break
+		}
+	}
+	if !rowKeysNeeded {
+		delete(m.rowKeyCache, tableKey)
+	}
 	m.cacheMu.Unlock()
-
-	rows, err := m.Select(tableName, nil)
-	if err != nil {
-		return err
-	}
-
-	for _, row := range rows {
-		colValue := m.buildIndexValue(row, columns)
-		key := m.indexEntryKey(indexName, colValue)
-		m.pool.WithClient(func(c *KVClient) error {
-			return c.Delete(key)
-		})
-	}
-
 	return nil
 }
 
@@ -1101,25 +1167,29 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 		return m.ensureIndex(index)
 	}
 
-	rows, err := m.Select(tableName, nil)
-	if err != nil {
-		return err
+	tableSchema, schemaErr := m.schema.GetSchema(tableName)
+	if schemaErr != nil {
+		return schemaErr
 	}
-
 	values := make(map[string][]int64)
-	for _, row := range rows {
+	rowKeys := make(map[int64]string)
+	if err := m.scanRows(tableName, func(row Row) (bool, error) {
 		rowid, ok := rowIDFromRow(row)
 		if !ok {
-			continue
+			return false, nil
 		}
-
 		colValue := m.buildIndexValue(row, columns)
 		values[formatIndexValue(colValue)] = append(values[formatIndexValue(colValue)], rowid)
+		rowKeys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
+		return false, nil
+	}); err != nil {
+		return err
 	}
 
 	m.cacheMu.Lock()
 	m.indexCache[indexKey] = values
 	m.indexTable[indexKey] = strings.ToLower(tableName)
+	m.rowKeyCache[strings.ToLower(tableName)] = rowKeys
 	m.cacheMu.Unlock()
 
 	return nil
@@ -1156,11 +1226,45 @@ func (m *TableManager) buildIndexValue(row Row, columns []string) string {
 	return strings.Join(parts, "\x00")
 }
 
-// SelectByIndex retrieves rows using an index lookup.
+// SelectByIndex retrieves rows using an index lookup. It obtains the matching
+// rowids from the in-memory index, then streams the table's rows and returns
+// only those whose rowid is indexed, without retaining a permanent row map.
 func (m *TableManager) SelectByIndex(table, indexName string, colValue interface{}) ([]Row, error) {
-	rowids, err := m.LookupIndex(indexName, colValue)
+	index, err := m.schema.GetIndex(indexName)
 	if err != nil {
 		return nil, err
+	}
+	if err := m.ensureIndex(index); err != nil {
+		return nil, err
+	}
+
+	tableKey := strings.ToLower(table)
+	tl := m.tableLock(tableKey)
+	tl.RLock()
+	defer tl.RUnlock()
+	if !m.schema.TableExists(table) {
+		return nil, fmt.Errorf("table not found: %s", table)
+	}
+
+	indexKey := strings.ToLower(indexName)
+	valueKey := formatIndexValue(colValue)
+	m.cacheMu.RLock()
+	rowids := append([]int64(nil), m.indexCache[indexKey][valueKey]...)
+	primaryKeys := make([]string, 0, len(rowids))
+	missingRowID := int64(0)
+	missingRowKey := false
+	for _, rowid := range rowids {
+		if primaryKey, ok := m.rowKeyCache[tableKey][rowid]; ok {
+			primaryKeys = append(primaryKeys, primaryKey)
+		} else {
+			missingRowID = rowid
+			missingRowKey = true
+			break
+		}
+	}
+	m.cacheMu.RUnlock()
+	if missingRowKey {
+		return nil, fmt.Errorf("index %s is missing rowid %d", indexName, missingRowID)
 	}
 
 	// If no rowids found, return empty result
@@ -1168,27 +1272,26 @@ func (m *TableManager) SelectByIndex(table, indexName string, colValue interface
 		return []Row{}, nil
 	}
 
-	// Ensure the rowID map is loaded, then look up and clone rows under the
-	// read lock so writers cannot mutate the map concurrently.
-	key := strings.ToLower(table)
-	if err := m.loadTable(key, table); err != nil {
+	rows := make([]Row, 0, len(primaryKeys))
+	err = m.pool.WithClient(func(client *KVClient) error {
+		for _, primaryKey := range primaryKeys {
+			result, err := client.Get([]byte(m.dataKey(table, primaryKey)))
+			if err == ErrKeyNotFound {
+				return fmt.Errorf("index %s references missing primary key %s", indexName, primaryKey)
+			}
+			if err != nil {
+				return err
+			}
+			row, err := decodeRow(result.Value)
+			if err != nil {
+				return err
+			}
+			rows = append(rows, row)
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	m.cacheMu.RLock()
-	byRowID := m.rowIDMap[key]
-	rows := make([]Row, 0, len(rowids))
-	seen := make(map[int64]struct{}, len(rowids))
-	for _, rid := range rowids {
-		if _, duplicate := seen[rid]; duplicate {
-			continue
-		}
-		seen[rid] = struct{}{}
-		if row, ok := byRowID[rid]; ok {
-			rows = append(rows, cloneRow(row))
-		}
-	}
-	m.cacheMu.RUnlock()
-
 	return rows, nil
 }
