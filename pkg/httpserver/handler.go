@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,18 +13,21 @@ import (
 
 	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
 	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
+	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqliteimport"
+	"github.com/danfragoso/pizzasql-next/pkg/storage"
 	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
 // QueryRequest represents a single query request.
 type QueryRequest struct {
-	SQL    string        `json:"sql"`
-	Params []interface{} `json:"params"`
+	SQL           string        `json:"sql"`
+	Params        []interface{} `json:"params"`
+	TransactionID string        `json:"transactionId,omitempty"`
 }
 
 // ExecuteRequest represents a batch execution request.
@@ -55,12 +59,25 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get database from X-Database header
-	dbName := r.Header.Get("X-Database")
-	exec, _, err := s.getExecutorForDatabase(dbName)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
-		return
+	var tx *transactionExecutor
+	var exec *executor.Executor
+	if req.TransactionID != "" {
+		var ok bool
+		tx, ok = s.getTransactionExecutor(req.TransactionID, r.Header.Get("X-Database"))
+		if !ok {
+			writeError(w, http.StatusNotFound, "TRANSACTION_NOT_FOUND", "unknown transaction ID", nil)
+			return
+		}
+		exec = tx.exec
+	} else {
+		// Get database from X-Database header.
+		dbName := r.Header.Get("X-Database")
+		var err error
+		exec, _, err = s.getExecutorForDatabase(dbName)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+			return
+		}
 	}
 
 	// Check for pretty print
@@ -81,6 +98,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	errorChan := make(chan error, 1)
 
 	go func() {
+		if tx != nil {
+			defer tx.mu.Unlock()
+		}
 		start := time.Now()
 
 		// Check readonly mode
@@ -221,7 +241,10 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		l := lexer.New("BEGIN")
 		p := parser.New(l)
 		stmt, _ := p.Parse()
-		exec.Execute(stmt)
+		if _, err := exec.Execute(stmt); err != nil {
+			writeError(w, http.StatusInternalServerError, "TRANSACTION_ERROR", err.Error(), nil)
+			return
+		}
 	}
 
 	var executeErr error
@@ -256,7 +279,10 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			l := lexer.New("ROLLBACK")
 			p := parser.New(l)
 			stmt, _ := p.Parse()
-			exec.Execute(stmt)
+			if _, rollbackErr := exec.Execute(stmt); rollbackErr != nil {
+				writeError(w, http.StatusInternalServerError, "ROLLBACK_ERROR", rollbackErr.Error(), nil)
+				return
+			}
 
 			writeError(w, http.StatusBadRequest, "TRANSACTION_ERROR", executeErr.Error(), nil)
 			return
@@ -265,7 +291,14 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			l := lexer.New("COMMIT")
 			p := parser.New(l)
 			stmt, _ := p.Parse()
-			exec.Execute(stmt)
+			if _, err := exec.Execute(stmt); err != nil {
+				if errors.Is(err, storage.ErrSerialization) {
+					writeError(w, http.StatusConflict, "SERIALIZATION_FAILURE", err.Error(), nil)
+				} else {
+					writeError(w, http.StatusBadRequest, "TRANSACTION_ERROR", err.Error(), nil)
+				}
+				return
+			}
 		}
 	} else if executeErr != nil {
 		writeError(w, http.StatusBadRequest, "EXECUTION_ERROR", executeErr.Error(), nil)
@@ -417,27 +450,15 @@ func (s *Server) handleTransactionBegin(w http.ResponseWriter, r *http.Request) 
 
 	// Get database from X-Database header
 	dbName := r.Header.Get("X-Database")
-	exec, _, err := s.getExecutorForDatabase(dbName)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
-		return
-	}
-
-	l := lexer.New("BEGIN")
-	p := parser.New(l)
-	stmt, _ := p.Parse()
-	_, err = exec.Execute(stmt)
-
+	txID, _, err := s.beginTransaction(dbName)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "TRANSACTION_ERROR", err.Error(), nil)
 		return
 	}
 
-	// Generate transaction ID (simple implementation)
-	txID := fmt.Sprintf("tx-%d", time.Now().UnixNano())
-
 	resp := map[string]interface{}{
 		"transactionId": txID,
+		"status":        "started",
 	}
 
 	pretty := r.URL.Query().Get("pretty") == "true"
@@ -451,26 +472,27 @@ func (s *Server) handleTransactionCommit(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Get database from X-Database header
-	dbName := r.Header.Get("X-Database")
-	exec, _, err := s.getExecutorForDatabase(dbName)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
-		return
-	}
-
 	var req TransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// Allow commit without transaction ID for simplicity
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid JSON in request body", nil)
+		return
 	}
+	tx, ok := s.takeTransactionExecutor(req.TransactionID, r.Header.Get("X-Database"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "TRANSACTION_NOT_FOUND", "unknown transaction ID", nil)
+		return
+	}
+	defer tx.mu.Unlock()
 
 	l := lexer.New("COMMIT")
 	p := parser.New(l)
 	stmt, _ := p.Parse()
-	_, err = exec.Execute(stmt)
-
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "TRANSACTION_ERROR", err.Error(), nil)
+	if _, err := tx.exec.Execute(stmt); err != nil {
+		if errors.Is(err, storage.ErrSerialization) {
+			writeError(w, http.StatusConflict, "SERIALIZATION_FAILURE", err.Error(), nil)
+		} else {
+			writeError(w, http.StatusBadRequest, "TRANSACTION_ERROR", err.Error(), nil)
+		}
 		return
 	}
 
@@ -553,26 +575,23 @@ func (s *Server) handleTransactionRollback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Get database from X-Database header
-	dbName := r.Header.Get("X-Database")
-	exec, _, err := s.getExecutorForDatabase(dbName)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
-		return
-	}
-
 	var req TransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// Allow rollback without transaction ID for simplicity
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid JSON in request body", nil)
+		return
 	}
+	tx, ok := s.takeTransactionExecutor(req.TransactionID, r.Header.Get("X-Database"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "TRANSACTION_NOT_FOUND", "unknown transaction ID", nil)
+		return
+	}
+	defer tx.mu.Unlock()
 
 	l := lexer.New("ROLLBACK")
 	p := parser.New(l)
 	stmt, _ := p.Parse()
-	_, err = exec.Execute(stmt)
-
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "TRANSACTION_ERROR", err.Error(), nil)
+	if _, err := tx.exec.Execute(stmt); err != nil {
+		writeError(w, http.StatusBadRequest, "TRANSACTION_ERROR", err.Error(), nil)
 		return
 	}
 
@@ -890,9 +909,9 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		result, err := sqliteimport.ImportSQLiteBytes(fileContent, exec, opts)
 		if err != nil && !ignoreErrors {
 			writeError(w, http.StatusBadRequest, "IMPORT_ERROR", err.Error(), map[string]interface{}{
-				"tablesCreated":  result.TablesCreated,
-				"rowsInserted":   result.RowsInserted,
-				"errors":         result.Errors,
+				"tablesCreated": result.TablesCreated,
+				"rowsInserted":  result.RowsInserted,
+				"errors":        result.Errors,
 			})
 			return
 		}

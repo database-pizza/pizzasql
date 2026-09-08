@@ -2,15 +2,22 @@ package httpserver
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
+	"github.com/danfragoso/pizzasql-next/pkg/lexer"
+	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
+
+const httpTransactionTTL = 30 * time.Minute
 
 // Config holds HTTP server configuration.
 type Config struct {
@@ -47,15 +54,25 @@ func DefaultConfig() *Config {
 // Server represents the HTTP API server.
 type Server struct {
 	config    *Config
-	executor  *executor.Executor  // Default executor (for backward compatibility)
+	executor  *executor.Executor // Default executor (for backward compatibility)
 	schema    *storage.SchemaManager
 	dbManager *storage.DatabaseManager // Multi-database support
 	server    *http.Server
 	stats     *Stats
 
-	// Per-server executor cache for multi-database support
-	executorCache   map[string]*executor.Executor
-	executorCacheMu sync.RWMutex
+	// transactionExecutors holds a per-session executor for the HTTP
+	// transaction endpoints (BEGIN/COMMIT/ROLLBACK), keyed by transaction ID.
+	// This prevents transaction state and caches from being shared across
+	// concurrent HTTP requests.
+	transactionExecutorsMu sync.RWMutex
+	transactionExecutors   map[string]*transactionExecutor
+}
+
+type transactionExecutor struct {
+	mu        sync.Mutex
+	exec      *executor.Executor
+	database  string
+	expiresAt time.Time
 }
 
 // Stats tracks server statistics.
@@ -74,10 +91,10 @@ func New(config *Config, exec *executor.Executor, schema *storage.SchemaManager)
 	}
 
 	s := &Server{
-		config:        config,
-		executor:      exec,
-		schema:        schema,
-		executorCache: make(map[string]*executor.Executor),
+		config:               config,
+		executor:             exec,
+		schema:               schema,
+		transactionExecutors: make(map[string]*transactionExecutor),
 		stats: &Stats{
 			StartTime: time.Now(),
 		},
@@ -92,10 +109,6 @@ func NewWithDatabaseManager(config *Config, dbManager *storage.DatabaseManager) 
 		config = DefaultConfig()
 	}
 
-	// Initialize executor cache
-	execCache := make(map[string]*executor.Executor)
-
-	// Get the default database for backward compatibility
 	defaultDB, _ := dbManager.GetDatabase("")
 	var defaultExec *executor.Executor
 	var defaultSchema *storage.SchemaManager
@@ -103,16 +116,14 @@ func NewWithDatabaseManager(config *Config, dbManager *storage.DatabaseManager) 
 		defaultExec = executor.New(defaultDB.Schema, defaultDB.Table)
 		defaultExec.SyncCatalog()
 		defaultSchema = defaultDB.Schema
-		// Pre-populate cache with default executor
-		execCache[defaultDB.Name] = defaultExec
 	}
 
 	s := &Server{
-		config:        config,
-		executor:      defaultExec,
-		schema:        defaultSchema,
-		dbManager:     dbManager,
-		executorCache: execCache,
+		config:               config,
+		executor:             defaultExec,
+		schema:               defaultSchema,
+		dbManager:            dbManager,
+		transactionExecutors: make(map[string]*transactionExecutor),
 		stats: &Stats{
 			StartTime: time.Now(),
 		},
@@ -191,50 +202,98 @@ func (s *Server) Addr() string {
 	return s.server.Addr
 }
 
-// getExecutorForDatabase returns an executor for the specified database.
-// If dbName is empty, returns the default executor.
-// If multi-database support is not enabled, always returns the default executor.
+// getExecutorForDatabase returns a fresh executor for the specified database.
+// A new executor is created per call so transaction state, subquery caches, and
+// other mutable per-executor fields are never shared across concurrent HTTP
+// requests. If dbName is empty, the default database is used.
 func (s *Server) getExecutorForDatabase(dbName string) (*executor.Executor, *storage.SchemaManager, error) {
-	// If no database manager, use the default executor
+	// If no database manager, create a fresh executor from the default managers.
 	if s.dbManager == nil {
-		return s.executor, s.schema, nil
+		return s.executor.NewSessionExecutor(), s.schema, nil
 	}
 
-	// Get the database instance - this ensures we get the correct SchemaManager
 	dbInstance, err := s.dbManager.GetDatabase(dbName)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// IMPORTANT: Always use dbInstance.Schema for isolation
-	// The SchemaManager contains the database name and ensures queries
-	// are scoped to the correct database namespace
-
-	// Check per-server executor cache
-	s.executorCacheMu.RLock()
-	exec, exists := s.executorCache[dbInstance.Name]
-	s.executorCacheMu.RUnlock()
-
-	if exists {
-		// Return cached executor with the correct schema from dbInstance
-		return exec, dbInstance.Schema, nil
-	}
-
-	// Create new executor and cache it
-	s.executorCacheMu.Lock()
-	defer s.executorCacheMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if exec, exists := s.executorCache[dbInstance.Name]; exists {
-		return exec, dbInstance.Schema, nil
-	}
-
-	// Create executor with the database-specific schema and table managers
-	exec = executor.New(dbInstance.Schema, dbInstance.Table)
+	exec := executor.New(dbInstance.Schema, dbInstance.Table)
 	exec.SyncCatalog()
-	s.executorCache[dbInstance.Name] = exec
-
-	log.Printf("Created executor for database: %s", dbInstance.Name)
-
 	return exec, dbInstance.Schema, nil
+}
+
+// beginTransaction starts a transaction bound to a new session executor and
+// registers it under the returned transaction ID.
+func (s *Server) beginTransaction(dbName string) (string, *executor.Executor, error) {
+	dbName = strings.TrimSpace(dbName)
+	exec, _, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		return "", nil, err
+	}
+
+	l := lexer.New("BEGIN")
+	p := parser.New(l)
+	stmt, _ := p.Parse()
+	if _, err := exec.Execute(stmt); err != nil {
+		return "", nil, err
+	}
+
+	idBytes := make([]byte, 16)
+	if _, err := rand.Read(idBytes); err != nil {
+		return "", nil, fmt.Errorf("generate transaction ID: %w", err)
+	}
+	txID := "tx-" + hex.EncodeToString(idBytes)
+	now := time.Now()
+	s.transactionExecutorsMu.Lock()
+	for id, tx := range s.transactionExecutors {
+		if !tx.expiresAt.After(now) {
+			delete(s.transactionExecutors, id)
+		}
+	}
+	s.transactionExecutors[txID] = &transactionExecutor{
+		exec:      exec,
+		database:  dbName,
+		expiresAt: now.Add(httpTransactionTTL),
+	}
+	s.transactionExecutorsMu.Unlock()
+	return txID, exec, nil
+}
+
+func (s *Server) getTransactionExecutor(txID, dbName string) (*transactionExecutor, bool) {
+	dbName = strings.TrimSpace(dbName)
+	s.transactionExecutorsMu.Lock()
+	tx, ok := s.transactionExecutors[txID]
+	if ok && !tx.expiresAt.After(time.Now()) {
+		delete(s.transactionExecutors, txID)
+		ok = false
+	}
+	if ok && tx.database == dbName {
+		tx.mu.Lock()
+	} else {
+		ok = false
+	}
+	s.transactionExecutorsMu.Unlock()
+	return tx, ok
+}
+
+// takeTransactionExecutor removes a session before COMMIT or ROLLBACK so it
+// cannot receive another request while its terminal command is running.
+func (s *Server) takeTransactionExecutor(txID, dbName string) (*transactionExecutor, bool) {
+	dbName = strings.TrimSpace(dbName)
+	s.transactionExecutorsMu.Lock()
+	tx, ok := s.transactionExecutors[txID]
+	if ok && !tx.expiresAt.After(time.Now()) {
+		delete(s.transactionExecutors, txID)
+		ok = false
+	}
+	if ok && tx.database == dbName {
+		delete(s.transactionExecutors, txID)
+	} else {
+		ok = false
+	}
+	s.transactionExecutorsMu.Unlock()
+	if ok {
+		tx.mu.Lock()
+	}
+	return tx, ok
 }

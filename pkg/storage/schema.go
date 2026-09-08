@@ -45,45 +45,71 @@ type IndexColumn struct {
 	Desc bool   `json:"desc"`
 }
 
-// SchemaManager manages table schemas.
-type SchemaManager struct {
-	pool             *KVPool
-	database         string
-	cache            map[string]*Schema
-	indexCache       map[string]*Index
-	indexListCache   []string
-	indexListCached  bool
-	rowIDInitialized map[string]bool
-	version          uint64
-	mu               sync.RWMutex
-	txMu             sync.RWMutex
-	tableLocksMu     sync.Mutex
-	tableLocks       map[string]*sync.RWMutex
+// rowIDAllocator owns the next-ROWID state for a single table. It is a separate
+// mutex per table so allocating a ROWID on one table never serializes against
+// another table, and never contends with the SchemaManager catalog lock.
+type rowIDAllocator struct {
+	mu   sync.Mutex
+	next int64
+	init bool
 }
 
-// BeginTransaction prevents other connections from observing intermediate
-// changes until this connection commits or rolls back.
-func (m *SchemaManager) BeginTransaction() { m.txMu.Lock() }
+// SchemaManager manages table schemas.
+type SchemaManager struct {
+	pool            *KVPool
+	database        string
+	cache           map[string]*Schema
+	indexCache      map[string]*Index
+	indexListCache  []string
+	indexListCached bool
+	version         uint64
+	mu              sync.RWMutex
+	tableLocksMu    sync.Mutex
+	tableLocks      map[string]*sync.RWMutex
 
-// EndTransaction releases the database transaction lock.
-func (m *SchemaManager) EndTransaction() { m.txMu.Unlock() }
+	rowIDMu    sync.Mutex
+	rowIDAlloc map[string]*rowIDAllocator
+}
 
-// LockStatement serializes a non-transactional statement with transactions.
-func (m *SchemaManager) LockStatement() { m.txMu.RLock() }
+// BeginTransaction is retained for API compatibility. Buffered per-session
+// transactions no longer take a database-wide transaction lock; staged writes
+// are validated and committed atomically with CompareBatchWrite instead.
+func (m *SchemaManager) BeginTransaction() {}
 
-// UnlockStatement releases a non-transactional statement lock.
-func (m *SchemaManager) UnlockStatement() { m.txMu.RUnlock() }
+// EndTransaction is retained for API compatibility.
+func (m *SchemaManager) EndTransaction() {}
+
+// LockStatement is retained for API compatibility. Statement execution is now
+// serialized through per-table locks and optimistic validation, so no global
+// statement lock is required.
+func (m *SchemaManager) LockStatement() {}
+
+// UnlockStatement is retained for API compatibility.
+func (m *SchemaManager) UnlockStatement() {}
 
 // NewSchemaManager creates a new schema manager.
 func NewSchemaManager(pool *KVPool, database string) *SchemaManager {
 	return &SchemaManager{
-		pool:             pool,
-		database:         database,
-		cache:            make(map[string]*Schema),
-		indexCache:       make(map[string]*Index),
-		rowIDInitialized: make(map[string]bool),
-		tableLocks:       make(map[string]*sync.RWMutex),
+		pool:       pool,
+		database:   database,
+		cache:      make(map[string]*Schema),
+		indexCache: make(map[string]*Index),
+		tableLocks: make(map[string]*sync.RWMutex),
+		rowIDAlloc: make(map[string]*rowIDAllocator),
 	}
+}
+
+// rowIDAllocatorFor returns (creating if needed) the per-table ROWID allocator.
+func (m *SchemaManager) rowIDAllocatorFor(table string) *rowIDAllocator {
+	key := strings.ToLower(table)
+	m.rowIDMu.Lock()
+	a, ok := m.rowIDAlloc[key]
+	if !ok {
+		a = &rowIDAllocator{}
+		m.rowIDAlloc[key] = a
+	}
+	m.rowIDMu.Unlock()
+	return a
 }
 
 func (m *SchemaManager) tableLock(table string) *sync.RWMutex {
@@ -248,7 +274,9 @@ func (m *SchemaManager) DropTable(name string) error {
 	// Update cache
 	tableLower := strings.ToLower(name)
 	delete(m.cache, tableLower)
-	delete(m.rowIDInitialized, tableLower)
+	m.rowIDMu.Lock()
+	delete(m.rowIDAlloc, tableLower)
+	m.rowIDMu.Unlock()
 	m.bumpVersionLocked()
 
 	return nil
@@ -402,7 +430,9 @@ func (m *SchemaManager) InvalidateCache(name string) {
 	defer m.mu.Unlock()
 	tableLower := strings.ToLower(name)
 	delete(m.cache, tableLower)
-	delete(m.rowIDInitialized, tableLower)
+	m.rowIDMu.Lock()
+	delete(m.rowIDAlloc, tableLower)
+	m.rowIDMu.Unlock()
 }
 
 // ToAnalyzerTableInfo converts a Schema to analyzer.TableInfo.
@@ -435,80 +465,59 @@ func (s *Schema) GetColumn(name string) (*Column, bool) {
 	return nil, false
 }
 
-// GetNextRowID gets and increments the next ROWID for a table.
+// GetNextRowID gets and increments the next ROWID for a table. Allocation is
+// serialized per table via the table's own allocator so inserts on different
+// tables never contend, and no global SchemaManager lock is held across the
+// durable derivation scan.
 func (m *SchemaManager) GetNextRowID(table string) (int64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	schema, err := m.getSchemaLocked(table)
+	alloc := m.rowIDAllocatorFor(table)
+	alloc.mu.Lock()
+	defer alloc.mu.Unlock()
+	next, err := m.nextRowIDLocked(alloc, table)
 	if err != nil {
 		return 0, err
 	}
-
-	nextRowID, err := m.getNextRowIDLocked(schema)
-	if err != nil {
-		return 0, err
-	}
-
-	schema.NextRowID = nextRowID + 1
-
-	return nextRowID, nil
+	alloc.next = next + 1
+	return next, nil
 }
 
 // UpdateMaxRowID updates the next ROWID if the provided value is higher.
 func (m *SchemaManager) UpdateMaxRowID(table string, rowid int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	schema, err := m.getSchemaLocked(table)
+	alloc := m.rowIDAllocatorFor(table)
+	alloc.mu.Lock()
+	defer alloc.mu.Unlock()
+	next, err := m.nextRowIDLocked(alloc, table)
 	if err != nil {
 		return err
 	}
-
-	nextRowID, err := m.getNextRowIDLocked(schema)
-	if err != nil {
-		return err
+	if rowid >= next {
+		alloc.next = rowid + 1
 	}
-
-	if rowid >= nextRowID {
-		schema.NextRowID = rowid + 1
-	}
-
 	return nil
 }
 
-// getNextRowIDLocked returns a table's in-memory ROWID counter (must hold lock).
-// On first use after startup, the counter is derived from durable row data so
-// ROWID movement does not add a separate WAL entry.
-func (m *SchemaManager) getNextRowIDLocked(schema *Schema) (int64, error) {
-	tableLower := strings.ToLower(schema.Name)
-	if m.rowIDInitialized[tableLower] {
-		if schema.NextRowID < 1 {
-			schema.NextRowID = 1
-		}
-		return schema.NextRowID, nil
+// nextRowIDLocked returns the current next ROWID, deriving it from durable rows
+// on first use (must hold the per-table allocator lock).
+func (m *SchemaManager) nextRowIDLocked(alloc *rowIDAllocator, table string) (int64, error) {
+	if alloc.init {
+		return alloc.next, nil
 	}
-
-	nextRowID, err := m.deriveNextRowIDLocked(schema)
+	next, err := m.deriveNextRowID(table)
 	if err != nil {
 		return 0, err
 	}
-	if schema.NextRowID > nextRowID {
-		nextRowID = schema.NextRowID
+	if next < 1 {
+		next = 1
 	}
-	if nextRowID < 1 {
-		nextRowID = 1
-	}
-
-	schema.NextRowID = nextRowID
-	m.rowIDInitialized[tableLower] = true
-	return schema.NextRowID, nil
+	alloc.next = next
+	alloc.init = true
+	return alloc.next, nil
 }
 
-// deriveNextRowIDLocked scans durable row keys to recover max(rowid)+1,
-// streaming each page through decodeRow instead of materializing every value.
-func (m *SchemaManager) deriveNextRowIDLocked(schema *Schema) (int64, error) {
-	prefix := []byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(schema.Name)))
+// deriveNextRowID scans durable row keys to recover max(rowid)+1, streaming
+// each page through decodeRow instead of materializing every value.
+func (m *SchemaManager) deriveNextRowID(table string) (int64, error) {
+	prefix := []byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(table)))
 	var maxRowID int64
 	err := m.pool.WithClient(func(client *KVClient) (retErr error) {
 		cursor, err := client.Scan(prefix)
@@ -1000,9 +1009,10 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	// Update cache
 	oldLower := strings.ToLower(oldName)
 	newLower := strings.ToLower(newName)
-	wasInitialized := m.rowIDInitialized[oldLower]
 	delete(m.cache, oldLower)
-	delete(m.rowIDInitialized, oldLower)
+	m.rowIDMu.Lock()
+	delete(m.rowIDAlloc, oldLower)
+	m.rowIDMu.Unlock()
 
 	// Write new schema
 	newKey := m.schemaKey(newName)
@@ -1019,9 +1029,6 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 
 	// Update cache
 	m.cache[newLower] = schema
-	if wasInitialized {
-		m.rowIDInitialized[newLower] = true
-	}
 	m.bumpVersionLocked()
 
 	return nil

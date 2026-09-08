@@ -276,6 +276,47 @@ func (s *testKVServer) execute(opcode uint16, payload []byte, scans map[uint64]*
 		putU16(body[0:2], statusOK)
 		putU64(body[2:10], lsn)
 		return body
+	case opCompareBatch:
+		checks, ops, ok := parseCompareBatch(payload)
+		if !ok {
+			return errorBody("InvalidPayload")
+		}
+		s.mu.Lock()
+		committed := true
+		for _, check := range checks {
+			if check.LSN == 0 {
+				if _, found := s.data[string(check.Key)]; found {
+					committed = false
+					break
+				}
+			} else if s.lsns[string(check.Key)] != check.LSN {
+				committed = false
+				break
+			}
+		}
+		var lsn uint64
+		if committed {
+			s.nextLSN++
+			lsn = s.nextLSN
+			for _, op := range ops {
+				if op.Op == batchPut {
+					s.data[string(op.Key)] = append([]byte(nil), op.Value...)
+					s.lsns[string(op.Key)] = lsn
+					s.writes[string(op.Key)]++
+				} else {
+					delete(s.data, string(op.Key))
+					delete(s.lsns, string(op.Key))
+				}
+			}
+		}
+		s.mu.Unlock()
+		body := make([]byte, 18)
+		putU16(body[0:2], statusOK)
+		if committed {
+			body[2] = 1
+		}
+		putU64(body[10:18], lsn)
+		return body
 	case opScanOpen:
 		includeValues, limit, prefix, ok := parseScanOpen(payload)
 		if !ok {
@@ -444,6 +485,68 @@ func parseBatchOps(payload []byte) ([]BatchOp, bool) {
 		ops = append(ops, BatchOp{Op: opcode, Key: key, Value: value})
 	}
 	return ops, pos == len(payload)
+}
+
+func parseCompareBatch(payload []byte) ([]CompareCheck, []BatchOp, bool) {
+	if len(payload) < 16 {
+		return nil, nil, false
+	}
+	numChecks := getU32(payload[0:4])
+	numOps := getU32(payload[4:8])
+	metadataLen := getU32(payload[8:12])
+	if numChecks > maxOperations || numOps == 0 || numOps > maxOperations {
+		return nil, nil, false
+	}
+	if uint64(16)+uint64(metadataLen) > uint64(len(payload)) {
+		return nil, nil, false
+	}
+	pos := 16
+	checks := make([]CompareCheck, 0, numChecks)
+	for i := uint32(0); i < numChecks; i++ {
+		if len(payload)-pos < 16 {
+			return nil, nil, false
+		}
+		keyLen := getU32(payload[pos : pos+4])
+		lsn := getU64(payload[pos+8 : pos+16])
+		pos += 16
+		if keyLen > maxKeySize || len(payload)-pos < int(keyLen) {
+			return nil, nil, false
+		}
+		checks = append(checks, CompareCheck{Key: payload[pos : pos+int(keyLen)], LSN: lsn})
+		pos += int(keyLen)
+	}
+	pos += int(metadataLen)
+	if pos > len(payload) {
+		return nil, nil, false
+	}
+	ops := make([]BatchOp, 0, numOps)
+	for i := uint32(0); i < numOps; i++ {
+		if len(payload)-pos < 12 {
+			return nil, nil, false
+		}
+		opcode := payload[pos]
+		keyLen := getU32(payload[pos+4 : pos+8])
+		valueLen := getU32(payload[pos+8 : pos+12])
+		pos += 12
+		if opcode != batchPut && opcode != batchDelete {
+			return nil, nil, false
+		}
+		if keyLen > maxKeySize || valueLen > maxValueSize {
+			return nil, nil, false
+		}
+		if opcode == batchDelete && valueLen != 0 {
+			return nil, nil, false
+		}
+		if len(payload)-pos < int(keyLen)+int(valueLen) {
+			return nil, nil, false
+		}
+		key := payload[pos : pos+int(keyLen)]
+		pos += int(keyLen)
+		value := payload[pos : pos+int(valueLen)]
+		pos += int(valueLen)
+		ops = append(ops, BatchOp{Op: opcode, Key: key, Value: value})
+	}
+	return checks, ops, pos == len(payload)
 }
 
 func parseScanOpen(payload []byte) (bool, uint32, []byte, bool) {

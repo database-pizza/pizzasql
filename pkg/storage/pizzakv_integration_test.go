@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,6 +138,96 @@ func TestPizzaKVIntegration(t *testing.T) {
 	}
 	if schemas.TableExists("events") {
 		t.Fatal("table still exists")
+	}
+}
+
+func TestPizzaKVCompareBatchIntegration(t *testing.T) {
+	binary := os.Getenv("PIZZAKV_BIN")
+	if binary == "" {
+		t.Skip("PIZZAKV_BIN is not set")
+	}
+
+	dir := t.TempDir()
+	socket := shortPizzaKVSocket(t)
+	database := filepath.Join(dir, "compare.pkvdb")
+	startPizzaKVTest(t, binary, socket, database)
+	pool := waitPizzaKVPool(t, socket)
+	defer pool.Close()
+
+	var seededLSN uint64
+	if err := pool.WithClient(func(c *KVClient) error {
+		lsn, committed, err := c.CompareBatchWrite(
+			[]CompareCheck{{Key: []byte("k"), LSN: 0}},
+			[]BatchOp{{Op: batchPut, Key: []byte("k"), Value: []byte("v")}},
+			nil,
+		)
+		if err != nil {
+			return err
+		}
+		if !committed || lsn == 0 {
+			return fmt.Errorf("absent check expected commit, committed=%v lsn=%d", committed, lsn)
+		}
+		seededLSN = lsn
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := pool.WithClient(func(c *KVClient) error {
+		lsn, committed, err := c.CompareBatchWrite(
+			[]CompareCheck{{Key: []byte("k"), LSN: 0}},
+			[]BatchOp{{Op: batchPut, Key: []byte("k"), Value: []byte("x")}},
+			nil,
+		)
+		if err != nil {
+			return err
+		}
+		if committed || lsn != 0 {
+			return fmt.Errorf("expected conflict, committed=%v lsn=%d", committed, lsn)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("stale conflict: %v", err)
+	}
+
+	const workers = 8
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := pool.WithClient(func(c *KVClient) error {
+				lsn, committed, err := c.CompareBatchWrite(
+					[]CompareCheck{{Key: []byte("k"), LSN: seededLSN}},
+					[]BatchOp{{Op: batchPut, Key: []byte("k"), Value: []byte("winner")}},
+					nil,
+				)
+				if err != nil {
+					return err
+				}
+				if committed {
+					if lsn <= seededLSN {
+						return fmt.Errorf("winner lsn %d did not advance past %d", lsn, seededLSN)
+					}
+					wins.Add(1)
+				}
+				return nil
+			}); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent: %v", err)
+		}
+	}
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("exactly one transaction should win, got %d", got)
 	}
 }
 

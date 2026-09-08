@@ -637,3 +637,293 @@ func TestPoolReconnectsAfterBrokenConnection(t *testing.T) {
 		t.Fatalf("stale idle connection was not replaced before use: %v", err)
 	}
 }
+
+func compareBatchResponseBody(committed bool, lsn uint64) []byte {
+	body := make([]byte, 18)
+	putU16(body[0:2], statusOK)
+	if committed {
+		body[2] = 1
+	}
+	putU64(body[10:18], lsn)
+	return body
+}
+
+func parseComparePayload(payload []byte) ([]CompareCheck, []BatchOp, bool) {
+	if len(payload) < 16 {
+		return nil, nil, false
+	}
+	checkCount := getU32(payload[0:4])
+	opCount := getU32(payload[4:8])
+	metadataLen := getU32(payload[8:12])
+	pos := 16
+	checks := make([]CompareCheck, 0, checkCount)
+	for i := uint32(0); i < checkCount; i++ {
+		if len(payload)-pos < 16 {
+			return nil, nil, false
+		}
+		keyLen := getU32(payload[pos : pos+4])
+		lsn := getU64(payload[pos+8 : pos+16])
+		pos += 16
+		if keyLen > maxKeySize || len(payload)-pos < int(keyLen) {
+			return nil, nil, false
+		}
+		checks = append(checks, CompareCheck{Key: payload[pos : pos+int(keyLen)], LSN: lsn})
+		pos += int(keyLen)
+	}
+	if len(payload)-pos < int(metadataLen) {
+		return nil, nil, false
+	}
+	pos += int(metadataLen)
+	ops := make([]BatchOp, 0, opCount)
+	for i := uint32(0); i < opCount; i++ {
+		if len(payload)-pos < 12 {
+			return nil, nil, false
+		}
+		op := payload[pos]
+		keyLen := getU32(payload[pos+4 : pos+8])
+		valueLen := getU32(payload[pos+8 : pos+12])
+		pos += 12
+		if keyLen > maxKeySize || valueLen > maxValueSize || len(payload)-pos < int(keyLen)+int(valueLen) {
+			return nil, nil, false
+		}
+		ops = append(ops, BatchOp{
+			Op:    op,
+			Key:   payload[pos : pos+int(keyLen)],
+			Value: payload[pos+int(keyLen) : pos+int(keyLen)+int(valueLen)],
+		})
+		pos += int(keyLen) + int(valueLen)
+	}
+	if pos != len(payload) {
+		return nil, nil, false
+	}
+	return checks, ops, true
+}
+
+func TestCompareBatchWriteClientSemantics(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	c := pipeClient(clientConn)
+
+	state := make(map[string]uint64)
+	var nextLSN uint64
+
+	go func() {
+		defer serverConn.Close()
+		r := bufio.NewReader(serverConn)
+		for i := 0; i < 3; i++ {
+			opcode, _, requestID, payload, err := readFrame(r)
+			if err != nil {
+				return
+			}
+			if opcode != opCompareBatch {
+				serverConn.Write(encodeResponse(opcode, requestID, errorBody("UnknownOpcode")))
+				continue
+			}
+			checks, ops, ok := parseComparePayload(payload)
+			if !ok {
+				serverConn.Write(encodeResponse(opcode, requestID, errorBody("InvalidPayload")))
+				continue
+			}
+			committed := true
+			for _, check := range checks {
+				current, found := state[string(check.Key)]
+				if check.LSN == 0 {
+					if found {
+						committed = false
+					}
+				} else if !found || current != check.LSN {
+					committed = false
+				}
+			}
+			responseLSN := uint64(0)
+			if committed {
+				nextLSN++
+				responseLSN = nextLSN
+				for _, op := range ops {
+					if op.Op == batchPut {
+						state[string(op.Key)] = nextLSN
+					} else {
+						delete(state, string(op.Key))
+					}
+				}
+			}
+			serverConn.Write(encodeResponse(opcode, requestID, compareBatchResponseBody(committed, responseLSN)))
+		}
+	}()
+
+	lsn, committed, err := c.CompareBatchWrite(
+		[]CompareCheck{{Key: []byte("k"), LSN: 0}},
+		[]BatchOp{{Op: batchPut, Key: []byte("k"), Value: []byte("v")}},
+		[]byte("meta"),
+	)
+	if err != nil {
+		t.Fatalf("absent check: %v", err)
+	}
+	if !committed || lsn != 1 {
+		t.Fatalf("absent check committed=%v lsn=%d, want committed lsn=1", committed, lsn)
+	}
+
+	lsn, committed, err = c.CompareBatchWrite(
+		[]CompareCheck{{Key: []byte("k"), LSN: 1}},
+		[]BatchOp{{Op: batchPut, Key: []byte("k"), Value: []byte("v2")}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("matching lsn: %v", err)
+	}
+	if !committed || lsn != 2 {
+		t.Fatalf("matching lsn committed=%v lsn=%d, want committed lsn=2", committed, lsn)
+	}
+
+	lsn, committed, err = c.CompareBatchWrite(
+		[]CompareCheck{{Key: []byte("k"), LSN: 1}},
+		[]BatchOp{{Op: batchPut, Key: []byte("k"), Value: []byte("v3")}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("stale lsn: %v", err)
+	}
+	if committed || lsn != 0 {
+		t.Fatalf("stale lsn committed=%v lsn=%d, want conflict committed=false lsn=0", committed, lsn)
+	}
+}
+
+func TestCompareBatchWriteWireFormat(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	c := pipeClient(clientConn)
+
+	var captured []byte
+	go func() {
+		defer serverConn.Close()
+		r := bufio.NewReader(serverConn)
+		opcode, _, requestID, payload, err := readFrame(r)
+		if err != nil {
+			return
+		}
+		captured = payload
+		serverConn.Write(encodeResponse(opcode, requestID, compareBatchResponseBody(true, 7)))
+	}()
+
+	checks := []CompareCheck{
+		{Key: []byte("a"), LSN: 0},
+		{Key: []byte("bb"), LSN: 42},
+	}
+	ops := []BatchOp{
+		{Op: batchPut, Key: []byte("x"), Value: []byte("yy")},
+		{Op: batchDelete, Key: []byte("z")},
+	}
+	if _, _, err := c.CompareBatchWrite(checks, ops, []byte("m")); err != nil {
+		t.Fatalf("compare batch: %v", err)
+	}
+
+	if !bytes.Equal(captured[0:4], []byte{2, 0, 0, 0}) {
+		t.Fatalf("check count = %v", captured[0:4])
+	}
+	if !bytes.Equal(captured[4:8], []byte{2, 0, 0, 0}) {
+		t.Fatalf("op count = %v", captured[4:8])
+	}
+	if !bytes.Equal(captured[8:12], []byte{1, 0, 0, 0}) {
+		t.Fatalf("metadata len = %v", captured[8:12])
+	}
+	if !bytes.Equal(captured[12:16], []byte{0, 0, 0, 0}) {
+		t.Fatalf("reserved = %v", captured[12:16])
+	}
+	pos := 16
+	if !bytes.Equal(captured[pos:pos+4], []byte{1, 0, 0, 0}) {
+		t.Fatalf("check0 key len = %v", captured[pos:pos+4])
+	}
+	if getU64(captured[pos+8:pos+16]) != 0 {
+		t.Fatalf("check0 lsn = %d", getU64(captured[pos+8:pos+16]))
+	}
+	if !bytes.Equal(captured[pos+16:pos+17], []byte("a")) {
+		t.Fatalf("check0 key = %q", captured[pos+16:pos+17])
+	}
+	pos += 17
+	if !bytes.Equal(captured[pos:pos+4], []byte{2, 0, 0, 0}) {
+		t.Fatalf("check1 key len = %v", captured[pos:pos+4])
+	}
+	if getU64(captured[pos+8:pos+16]) != 42 {
+		t.Fatalf("check1 lsn = %d", getU64(captured[pos+8:pos+16]))
+	}
+	if !bytes.Equal(captured[pos+16:pos+18], []byte("bb")) {
+		t.Fatalf("check1 key = %q", captured[pos+16:pos+18])
+	}
+	pos += 18
+	if !bytes.Equal(captured[pos:pos+1], []byte("m")) {
+		t.Fatalf("metadata = %q", captured[pos:pos+1])
+	}
+	pos++
+	if captured[pos] != batchPut {
+		t.Fatalf("op0 opcode = %d", captured[pos])
+	}
+	if !bytes.Equal(captured[pos+4:pos+8], []byte{1, 0, 0, 0}) {
+		t.Fatalf("op0 key len = %v", captured[pos+4:pos+8])
+	}
+	if !bytes.Equal(captured[pos+8:pos+12], []byte{2, 0, 0, 0}) {
+		t.Fatalf("op0 value len = %v", captured[pos+8:pos+12])
+	}
+	pos += 12
+	if !bytes.Equal(captured[pos:pos+3], []byte("xyy")) {
+		t.Fatalf("op0 body = %q", captured[pos:pos+3])
+	}
+	pos += 3
+	if captured[pos] != batchDelete {
+		t.Fatalf("op1 opcode = %d", captured[pos])
+	}
+	if !bytes.Equal(captured[pos+4:pos+8], []byte{1, 0, 0, 0}) {
+		t.Fatalf("op1 key len = %v", captured[pos+4:pos+8])
+	}
+	if !bytes.Equal(captured[pos+8:pos+12], []byte{0, 0, 0, 0}) {
+		t.Fatalf("op1 value len = %v", captured[pos+8:pos+12])
+	}
+	pos += 12
+	if !bytes.Equal(captured[pos:pos+1], []byte("z")) {
+		t.Fatalf("op1 key = %q", captured[pos:pos+1])
+	}
+	pos++
+	if pos != len(captured) {
+		t.Fatalf("payload trailing bytes: got len %d want %d", len(captured), pos)
+	}
+}
+
+func TestCompareBatchWriteRejectsInvalidInput(t *testing.T) {
+	c := &KVClient{}
+	largeKey := make([]byte, maxKeySize+1)
+	if _, _, err := c.CompareBatchWrite(nil, nil, nil); err == nil {
+		t.Fatal("accepted empty ops")
+	}
+	if _, _, err := c.CompareBatchWrite([]CompareCheck{{Key: largeKey}}, []BatchOp{{Op: batchPut, Key: []byte("k")}}, nil); err == nil {
+		t.Fatal("accepted oversized check key")
+	}
+	if _, _, err := c.CompareBatchWrite(nil, []BatchOp{{Op: 99, Key: []byte("k")}}, nil); err == nil {
+		t.Fatal("accepted invalid batch opcode")
+	}
+	if _, _, err := c.CompareBatchWrite(nil, []BatchOp{{Op: batchDelete, Key: []byte("k"), Value: []byte("v")}}, nil); err == nil {
+		t.Fatal("accepted delete with value")
+	}
+}
+
+func TestCompareBatchWriteMalformedResponse(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	c := pipeClient(clientConn)
+
+	go func() {
+		defer serverConn.Close()
+		r := bufio.NewReader(serverConn)
+		opcode, _, requestID, _, err := readFrame(r)
+		if err != nil {
+			return
+		}
+		serverConn.Write(encodeResponse(opcode, requestID, []byte{0, 0, 1}))
+	}()
+
+	if _, _, err := c.CompareBatchWrite(
+		[]CompareCheck{{Key: []byte("k"), LSN: 0}},
+		[]BatchOp{{Op: batchPut, Key: []byte("k"), Value: []byte("v")}},
+		nil,
+	); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("err = %v, want ErrProtocol", err)
+	}
+}

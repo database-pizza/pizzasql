@@ -79,18 +79,19 @@ const (
 
 // PostgreSQL error codes (subset)
 const (
-	ErrCodeSuccess             = "00000"
-	ErrCodeSyntaxError         = "42601"
-	ErrCodeUndefinedTable      = "42P01"
-	ErrCodeUndefinedColumn     = "42703"
-	ErrCodeDuplicateTable      = "42P07"
-	ErrCodeDuplicateColumn     = "42701"
-	ErrCodeInvalidParameter    = "22023"
-	ErrCodeInternalError       = "XX000"
-	ErrCodeConnectionFailure   = "08006"
-	ErrCodeProtocolViolation   = "08P01"
-	ErrCodeFeatureNotSupported = "0A000"
-	ErrCodeTransactionAborted  = "25P02"
+	ErrCodeSuccess              = "00000"
+	ErrCodeSyntaxError          = "42601"
+	ErrCodeUndefinedTable       = "42P01"
+	ErrCodeUndefinedColumn      = "42703"
+	ErrCodeDuplicateTable       = "42P07"
+	ErrCodeDuplicateColumn      = "42701"
+	ErrCodeInvalidParameter     = "22023"
+	ErrCodeInternalError        = "XX000"
+	ErrCodeConnectionFailure    = "08006"
+	ErrCodeProtocolViolation    = "08P01"
+	ErrCodeFeatureNotSupported  = "0A000"
+	ErrCodeTransactionAborted   = "25P02"
+	ErrCodeSerializationFailure = "40001"
 )
 
 // Message represents a PostgreSQL protocol message

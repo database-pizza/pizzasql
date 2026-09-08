@@ -56,6 +56,75 @@ func TestSelectWithLimitStopsBeforeAllPages(t *testing.T) {
 	}
 }
 
+func TestPointUpdateDoesNotBlockPointReadBehindTableWriter(t *testing.T) {
+	_, _, schemas, tables := newTestSession(t)
+	createTestTable(t, schemas, "t", []Column{
+		{Name: "id", Type: "INTEGER", PrimaryKey: true},
+		{Name: "value", Type: "INTEGER"},
+	})
+	if err := tables.Insert("t", Row{"id": int64(1), "value": int64(1)}); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := tables.tableLock("t")
+	gate.RLock()
+
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := tables.Delete("t", func(Row) bool { return false })
+		writerDone <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for gate.TryRLock() {
+		gate.RUnlock()
+		if time.Now().After(deadline) {
+			gate.RUnlock()
+			t.Fatal("table writer did not queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	updateDone := make(chan error, 1)
+	go func() {
+		_, _, err := tables.UpdateByPK("t", "1", func(Row) (Row, error) {
+			return Row{"value": int64(2)}, nil
+		})
+		updateDone <- err
+	}()
+
+	// Give the update time to reach the queued table gate. It must not hold the
+	// row stripe while waiting, or this point read completes only after timeout.
+	time.Sleep(10 * time.Millisecond)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := tables.GetByPK("t", "1")
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if err != nil {
+			gate.RUnlock()
+			t.Fatalf("point read: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		gate.RUnlock()
+		<-writerDone
+		<-updateDone
+		<-readDone
+		t.Fatal("point read deadlocked behind queued table writer")
+	}
+
+	gate.RUnlock()
+	if err := <-writerDone; err != nil {
+		t.Fatalf("table writer: %v", err)
+	}
+	if err := <-updateDone; err != nil {
+		t.Fatalf("point update: %v", err)
+	}
+}
+
 // TestDropTableDeletesDurableRows verifies that a direct DropTable removes all
 // durable row keys, not just the schema entry.
 func TestDropTableDeletesDurableRows(t *testing.T) {

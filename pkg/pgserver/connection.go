@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -317,10 +318,14 @@ func (c *Connection) handleQuery(msg *Message) error {
 		}
 		result, err := c.executor.Execute(stmt)
 		if err != nil {
-			if c.txStatus == TxStatusInBlock {
+			code := ErrCodeInternalError
+			if errors.Is(err, storage.ErrSerialization) {
+				code = ErrCodeSerializationFailure
+				c.txStatus = TxStatusIdle
+			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
-			c.sendError("ERROR", ErrCodeInternalError, fmt.Sprintf("Execution error: %v", err))
+			c.sendError("ERROR", code, fmt.Sprintf("Execution error: %v", err))
 			return c.sendReadyForQuery()
 		}
 		if err := c.sendResult(result, stmt); err != nil {
@@ -482,10 +487,14 @@ func (c *Connection) handleExecute(msg *Message) error {
 	}
 	result, err := c.executor.Execute(stmt)
 	if err != nil {
-		if c.txStatus == TxStatusInBlock {
+		code := ErrCodeInternalError
+		if errors.Is(err, storage.ErrSerialization) {
+			code = ErrCodeSerializationFailure
+			c.txStatus = TxStatusIdle
+		} else if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
 		}
-		return c.failExtended(ErrCodeInternalError, fmt.Errorf("execution error: %w", err))
+		return c.failExtended(code, fmt.Errorf("execution error: %w", err))
 	}
 	return c.sendResult(result, stmt)
 }

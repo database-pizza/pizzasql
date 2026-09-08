@@ -31,6 +31,11 @@ The migration command exits after writing and verifying the destination. It refu
 - Existing PizzaSQL row values remain readable as legacy JSON after migration. New and updated rows use the versioned binary tuple encoding, so an eager row rewrite is unnecessary.
 - Schema and catalog values remain JSON because they are cold metadata.
 - Successful PKBFI writes are acknowledged only after PizzaKV's durability sync completes.
+- A `.pkvdb` file must have one PizzaSQL process owner. Optimistic scan and
+  predicate conflict detection uses process-local generations and is not safe
+  when multiple PizzaSQL processes share one storage file.
+- Read-only transactions validate scan and indexed-predicate generations, but
+  point reads are not revalidated unless the transaction also writes.
 
 ## Rollback
 

@@ -17,17 +17,18 @@ const (
 	headerMagic   = "PKBF"
 	headerVersion = 1
 
-	opPing       = 1
-	opStatus     = 2
-	opGet        = 3
-	opPut        = 4
-	opDelete     = 5
-	opExists     = 6
-	opMultiGet   = 7
-	opBatchWrite = 8
-	opScanOpen   = 9
-	opScanNext   = 10
-	opScanClose  = 11
+	opPing         = 1
+	opStatus       = 2
+	opGet          = 3
+	opPut          = 4
+	opDelete       = 5
+	opExists       = 6
+	opMultiGet     = 7
+	opBatchWrite   = 8
+	opScanOpen     = 9
+	opScanNext     = 10
+	opScanClose    = 11
+	opCompareBatch = 12
 
 	batchPut    = 1
 	batchDelete = 2
@@ -210,6 +211,11 @@ type BatchOp struct {
 	Op    byte
 	Key   []byte
 	Value []byte
+}
+
+type CompareCheck struct {
+	Key []byte
+	LSN uint64
 }
 
 type ScanCursor struct {
@@ -548,6 +554,79 @@ func (c *KVClient) BatchWrite(ops []BatchOp, metadata []byte) (uint64, error) {
 		return 0, fmt.Errorf("%w: malformed batch_write response", ErrProtocol)
 	}
 	return getU64(body[0:8]), nil
+}
+
+func (c *KVClient) CompareBatchWrite(checks []CompareCheck, ops []BatchOp, metadata []byte) (uint64, bool, error) {
+	if len(ops) == 0 || len(ops) > maxOperations {
+		return 0, false, fmt.Errorf("pkbfi: invalid operation count")
+	}
+	if len(checks) > maxOperations {
+		return 0, false, fmt.Errorf("pkbfi: too many compare checks")
+	}
+	if len(metadata) > maxTransactionSize-16 {
+		return 0, false, fmt.Errorf("pkbfi: batch metadata exceeds transaction limit")
+	}
+	payloadSize := 16 + len(metadata)
+	for _, check := range checks {
+		if err := validateKey(check.Key); err != nil {
+			return 0, false, err
+		}
+		payloadSize += 16 + len(check.Key)
+		if payloadSize > maxFrameSize {
+			return 0, false, fmt.Errorf("pkbfi: compare batch exceeds frame limit")
+		}
+	}
+	for _, op := range ops {
+		if op.Op != batchPut && op.Op != batchDelete {
+			return 0, false, fmt.Errorf("pkbfi: invalid batch opcode %d", op.Op)
+		}
+		if err := validateKey(op.Key); err != nil {
+			return 0, false, err
+		}
+		if err := validateValue(op.Value); err != nil {
+			return 0, false, err
+		}
+		if op.Op == batchDelete && len(op.Value) != 0 {
+			return 0, false, fmt.Errorf("pkbfi: delete operation with value")
+		}
+		payloadSize += 12 + len(op.Key) + len(op.Value)
+		if payloadSize > maxTransactionSize {
+			return 0, false, fmt.Errorf("pkbfi: batch exceeds transaction limit")
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	payload := make([]byte, 16, payloadSize)
+	putU32(payload[0:4], uint32(len(checks)))
+	putU32(payload[4:8], uint32(len(ops)))
+	putU32(payload[8:12], uint32(len(metadata)))
+	for _, check := range checks {
+		var header [16]byte
+		putU32(header[0:4], uint32(len(check.Key)))
+		putU64(header[8:16], check.LSN)
+		payload = append(payload, header[:]...)
+		payload = append(payload, check.Key...)
+	}
+	payload = append(payload, metadata...)
+	for _, op := range ops {
+		var header [12]byte
+		header[0] = op.Op
+		putU32(header[4:8], uint32(len(op.Key)))
+		putU32(header[8:12], uint32(len(op.Value)))
+		payload = append(payload, header[:]...)
+		payload = append(payload, op.Key...)
+		payload = append(payload, op.Value...)
+	}
+	status, body, err := c.request(opCompareBatch, payload)
+	if err != nil {
+		return 0, false, err
+	}
+	if status != statusOK || len(body) != 16 {
+		return 0, false, fmt.Errorf("%w: malformed compare_batch_write response", ErrProtocol)
+	}
+	committed := body[0] != 0
+	lsn := getU64(body[8:16])
+	return lsn, committed, nil
 }
 
 func (c *KVClient) Scan(prefix []byte) (*ScanCursor, error) {
