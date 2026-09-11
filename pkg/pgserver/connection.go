@@ -1143,6 +1143,8 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 		// Datetime values are exchanged as UTC RFC3339 (ISO8601 with a timezone
 		// offset), which timestamptz decodes directly.
 		return 1184 // TIMESTAMPTZOID
+	case "DATE":
+		return 1082 // DATEOID
 	default:
 		return 25 // Default to TEXT
 	}
@@ -1163,6 +1165,8 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 		return 1
 	case "DATETIME", "TIMESTAMP":
 		return 8
+	case "DATE":
+		return 4
 	default:
 		return -1 // Variable length
 	}

@@ -1734,17 +1734,28 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 		}
 	}
 
+	// Populate column types from schema metadata, as the plain SELECT path
+	// does, so protocol clients can decode grouped timestamp/date columns.
+	result.ColumnTypes = make([]string, len(expandedColumns))
+	for i, col := range expandedColumns {
+		result.ColumnTypes[i] = projectionColumnType(col, schema)
+	}
+
+	// Resolve GROUP BY references that name a SELECT alias to the aliased
+	// expression, matching SQLite.
+	groupByExprs := e.resolveGroupByAliases(stmt.GroupBy, expandedColumns)
+
 	// Fast path: use running accumulators instead of collecting rows per group.
 	// Applicable when there is no HAVING clause and all aggregate SELECT columns
 	// are direct FunctionCalls (COUNT/SUM/AVG/MIN/MAX).
 	if e.canUseGroupAccum(stmt, expandedColumns) {
-		return e.executeGroupByAccum(stmt, rows, result, expandedColumns, columnNames)
+		return e.executeGroupByAccum(stmt, rows, result, expandedColumns, columnNames, groupByExprs)
 	}
 
 	// Slow path: collect full rows per group then evaluate aggregates over them.
 	groups := make(map[string][]storage.Row)
 	for _, row := range rows {
-		key := e.buildGroupKey(stmt.GroupBy, row)
+		key := e.buildGroupKey(groupByExprs, row)
 		groups[key] = append(groups[key], row)
 	}
 
@@ -1824,7 +1835,7 @@ type groupAccumState struct {
 
 // executeGroupByAccum is the fast GROUP BY path: increments per-group counters as rows
 // arrive rather than materialising row slices, keeping O(1) state per group.
-func (e *Executor) executeGroupByAccum(stmt *parser.SelectStmt, rows []storage.Row, result *Result, expandedColumns []parser.SelectColumn, columnNames []string) (*Result, error) {
+func (e *Executor) executeGroupByAccum(stmt *parser.SelectStmt, rows []storage.Row, result *Result, expandedColumns []parser.SelectColumn, columnNames []string, groupBy []parser.Expr) (*Result, error) {
 	var aggCols []aggColInfo
 	for i, col := range expandedColumns {
 		if e.isAggregate(col.Expr) {
@@ -1836,7 +1847,7 @@ func (e *Executor) executeGroupByAccum(stmt *parser.SelectStmt, rows []storage.R
 	var keyOrder []string
 
 	for _, row := range rows {
-		key := e.buildGroupKey(stmt.GroupBy, row)
+		key := e.buildGroupKey(groupBy, row)
 		state, exists := states[key]
 		if !exists {
 			accums := make([]*aggAccum, len(aggCols))
@@ -5150,22 +5161,47 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		}
 	case "SUBSTR", "SUBSTRING":
 		if len(args) >= 2 {
-			s := toString(args[0])
-			start := int(toFloat(args[1])) - 1 // SQL is 1-indexed
-			if start < 0 {
-				start = 0
-			}
-			if start >= len(s) {
-				return "", nil
+			// SQLite substring semantics. Indices are 1-based and inclusive:
+			// a zero or negative Y shifts the window rather than simply
+			// clamping, e.g. substr('US-NY', 0, 3) is 'US', not 'US-'.
+			runes := []rune(toString(args[0]))
+			n := len(runes)
+			y := int(toFloat(args[1]))
+			var start1, end1 int
+			switch {
+			case y < 0:
+				start1 = n + y + 1
+			case y == 0:
+				start1 = 1
+			default:
+				start1 = y
 			}
 			if len(args) >= 3 {
-				length := int(toFloat(args[2]))
-				if start+length > len(s) {
-					length = len(s) - start
+				z := int(toFloat(args[2]))
+				switch {
+				case z < 0:
+					end1 = start1 - 1
+					start1 = end1 + z + 1
+				case y < 0:
+					end1 = start1 + z - 1
+				case y == 0:
+					end1 = z - 1
+				default:
+					end1 = y + z - 1
 				}
-				return s[start : start+length], nil
+			} else {
+				end1 = n
 			}
-			return s[start:], nil
+			if start1 < 1 {
+				start1 = 1
+			}
+			if end1 > n {
+				end1 = n
+			}
+			if start1 > n || start1 > end1 {
+				return "", nil
+			}
+			return string(runes[start1-1 : end1]), nil
 		}
 	case "TRIM":
 		if len(args) > 0 {
@@ -6345,6 +6381,35 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 		return false
 	}
 	return false
+}
+
+// resolveGroupByAliases replaces GROUP BY references that name a SELECT alias
+// with the aliased expression. SQLite allows `GROUP BY alias`, so grouping must
+// use the same expression the projection evaluates.
+func (e *Executor) resolveGroupByAliases(groupBy []parser.Expr, selectCols []parser.SelectColumn) []parser.Expr {
+	if len(groupBy) == 0 {
+		return groupBy
+	}
+	aliases := make(map[string]parser.Expr, len(selectCols))
+	for _, col := range selectCols {
+		if col.Alias != "" && col.Expr != nil {
+			aliases[strings.ToUpper(col.Alias)] = col.Expr
+		}
+	}
+	if len(aliases) == 0 {
+		return groupBy
+	}
+	out := make([]parser.Expr, len(groupBy))
+	for i, expr := range groupBy {
+		if ref, ok := expr.(*parser.ColumnRef); ok {
+			if target, ok := aliases[strings.ToUpper(ref.Column)]; ok {
+				out[i] = target
+				continue
+			}
+		}
+		out[i] = expr
+	}
+	return out
 }
 
 func (e *Executor) buildGroupKey(groupBy []parser.Expr, row storage.Row) string {

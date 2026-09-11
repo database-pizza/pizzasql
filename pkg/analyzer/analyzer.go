@@ -140,14 +140,9 @@ func (a *Analyzer) analyzeSelect(stmt *parser.SelectStmt) error {
 	hasAggregate := false
 	hasGroupBy := len(stmt.GroupBy) > 0
 
-	// Analyze GROUP BY expressions first
-	for _, expr := range stmt.GroupBy {
-		if _, err := a.analyzeExpr(expr); err != nil {
-			return err
-		}
-	}
-
-	// Analyze SELECT columns and collect aliases for ORDER BY/HAVING reference
+	// Analyze SELECT columns and collect aliases for GROUP BY/ORDER BY/HAVING
+	// reference. SELECT aliases are registered before GROUP BY so a query may
+	// group by an output alias, matching SQLite.
 	selectAliases := make(map[string]*ExprInfo)
 	for _, col := range stmt.Columns {
 		if col.Star {
@@ -178,9 +173,17 @@ func (a *Analyzer) analyzeSelect(stmt *parser.SelectStmt) error {
 		}
 	}
 
-	// Register SELECT aliases as virtual columns for ORDER BY/HAVING reference
+	// Register SELECT aliases as virtual columns for GROUP BY/ORDER BY/HAVING
+	// reference
 	for alias, info := range selectAliases {
 		a.scope.DefineSelectAlias(alias, info.Type)
+	}
+
+	// Analyze GROUP BY expressions after aliases are in scope
+	for _, expr := range stmt.GroupBy {
+		if _, err := a.analyzeExpr(expr); err != nil {
+			return err
+		}
 	}
 
 	// Validate GROUP BY semantics

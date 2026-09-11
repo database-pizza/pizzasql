@@ -14,6 +14,7 @@ func TestGetOIDForTypeDatetime(t *testing.T) {
 	cases := map[string]int32{
 		"DATETIME":  1184,
 		"TIMESTAMP": 1184,
+		"DATE":      1082,
 		"BIGINT":    20,
 		"INTEGER":   23,
 		"INT":       23,
