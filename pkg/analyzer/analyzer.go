@@ -107,6 +107,12 @@ func (a *Analyzer) GetCatalog() *Catalog {
 
 // analyzeSelect analyzes a SELECT statement.
 func (a *Analyzer) analyzeSelect(stmt *parser.SelectStmt) error {
+	// Register CTE names before resolving FROM so both the main query and the
+	// recursive legs can reference them.
+	for _, cte := range stmt.With {
+		a.scope.DefineTable(cteTableInfo(cte))
+	}
+
 	// First, resolve tables in FROM clause
 	if err := a.resolveFromClause(stmt.From); err != nil {
 		return err
@@ -261,59 +267,8 @@ func (a *Analyzer) analyzeSelect(stmt *parser.SelectStmt) error {
 // resolveFromClause adds tables from FROM clause to scope.
 func (a *Analyzer) resolveFromClause(tables []parser.TableRef) error {
 	for _, ref := range tables {
-		// Handle subquery (derived table)
-		if ref.Subquery != nil {
-			// Analyze the subquery
-			if err := a.analyzeSelect(ref.Subquery); err != nil {
-				return err
-			}
-
-			// Create a table info from subquery columns
-			// For now, we'll use a simplified approach - just mark it as a derived table
-			tableInfo := &TableInfo{
-				Name:    ref.Alias, // Derived tables MUST have an alias
-				Columns: []ColumnInfo{},
-				Alias:   ref.Alias,
-			}
-
-			// Add columns from SELECT list
-			for _, col := range ref.Subquery.Columns {
-				colName := ""
-				if col.Alias != "" {
-					colName = col.Alias
-				} else if colRef, ok := col.Expr.(*parser.ColumnRef); ok {
-					colName = colRef.Column
-				} else {
-					// For expressions without alias, use a generated name
-					colName = fmt.Sprintf("col_%d", len(tableInfo.Columns))
-				}
-
-				tableInfo.Columns = append(tableInfo.Columns, ColumnInfo{
-					Name:      colName,
-					TableName: ref.Alias,
-					Type:      TypeAny, // We'd need type inference for proper typing
-				})
-			}
-
-			a.scope.DefineTable(tableInfo)
-		} else {
-			// Regular table reference
-			table, ok := a.catalog.GetTable(ref.Name)
-			if !ok {
-				return &AnalysisError{
-					Type:    ErrTableNotFound,
-					Message: fmt.Sprintf("table not found: %s", ref.Name),
-				}
-			}
-
-			// Create a copy with alias if specified
-			tableInfo := &TableInfo{
-				Name:    table.Name,
-				Columns: table.Columns,
-				Alias:   ref.Alias,
-				IsView:  table.IsView,
-			}
-			a.scope.DefineTable(tableInfo)
+		if err := a.defineTableRef(ref); err != nil {
+			return err
 		}
 
 		// Handle JOINs
@@ -324,6 +279,145 @@ func (a *Analyzer) resolveFromClause(tables []parser.TableRef) error {
 		}
 	}
 	return nil
+}
+
+// defineTableRef adds a single FROM/JOIN table to scope. The reference may be a
+// derived table (subquery), a CTE, or a real catalog table.
+func (a *Analyzer) defineTableRef(ref parser.TableRef) error {
+	if ref.Subquery != nil {
+		if err := a.analyzeSelect(ref.Subquery); err != nil {
+			return err
+		}
+		a.scope.DefineTable(a.derivedTableInfo(ref))
+		return nil
+	}
+
+	if cte, ok := a.scope.LookupTable(ref.Name); ok {
+		a.scope.DefineTable(&TableInfo{
+			Name:    cte.Name,
+			Columns: cte.Columns,
+			Alias:   ref.Alias,
+			IsView:  cte.IsView,
+		})
+		return nil
+	}
+
+	table, ok := a.catalog.GetTable(ref.Name)
+	if !ok {
+		return &AnalysisError{
+			Type:    ErrTableNotFound,
+			Message: fmt.Sprintf("table not found: %s", ref.Name),
+		}
+	}
+	a.scope.DefineTable(&TableInfo{
+		Name:    table.Name,
+		Columns: table.Columns,
+		Alias:   ref.Alias,
+		IsView:  table.IsView,
+	})
+	return nil
+}
+
+// derivedTableInfo builds the scope entry for a derived table. A compound
+// subquery (UNION/…) keeps its projection on the first leg. A wildcard expands
+// the columns of the subquery's source tables so callers can reference them.
+func (a *Analyzer) derivedTableInfo(ref parser.TableRef) *TableInfo {
+	info := &TableInfo{Name: ref.Alias, Alias: ref.Alias}
+	leg := firstSelectLeg(ref.Subquery)
+	if leg == nil {
+		return info
+	}
+	for _, col := range leg.Columns {
+		if col.Star {
+			for _, tref := range collectAllTableRefs(leg.From) {
+				if t, ok := a.scope.LookupTable(tref.Name); ok {
+					for _, c := range t.Columns {
+						info.Columns = append(info.Columns, ColumnInfo{Name: c.Name, TableName: ref.Alias, Type: c.Type})
+					}
+				} else if t, ok := a.catalog.GetTable(tref.Name); ok {
+					for _, c := range t.Columns {
+						info.Columns = append(info.Columns, ColumnInfo{Name: c.Name, TableName: ref.Alias, Type: c.Type})
+					}
+				}
+			}
+			continue
+		}
+		name := ""
+		switch {
+		case col.Alias != "":
+			name = col.Alias
+		case col.Expr != nil:
+			if colRef, ok := col.Expr.(*parser.ColumnRef); ok {
+				name = colRef.Column
+			}
+		}
+		if name == "" {
+			name = fmt.Sprintf("col_%d", len(info.Columns))
+		}
+		info.Columns = append(info.Columns, ColumnInfo{Name: name, TableName: ref.Alias, Type: TypeAny})
+	}
+	return info
+}
+
+// collectAllTableRefs flattens a FROM list and its join chains.
+func collectAllTableRefs(from []parser.TableRef) []parser.TableRef {
+	var refs []parser.TableRef
+	var add func(parser.TableRef)
+	add = func(ref parser.TableRef) {
+		if ref.Subquery != nil {
+			return
+		}
+		refs = append(refs, ref)
+		if ref.Join != nil && ref.Join.Table != nil {
+			add(*ref.Join.Table)
+		}
+	}
+	for _, ref := range from {
+		add(ref)
+	}
+	return refs
+}
+
+// cteTableInfo describes the columns a CTE exposes. The declared column list
+// wins; otherwise the anchor/first-leg projection names are used.
+func cteTableInfo(cte *parser.CTE) *TableInfo {
+	leg := firstSelectLeg(cte.Query)
+	info := &TableInfo{Name: cte.Name}
+	if leg == nil {
+		return info
+	}
+	for i, col := range leg.Columns {
+		name := ""
+		switch {
+		case i < len(cte.Columns):
+			name = cte.Columns[i]
+		case col.Alias != "":
+			name = col.Alias
+		case col.Expr != nil:
+			if ref, ok := col.Expr.(*parser.ColumnRef); ok {
+				name = ref.Column
+			}
+		}
+		if name == "" {
+			name = fmt.Sprintf("col_%d", i)
+		}
+		info.Columns = append(info.Columns, ColumnInfo{
+			Name:      name,
+			TableName: cte.Name,
+			Type:      TypeAny,
+		})
+	}
+	return info
+}
+
+// firstSelectLeg returns the SELECT whose projection describes a (possibly
+// compound) subquery's output columns. A UNION/INTERSECT/EXCEPT keeps the
+// projection on its first leg.
+func firstSelectLeg(sel *parser.SelectStmt) *parser.SelectStmt {
+	for sel != nil && sel.Compound != nil {
+		sel = sel.Compound.Left
+	}
+	return sel
 }
 
 // validateTableStar checks that a qualified wildcard qualifier names a table or
@@ -345,21 +439,9 @@ func (a *Analyzer) resolveJoin(join *parser.JoinClause) error {
 		return nil
 	}
 
-	table, ok := a.catalog.GetTable(join.Table.Name)
-	if !ok {
-		return &AnalysisError{
-			Type:    ErrTableNotFound,
-			Message: fmt.Sprintf("table not found: %s", join.Table.Name),
-		}
+	if err := a.defineTableRef(*join.Table); err != nil {
+		return err
 	}
-
-	tableInfo := &TableInfo{
-		Name:    table.Name,
-		Columns: table.Columns,
-		Alias:   join.Table.Alias,
-		IsView:  table.IsView,
-	}
-	a.scope.DefineTable(tableInfo)
 
 	// Analyze ON condition
 	if join.Condition != nil {
@@ -658,9 +740,40 @@ func (a *Analyzer) analyzeExpr(expr parser.Expr) (*ExprInfo, error) {
 		return a.analyzeExistsExpr(e)
 	case *parser.SubqueryExpr:
 		return a.analyzeSubqueryExpr(e)
+	case *parser.WindowExpr:
+		return a.analyzeWindowExpr(e)
 	default:
 		return &ExprInfo{Type: TypeUnknown}, nil
 	}
+}
+
+// analyzeWindowExpr analyzes a window function. Window functions are not
+// aggregates for the purpose of GROUP BY handling.
+func (a *Analyzer) analyzeWindowExpr(e *parser.WindowExpr) (*ExprInfo, error) {
+	if e.Func != nil {
+		for _, arg := range e.Func.Args {
+			if _, err := a.analyzeExpr(arg); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, p := range e.PartitionBy {
+		if _, err := a.analyzeExpr(p); err != nil {
+			return nil, err
+		}
+	}
+	for _, o := range e.OrderBy {
+		if _, err := a.analyzeExpr(o.Expr); err != nil {
+			return nil, err
+		}
+	}
+	ret := TypeInteger
+	if e.Func != nil {
+		if sig, ok := builtinFunctions[e.Func.Name]; ok {
+			ret = sig.ReturnType
+		}
+	}
+	return &ExprInfo{Type: ret}, nil
 }
 
 func (a *Analyzer) analyzeLiteral(e *parser.LiteralExpr) (*ExprInfo, error) {
@@ -758,9 +871,10 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 
 	switch e.Op {
 	case lexer.TokenPlus, lexer.TokenMinus, lexer.TokenStar, lexer.TokenSlash, lexer.TokenPercent:
-		// Arithmetic operators
+		// Arithmetic operators. TypeAny comes from derived tables and CTEs whose
+		// column types are not tracked, so it is allowed rather than rejected.
 		info.Type = CommonType(left.Type, right.Type)
-		if !left.Type.IsNumeric() && left.Type != TypeNull && left.Type != TypeUnknown {
+		if !left.Type.IsNumeric() && left.Type != TypeNull && left.Type != TypeUnknown && left.Type != TypeAny {
 			return nil, &AnalysisError{
 				Type:    ErrTypeMismatch,
 				Message: fmt.Sprintf("arithmetic operator requires numeric type, got %s", left.Type),

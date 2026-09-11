@@ -55,6 +55,18 @@ type SelectStmt struct {
 	Offset   Expr
 	// Compound chains a set operation onto this SELECT (UNION/INTERSECT/EXCEPT).
 	Compound *CompoundSelect
+	// With holds common table expressions that must be materialized before this
+	// SELECT runs. Non-recursive CTEs are desugared by the parser instead; this
+	// list carries recursive CTEs (and the CTEs that depend on them).
+	With []*CTE
+}
+
+// CTE is a common table expression from a WITH clause.
+type CTE struct {
+	Name      string
+	Columns   []string
+	Recursive bool
+	Query     *SelectStmt
 }
 
 func (s *SelectStmt) node()     {}
@@ -96,10 +108,20 @@ const (
 	JoinCross
 )
 
+// NullsOrder selects where NULLs sort in an ORDER BY item.
+type NullsOrder int
+
+const (
+	NullsDefault NullsOrder = iota // SQLite default: NULLs are smallest
+	NullsFirst
+	NullsLast
+)
+
 // OrderByItem represents an ORDER BY item.
 type OrderByItem struct {
-	Expr Expr
-	Desc bool
+	Expr       Expr
+	Desc       bool
+	NullsOrder NullsOrder
 }
 
 // ConflictAction represents the action to take on conflict.
@@ -440,6 +462,16 @@ type FunctionCall struct {
 
 func (e *FunctionCall) node()     {}
 func (e *FunctionCall) exprNode() {}
+
+// WindowExpr represents a function call with an OVER clause.
+type WindowExpr struct {
+	Func        *FunctionCall
+	PartitionBy []Expr
+	OrderBy     []OrderByItem
+}
+
+func (e *WindowExpr) node()     {}
+func (e *WindowExpr) exprNode() {}
 
 // SubqueryExpr represents a subquery expression.
 type SubqueryExpr struct {

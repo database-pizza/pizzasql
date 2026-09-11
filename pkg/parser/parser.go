@@ -106,6 +106,9 @@ func (p *Parser) curError(msg string) error {
 }
 
 func (p *Parser) parseStatement() (Statement, error) {
+	if p.isWithStart() {
+		return p.parseWithStatement()
+	}
 	switch p.curToken.Type {
 	case lexer.TokenSELECT:
 		return p.parseSelect()
@@ -706,6 +709,23 @@ func (p *Parser) parseOrderBy() ([]OrderByItem, error) {
 			item.Desc = true
 			p.nextToken()
 		} else if p.curTokenIs(lexer.TokenASC) {
+			p.nextToken()
+		}
+
+		// Optional NULLS FIRST / NULLS LAST.
+		if p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "NULLS") {
+			p.nextToken()
+			if !p.curTokenIs(lexer.TokenIdent) {
+				return nil, p.curError("expected FIRST or LAST after NULLS")
+			}
+			switch {
+			case strings.EqualFold(p.curToken.Literal, "FIRST"):
+				item.NullsOrder = NullsFirst
+			case strings.EqualFold(p.curToken.Literal, "LAST"):
+				item.NullsOrder = NullsLast
+			default:
+				return nil, p.curError("expected FIRST or LAST after NULLS")
+			}
 			p.nextToken()
 		}
 
@@ -2311,7 +2331,56 @@ func (p *Parser) parseFunctionCall(name string) (Expr, error) {
 	}
 	p.nextToken()
 
+	// Window function: func(...) OVER (PARTITION BY ... ORDER BY ...).
+	if p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "OVER") {
+		return p.parseWindowSpec(fn)
+	}
+
 	return fn, nil
+}
+
+// parseWindowSpec parses the OVER (...) clause of a window function. Only
+// PARTITION BY and ORDER BY are supported; frame clauses are not.
+func (p *Parser) parseWindowSpec(fn *FunctionCall) (Expr, error) {
+	p.nextToken() // consume OVER
+	if !p.curTokenIs(lexer.TokenLParen) {
+		return nil, p.curError("expected ( after OVER")
+	}
+	p.nextToken()
+
+	window := &WindowExpr{Func: fn}
+
+	if p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "PARTITION") {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenBY) {
+			return nil, p.curError("expected BY after PARTITION")
+		}
+		p.nextToken()
+		exprs, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		window.PartitionBy = exprs
+	}
+
+	if p.curTokenIs(lexer.TokenORDER) {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenBY) {
+			return nil, p.curError("expected BY after ORDER")
+		}
+		p.nextToken()
+		orderBy, err := p.parseOrderBy()
+		if err != nil {
+			return nil, err
+		}
+		window.OrderBy = orderBy
+	}
+
+	if !p.curTokenIs(lexer.TokenRParen) {
+		return nil, p.curError("expected ) after window specification")
+	}
+	p.nextToken()
+	return window, nil
 }
 
 func (p *Parser) parseCaseExpr() (Expr, error) {

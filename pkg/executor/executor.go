@@ -49,6 +49,11 @@ type Executor struct {
 	// In-memory view registry: view name (lowercase) → SELECT AST.
 	views map[string]*parser.SelectStmt
 
+	// Materialized common table expressions for the current query, keyed by
+	// lowercased CTE name. Recursive CTEs populate this during fixpoint
+	// iteration so their own legs can read the working set.
+	cteTables map[string]*cteTable
+
 	// Session-local SQLite compatibility state, tracked per connection so
 	// last_insert_rowid()/changes()/total_changes() reflect this session only.
 	lastInsertRowID int64 // rowid of the most recent successful INSERT
@@ -308,6 +313,9 @@ func isCountStarSingleTable(stmt *parser.SelectStmt) bool {
 
 // executeSelect executes a SELECT statement (or compound SELECT).
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	if len(stmt.With) > 0 {
+		return e.executeWith(stmt)
+	}
 	if stmt.Compound != nil {
 		return e.executeCompound(stmt.Compound)
 	}
@@ -322,6 +330,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	}
 
 	tableName := stmt.From[0].Name
+
+	// A materialized CTE is served from memory, not from storage.
+	if cte, ok := e.cteTableFor(tableName); ok {
+		return e.executeSelectOnMaterialized(stmt, cte.columns, cteRowsToValues(cte))
+	}
 
 	// Transparently expand view references as derived-table subqueries.
 	if viewDef, ok := e.views[strings.ToLower(tableName)]; ok {
@@ -420,6 +433,22 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		effectiveWhere = nil
 	}
 
+	// Pre-evaluate non-correlated subqueries in the WHERE before the scan takes
+	// the session lock.
+	e.primeSubqueries(effectiveWhere)
+
+	// A WHERE that contains a subquery is evaluated after the scan. Evaluating a
+	// correlated subquery inside the locked scan re-enters the session lock and
+	// deadlocks, so only a subquery-free predicate is pushed into the scan.
+	whereHasSubquery := false
+	for _, ref := range collectColumnRefs(effectiveWhere) {
+		if ref == "__subquery__" {
+			whereHasSubquery = true
+			break
+		}
+	}
+	appliedInScan := effectiveWhere != nil && !whereHasSubquery && stmt.From[0].Alias == "" && !isMultiTable && stmt.From[0].Join == nil
+
 	if effectiveWhere != nil && !isMultiTable {
 		// Check if we can use an index
 		colName, colValue, isEquality := e.extractIndexableCondition(stmt.Where)
@@ -459,7 +488,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if !usedIndex {
 		var filterErr error
 		var filter func(storage.Row) bool
-		if effectiveWhere != nil && stmt.From[0].Alias == "" && !isMultiTable && stmt.From[0].Join == nil {
+		if appliedInScan {
 			filter = func(row storage.Row) bool {
 				val, ferr := e.evalExpr(effectiveWhere, row)
 				if ferr != nil {
@@ -494,10 +523,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		}
 	}
 
-	// Apply WHERE for single-table with alias (after alias mapping so alias.col refs work).
-	// A query with a JOIN defers WHERE until after the join, because the WHERE may
+	// Apply WHERE for a single-table scan that did not push the predicate into
+	// the locked scan (aliased tables, or a WHERE containing a subquery). A
+	// query with a JOIN defers WHERE until after the join, because the WHERE may
 	// reference columns from the joined table.
-	if effectiveWhere != nil && stmt.From[0].Alias != "" && !isMultiTable && stmt.From[0].Join == nil {
+	if effectiveWhere != nil && !isMultiTable && stmt.From[0].Join == nil && !appliedInScan {
 		var filterErr error
 		var filtered []storage.Row
 		for _, row := range rows {
@@ -1165,8 +1195,15 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		result.ColumnTypes = selectColumnTypes(stmt, schema)
 	}
 
+	// Window functions in the projection are evaluated over the scanned rows
+	// before their per-row values are read.
+	windowValues, werr := e.computeWindowValues(stmt, rows)
+	if werr != nil {
+		return nil, werr
+	}
+
 	// Add rows - evaluate each select expression
-	for _, row := range rows {
+	for rowIdx, row := range rows {
 		values := make([]interface{}, 0)
 		for _, col := range stmt.Columns {
 			if col.Star {
@@ -1205,6 +1242,8 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					}
 					values = append(values, val)
 				}
+			} else if we, ok := col.Expr.(*parser.WindowExpr); ok {
+				values = append(values, windowValues[we][rowIdx])
 			} else {
 				// Evaluate the expression
 				val, err := e.evalExpr(col.Expr, row)
@@ -1374,18 +1413,27 @@ func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, 
 		return nil, fmt.Errorf("subquery error: %w", err)
 	}
 
-	// Convert subquery result to rows for further processing
-	derivedRows := make([]storage.Row, 0, subqueryResult.RowCount)
-	for _, rowValues := range subqueryResult.Rows {
-		row := make(storage.Row)
-		for i, col := range subqueryResult.Columns {
-			row[col] = rowValues[i]
+	return e.executeSelectOnMaterialized(stmt, subqueryResult.Columns, subqueryResult.Rows)
+}
+
+// executeSelectOnMaterialized runs a SELECT whose FROM[0] is already
+// materialized as (columns, rowValues). It is shared by derived tables and
+// materialized CTEs.
+func (e *Executor) executeSelectOnMaterialized(stmt *parser.SelectStmt, columns []string, rowValues [][]interface{}) (*Result, error) {
+	derivedRows := make([]storage.Row, 0, len(rowValues))
+	for _, values := range rowValues {
+		row := make(storage.Row, len(columns))
+		for i, col := range columns {
+			if i < len(values) {
+				row[col] = values[i]
+			}
 		}
 		derivedRows = append(derivedRows, row)
 	}
 
 	// Handle JOINs if present
 	if stmt.From[0].Join != nil {
+		var err error
 		derivedRows, err = e.executeJoin(stmt.From[0], derivedRows)
 		if err != nil {
 			return nil, err
@@ -1409,85 +1457,80 @@ func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, 
 
 	// Handle GROUP BY
 	if len(stmt.GroupBy) > 0 {
-		// Create a temporary schema from subquery columns
-		tempSchema := &storage.Schema{
-			Name:    "derived",
-			Columns: make([]storage.Column, len(subqueryResult.Columns)),
-		}
-		for i, col := range subqueryResult.Columns {
-			tempSchema.Columns[i] = storage.Column{
-				Name: col,
-				Type: "ANY",
-			}
-		}
-		return e.executeGroupBy(stmt, derivedRows, tempSchema)
+		return e.executeGroupBy(stmt, derivedRows, schemaFromColumns(columns))
 	}
 
 	// Check for aggregate functions without GROUP BY
-	hasAggregate := e.hasAggregates(stmt.Columns)
-	if hasAggregate {
-		tempSchema := &storage.Schema{
-			Name:    "derived",
-			Columns: make([]storage.Column, len(subqueryResult.Columns)),
-		}
-		for i, col := range subqueryResult.Columns {
-			tempSchema.Columns[i] = storage.Column{
-				Name: col,
-				Type: "ANY",
-			}
-		}
-		return e.executeAggregateSelect(stmt, derivedRows, tempSchema)
+	if e.hasAggregates(stmt.Columns) {
+		return e.executeAggregateSelect(stmt, derivedRows, schemaFromColumns(columns))
 	}
 
 	// Apply ORDER BY, LIMIT, and OFFSET.
 	derivedRows = e.orderAndLimitRows(derivedRows, stmt.OrderBy, stmt.Limit, stmt.Offset, stmt.Columns)
 
-	// Build result
+	// Build result. A projection may mix * and expressions, so each column is
+	// expanded independently.
 	result := NewResult("SELECT")
-
-	// Determine output columns
-	if stmt.Columns[0].Star {
-		// SELECT * from derived table
-		for _, col := range subqueryResult.Columns {
-			result.AddColumn(col)
-		}
-	} else {
-		// Specific columns
-		for _, col := range stmt.Columns {
-			if col.Alias != "" {
-				result.AddColumn(col.Alias)
-			} else if colRef, ok := col.Expr.(*parser.ColumnRef); ok {
+	for _, col := range stmt.Columns {
+		switch {
+		case col.Star:
+			for _, c := range columns {
+				result.AddColumn(c)
+			}
+		case col.Alias != "":
+			result.AddColumn(col.Alias)
+		case col.Expr != nil:
+			if colRef, ok := col.Expr.(*parser.ColumnRef); ok {
 				result.AddColumn(colRef.Column)
 			} else {
 				result.AddColumn("column")
 			}
+		default:
+			result.AddColumn("column")
 		}
 	}
 
-	// Add rows
-	for _, row := range derivedRows {
-		if stmt.Columns[0].Star {
-			// SELECT * - use all columns
-			values := make([]interface{}, len(subqueryResult.Columns))
-			for i, col := range subqueryResult.Columns {
-				values[i] = row[col]
-			}
-			result.AddRow(values...)
-		} else {
-			// Specific columns - evaluate expressions
-			values := make([]interface{}, len(stmt.Columns))
-			for i, col := range stmt.Columns {
+	// Window functions in the projection are evaluated over the materialized
+	// rows before the values are read.
+	windowValues, err := e.computeWindowValues(stmt, derivedRows)
+	if err != nil {
+		return nil, err
+	}
+
+	for rowIdx, row := range derivedRows {
+		values := make([]interface{}, 0, len(stmt.Columns))
+		for _, col := range stmt.Columns {
+			switch {
+			case col.Star:
+				for _, c := range columns {
+					values = append(values, row[c])
+				}
+			case col.Expr != nil:
+				if we, ok := col.Expr.(*parser.WindowExpr); ok {
+					values = append(values, windowValues[we][rowIdx])
+					continue
+				}
 				val, err := e.evalExpr(col.Expr, row)
 				if err != nil {
 					return nil, err
 				}
-				values[i] = val
+				values = append(values, val)
 			}
-			result.AddRow(values...)
 		}
+		result.AddRow(values...)
 	}
 
 	return result, nil
+}
+
+// schemaFromColumns builds a schema with ANY-typed columns for materialized
+// derived tables and CTEs.
+func schemaFromColumns(columns []string) *storage.Schema {
+	schema := &storage.Schema{Name: "derived", Columns: make([]storage.Column, len(columns))}
+	for i, col := range columns {
+		schema.Columns[i] = storage.Column{Name: col, Type: "ANY"}
+	}
+	return schema
 }
 
 // executeAggregateSelect executes a SELECT with aggregate functions.
@@ -1860,36 +1903,50 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 		Condition: tableRef.Join.Condition,
 	}
 	leftKey, rightKey, canHash := extractEqualityJoinKeys(tableRef.Join.Condition, syntheticLeft, syntheticJoin)
-	rightSchema, err := e.schema.GetSchema(rightTable)
-	if err != nil {
-		return nil, err
-	}
 	var rightRows []storage.Row
-	if canHash && strings.EqualFold(rightSchema.PrimaryKey, rightKey) && len(leftRows) <= 256 {
-		seen := make(map[string]bool, len(leftRows))
-		for _, left := range leftRows {
-			key := joinKeyString(left, leftKey)
-			if key == "\x00" || seen[key] {
-				continue
-			}
-			seen[key] = true
-			row, getErr := e.session.GetByPK(rightTable, key)
-			if getErr == storage.ErrKeyNotFound {
-				continue
-			}
-			if getErr != nil {
-				return nil, getErr
-			}
-			normalizeRowBySchema(row, rightSchema)
-			rightRows = append(rightRows, row)
-		}
-	} else {
-		rightRows, err = e.session.Select(rightTable, nil)
+	var rightSchema *storage.Schema
+	var err error
+	switch {
+	case rightTableRef.Subquery != nil:
+		rightRows, rightSchema, err = e.materializeJoinSubquery(rightTableRef)
 		if err != nil {
 			return nil, err
 		}
-		for _, row := range rightRows {
-			normalizeRowBySchema(row, rightSchema)
+	case e.cteTableExists(rightTable):
+		cte, _ := e.cteTableFor(rightTable)
+		rightRows = cloneRows(cte.rows)
+		rightSchema = schemaFromColumns(cte.columns)
+	default:
+		rightSchema, err = e.schema.GetSchema(rightTable)
+		if err != nil {
+			return nil, err
+		}
+		if canHash && strings.EqualFold(rightSchema.PrimaryKey, rightKey) && len(leftRows) <= 256 {
+			seen := make(map[string]bool, len(leftRows))
+			for _, left := range leftRows {
+				key := joinKeyString(left, leftKey)
+				if key == "\x00" || seen[key] {
+					continue
+				}
+				seen[key] = true
+				row, getErr := e.session.GetByPK(rightTable, key)
+				if getErr == storage.ErrKeyNotFound {
+					continue
+				}
+				if getErr != nil {
+					return nil, getErr
+				}
+				normalizeRowBySchema(row, rightSchema)
+				rightRows = append(rightRows, row)
+			}
+		} else {
+			rightRows, err = e.session.Select(rightTable, nil)
+			if err != nil {
+				return nil, err
+			}
+			for _, row := range rightRows {
+				normalizeRowBySchema(row, rightSchema)
+			}
 		}
 	}
 
@@ -1986,7 +2043,17 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 	}
 
 	rightTable := join.Table.Name
-	rightRows, err := e.session.Select(rightTable, nil)
+	var rightRows []storage.Row
+	var err error
+	switch {
+	case join.Table.Subquery != nil:
+		rightRows, _, err = e.materializeJoinSubquery(join.Table)
+	case e.cteTableExists(rightTable):
+		cte, _ := e.cteTableFor(rightTable)
+		rightRows = cloneRows(cte.rows)
+	default:
+		rightRows, err = e.session.Select(rightTable, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2266,6 +2333,66 @@ func (e *Executor) addTableAlias(row storage.Row, alias string) storage.Row {
 	return result
 }
 
+// isConflictError reports whether an insert failed because of a primary-key or
+// unique-index conflict.
+func isConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "duplicate") || strings.Contains(msg, "UNIQUE constraint failed")
+}
+
+// findConflictRow returns the first durable row whose target columns match the
+// inserted row.
+func (e *Executor) findConflictRow(table string, row storage.Row, columns []string) (storage.Row, bool) {
+	rows, err := e.session.Select(table, func(existing storage.Row) bool {
+		for _, col := range columns {
+			if compare(existing[col], row[col]) != 0 {
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil || len(rows) == 0 {
+		return nil, false
+	}
+	return rows[0], true
+}
+
+// applyUpsert implements ON CONFLICT (target) DO UPDATE SET ... for primary-key
+// and unique-index conflicts, resolving excluded.<col> to the new row.
+func (e *Executor) applyUpsert(table string, schema *storage.Schema, existing, row storage.Row, assignments []parser.Assignment) error {
+	context := make(storage.Row)
+	for k, v := range existing {
+		context[k] = v
+		context[table+"."+k] = v
+	}
+	for k, v := range row {
+		context["excluded."+k] = v
+	}
+
+	pk := fmt.Sprintf("%v", existing[schema.PrimaryKey])
+	_, updated, err := e.session.UpdateByPK(table, pk, func(storage.Row) (storage.Row, error) {
+		updates := make(storage.Row)
+		for _, assignment := range assignments {
+			value, evalErr := e.evalExpr(assignment.Value, context)
+			if evalErr != nil {
+				return nil, evalErr
+			}
+			updates[assignment.Column] = value
+		}
+		return updates, nil
+	})
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("ON CONFLICT row disappeared during update")
+	}
+	return nil
+}
+
 // executeInsert executes an INSERT statement.
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	tableName := stmt.Table.Name
@@ -2355,41 +2482,30 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 				}
 			}
 
-			rowID, err := e.session.InsertWithRowID(tableName, row)
-			if err != nil {
-				if strings.Contains(err.Error(), "duplicate") && (stmt.ConflictDoNothing || len(stmt.ConflictUpdate) > 0) {
+			// ON CONFLICT is resolved before inserting. A unique-index conflict
+			// may only surface at transaction commit, so the insert error is not
+			// a reliable signal.
+			if stmt.ConflictDoNothing || len(stmt.ConflictUpdate) > 0 {
+				columns := stmt.ConflictTarget
+				if len(columns) == 0 {
+					columns = []string{schema.PrimaryKey}
+				}
+				if existing, found := e.findConflictRow(tableName, row, columns); found {
 					if stmt.ConflictDoNothing {
 						continue
 					}
-					if len(stmt.ConflictTarget) > 0 && !containsFold(stmt.ConflictTarget, schema.PrimaryKey) {
-						return fmt.Errorf("ON CONFLICT target must include primary key %s", schema.PrimaryKey)
-					}
-					pkValue := row[schema.PrimaryKey]
-					updated, updateErr := e.session.UpdateFunc(tableName, func(existing storage.Row) (storage.Row, error) {
-						context := e.addTableAlias(existing, tableName)
-						updates := make(storage.Row)
-						for _, assignment := range stmt.ConflictUpdate {
-							value, evalErr := e.evalExpr(assignment.Value, context)
-							if evalErr != nil {
-								return nil, evalErr
-							}
-							updates[assignment.Column] = value
-						}
-						return updates, nil
-					}, func(existing storage.Row) bool {
-						return fmt.Sprintf("%v", existing[schema.PrimaryKey]) == fmt.Sprintf("%v", pkValue)
-					})
-					if updateErr != nil {
-						return updateErr
-					}
-					if updated != 1 {
-						return fmt.Errorf("ON CONFLICT row disappeared during update")
+					if err := e.applyUpsert(tableName, schema, existing, row, stmt.ConflictUpdate); err != nil {
+						return err
 					}
 					count++
 					continue
 				}
+			}
+
+			rowID, err := e.session.InsertWithRowID(tableName, row)
+			if err != nil {
 				// Handle conflict based on OnConflict action
-				if strings.Contains(err.Error(), "duplicate") {
+				if isConflictError(err) {
 					switch stmt.OnConflict {
 					case parser.ConflictIgnore:
 						// Silently ignore the duplicate
@@ -5227,6 +5343,10 @@ func (e *Executor) hasAggregates(columns []parser.SelectColumn) bool {
 }
 
 func (e *Executor) isAggregate(expr parser.Expr) bool {
+	if _, ok := expr.(*parser.WindowExpr); ok {
+		// Window functions are computed after grouping; they are not aggregates.
+		return false
+	}
 	if fn, ok := expr.(*parser.FunctionCall); ok {
 		name := strings.ToUpper(fn.Name)
 		switch name {
@@ -5298,7 +5418,7 @@ func resolveOrderByPositions(orderBy []parser.OrderByItem, selectCols []parser.S
 			if pos, err := strconv.Atoi(lit.Value); err == nil && pos >= 1 && pos <= len(selectCols) {
 				col := selectCols[pos-1]
 				if col.Expr != nil {
-					result[i] = parser.OrderByItem{Expr: col.Expr, Desc: item.Desc}
+					result[i] = parser.OrderByItem{Expr: col.Expr, Desc: item.Desc, NullsOrder: item.NullsOrder}
 					continue
 				}
 			}
@@ -5312,7 +5432,26 @@ func resolveOrderByPositions(orderBy []parser.OrderByItem, selectCols []parser.S
 // Keys are precomputed per-row ORDER BY expression values, one per item.
 func orderByLess(a, b []interface{}, orderBy []parser.OrderByItem) bool {
 	for i, item := range orderBy {
-		cmp := compare(a[i], b[i])
+		av, bv := a[i], b[i]
+		if av == nil || bv == nil {
+			if av == nil && bv == nil {
+				continue
+			}
+			// SQLite treats NULL as smaller than any value, so the default puts
+			// NULLs first for ASC and last for DESC. NULLS FIRST/LAST overrides it.
+			nullsFirst := !item.Desc
+			switch item.NullsOrder {
+			case parser.NullsFirst:
+				nullsFirst = true
+			case parser.NullsLast:
+				nullsFirst = false
+			}
+			if av == nil {
+				return nullsFirst
+			}
+			return !nullsFirst
+		}
+		cmp := compare(av, bv)
 		if cmp != 0 {
 			if item.Desc {
 				return cmp > 0
