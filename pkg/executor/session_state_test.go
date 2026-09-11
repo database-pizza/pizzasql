@@ -231,6 +231,20 @@ func TestUniqueIndexMultiRowInsertAtomic(t *testing.T) {
 	}
 }
 
+func TestPrimaryKeyMultiRowInsertAtomic(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+
+	_, err := execSQL(e, "INSERT INTO t VALUES (1, 'a'), (1, 'b')")
+	if err == nil {
+		t.Fatal("expected primary-key violation on the second row")
+	}
+	if res := execMust(t, e, "SELECT count(*) FROM t"); res.Rows[0][0] != int64(0) {
+		t.Fatalf("partial insert applied: %v rows present, want 0", res.Rows[0][0])
+	}
+}
+
 func TestUpdateWithScalarSubqueryInTransaction(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)

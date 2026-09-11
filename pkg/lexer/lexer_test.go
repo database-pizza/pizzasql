@@ -312,11 +312,6 @@ func TestLexerErrors(t *testing.T) {
 			input:  "@",
 			errMsg: "unexpected character: @",
 		},
-		{
-			name:   "single pipe",
-			input:  "|",
-			errMsg: "unexpected character: |",
-		},
 	}
 
 	for _, tt := range tests {
@@ -442,6 +437,52 @@ func TestLexerSubquery(t *testing.T) {
 	for i, exp := range expected {
 		if tokens[i].Type != exp {
 			t.Errorf("token[%d]: expected %v, got %v", i, exp, tokens[i].Type)
+		}
+	}
+}
+
+func TestLexerBitwiseOperators(t *testing.T) {
+	input := "a & b | c << 2 >> 1 ~d"
+	expected := []TokenType{
+		TokenIdent, TokenBitAnd, TokenIdent, TokenBitOr, TokenIdent,
+		TokenShiftLeft, TokenNumber, TokenShiftRight, TokenNumber,
+		TokenBitNot, TokenIdent, TokenEOF,
+	}
+
+	tokens := New(input).Tokenize()
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(tokens), tokens)
+	}
+	for i, exp := range expected {
+		if tokens[i].Type != exp {
+			t.Errorf("token[%d]: expected %v, got %v", i, exp, tokens[i].Type)
+		}
+	}
+}
+
+func TestLexerBlobLiteral(t *testing.T) {
+	tokens := New("X'53514C697465'").Tokenize()
+	if len(tokens) != 2 {
+		t.Fatalf("expected 2 tokens, got %d: %v", len(tokens), tokens)
+	}
+	if tokens[0].Type != TokenBlob {
+		t.Fatalf("expected TokenBlob, got %v", tokens[0].Type)
+	}
+	if tokens[0].Literal != "SQLite" {
+		t.Fatalf("blob literal = %q, want %q", tokens[0].Literal, "SQLite")
+	}
+}
+
+func TestLexerBlobLiteralWhitespaceAndErrors(t *testing.T) {
+	tokens := New("x'53 51'").Tokenize()
+	if tokens[0].Type != TokenBlob || tokens[0].Literal != "SQ" {
+		t.Fatalf("blob with whitespace = %v %q", tokens[0].Type, tokens[0].Literal)
+	}
+
+	for _, input := range []string{"X'5'", "X'zz'", "X'5"} {
+		tok := New(input).NextToken()
+		if tok.Type != TokenError {
+			t.Errorf("input %q: expected TokenError, got %v", input, tok.Type)
 		}
 	}
 }

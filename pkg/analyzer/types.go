@@ -247,6 +247,36 @@ var builtinFunctions = map[string]FunctionSignature{
 	"UNHEX":    {Name: "UNHEX", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeText}, ReturnType: TypeBlob, IsAggregate: false},
 	"ZEROBLOB": {Name: "ZEROBLOB", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeInteger}, ReturnType: TypeBlob, IsAggregate: false},
 	"QUOTE":    {Name: "QUOTE", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+
+	// GoatCounter compatibility: scalar percentage difference.
+	"PERCENT_DIFF": {Name: "PERCENT_DIFF", MinArgs: 2, MaxArgs: 2, ArgTypes: []Type{TypeNumeric, TypeNumeric}, ReturnType: TypeReal, IsAggregate: false},
+
+	// JSON1 scalar functions.
+	"JSON":          {Name: "JSON", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB":         {Name: "JSONB", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_VALID":    {Name: "JSON_VALID", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeInteger, IsAggregate: false},
+	"JSONB_VALID":   {Name: "JSONB_VALID", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeInteger, IsAggregate: false},
+	"JSON_TYPE":     {Name: "JSON_TYPE", MinArgs: 1, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_EXTRACT":  {Name: "JSON_EXTRACT", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_EXTRACT": {Name: "JSONB_EXTRACT", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeAny, IsAggregate: false},
+	"JSON_SET":      {Name: "JSON_SET", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_SET":     {Name: "JSONB_SET", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_INSERT":   {Name: "JSON_INSERT", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_INSERT":  {Name: "JSONB_INSERT", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_REPLACE":  {Name: "JSON_REPLACE", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_REPLACE": {Name: "JSONB_REPLACE", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_REMOVE":   {Name: "JSON_REMOVE", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_REMOVE":  {Name: "JSONB_REMOVE", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_ARRAY":    {Name: "JSON_ARRAY", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_ARRAY":   {Name: "JSONB_ARRAY", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_OBJECT":   {Name: "JSON_OBJECT", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_OBJECT":  {Name: "JSONB_OBJECT", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSON_QUOTE":    {Name: "JSON_QUOTE", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_QUOTE":   {Name: "JSONB_QUOTE", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+
+	// JSON1 aggregate.
+	"JSON_GROUP_ARRAY":  {Name: "JSON_GROUP_ARRAY", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: true},
+	"JSONB_GROUP_ARRAY": {Name: "JSONB_GROUP_ARRAY", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: true},
 }
 
 // LookupFunction returns the function signature for a function name.
@@ -281,6 +311,7 @@ type ColumnInfo struct {
 	PrimaryKey bool
 	Default    interface{}
 	TableName  string // For qualified references
+	Generated  bool   // generated columns cannot be written by the user
 }
 
 // TableInfo describes a table schema.

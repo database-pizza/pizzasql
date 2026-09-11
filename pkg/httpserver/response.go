@@ -1,11 +1,27 @@
 package httpserver
 
 import (
+	"encoding/hex"
 	"log"
 	"net/http"
 
 	"github.com/goccy/go-json"
 )
+
+// sanitizeRows converts non-JSON scalar values into a lossless textual form.
+// BLOBs are rendered as PostgreSQL-style \x-hex so HTTP clients receive the
+// same bytea text representation as the PostgreSQL wire protocol instead of an
+// encoding-dependent base64 string.
+func sanitizeRows(rows [][]interface{}) [][]interface{} {
+	for _, row := range rows {
+		for i, v := range row {
+			if b, ok := v.([]byte); ok {
+				row[i] = `\x` + hex.EncodeToString(b)
+			}
+		}
+	}
+	return rows
+}
 
 // ColumnInfo represents column metadata.
 type ColumnInfo struct {

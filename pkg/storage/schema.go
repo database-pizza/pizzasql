@@ -34,6 +34,11 @@ type Column struct {
 	Nullable   bool        `json:"nullable"`
 	Default    interface{} `json:"default,omitempty"`
 	PrimaryKey bool        `json:"primary_key"`
+	// GeneratedExpr holds the SQL text of a GENERATED ALWAYS AS (expr) column.
+	// GeneratedStored reports whether the value is materialized on write
+	// (STORED, the only form this engine persists) versus computed on read.
+	GeneratedExpr   string `json:"generated_expr,omitempty"`
+	GeneratedStored bool   `json:"generated_stored,omitempty"`
 }
 
 // Index represents an index definition.
@@ -43,12 +48,18 @@ type Index struct {
 	Columns   []IndexColumn `json:"columns"`
 	Unique    bool          `json:"unique"`
 	CreatedAt time.Time     `json:"created_at"`
+	// OnConflict is the default conflict resolution declared for this index via
+	// a UNIQUE(...) ON CONFLICT clause. Empty means the SQLite default (ABORT).
+	OnConflict string `json:"on_conflict,omitempty"`
 }
 
-// IndexColumn represents a column in an index.
+// IndexColumn represents a column in an index. Expression is set for expression
+// indexes (e.g. lower(email)); a plain column index leaves it empty and uses
+// Name.
 type IndexColumn struct {
-	Name string `json:"name"`
-	Desc bool   `json:"desc"`
+	Name       string `json:"name"`
+	Desc       bool   `json:"desc"`
+	Expression string `json:"expression,omitempty"`
 }
 
 // rowIDAllocator owns the next-ROWID state for a single table. It is a separate
@@ -454,6 +465,7 @@ func (s *Schema) ToAnalyzerTableInfo() *analyzer.TableInfo {
 			Nullable:   col.Nullable,
 			PrimaryKey: col.PrimaryKey,
 			TableName:  s.Name,
+			Generated:  col.GeneratedExpr != "",
 		})
 	}
 
@@ -945,6 +957,10 @@ func (m *SchemaManager) AddColumn(table string, column Column) error {
 
 // DropColumn removes a column from a table.
 func (m *SchemaManager) DropColumn(table, columnName string) error {
+	tableLock := m.tableLock(table)
+	tableLock.Lock()
+	defer tableLock.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -975,6 +991,17 @@ func (m *SchemaManager) DropColumn(table, columnName string) error {
 
 	schema = cloneSchema(schema)
 	schema.Columns = newColumns
+	if err := m.rewriteRows(table, func(row Row) bool {
+		for key := range row {
+			if strings.EqualFold(key, columnName) {
+				delete(row, key)
+				return true
+			}
+		}
+		return false
+	}); err != nil {
+		return err
+	}
 
 	// Update schema
 	return m.updateSchemaUnsafe(schema)
@@ -1001,24 +1028,58 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	// Update schema name
 	schema.Name = newName
 
-	rowIDKey := m.rowIDKey(oldName)
+	// Move durable rows from the old table's data prefix to the new one. Without
+	// this, ALTER TABLE ... RENAME leaves every row under the old key and the
+	// renamed table appears empty.
+	if err := m.renameDataKeys(oldName, newName); err != nil {
+		return err
+	}
 
-	// Delete old schema
+	// Repoint indexes that belonged to the old table.
+	if err := m.repointIndexesLocked(oldName, newName); err != nil {
+		return err
+	}
+
+	// Build the replacement catalog before switching schema names. The schema,
+	// catalog, and stale ROWID state change in one batch, so a crash cannot
+	// leave neither table name addressable after all row chunks have moved.
+	tables, err := m.ListTables()
+	if err != nil {
+		return err
+	}
+	foundOld := false
+	for i, name := range tables {
+		if strings.EqualFold(name, oldName) {
+			tables[i] = newName
+			foundOld = true
+			break
+		}
+	}
+	if !foundOld {
+		return fmt.Errorf("table not found in catalog: %s", oldName)
+	}
+	catalogData, err := json.Marshal(tables)
+	if err != nil {
+		return err
+	}
+	schemaData, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
 	oldKey := m.schemaKey(oldName)
+	newKey := m.schemaKey(newName)
 	err = m.pool.WithClient(func(c *KVClient) error {
-		return c.Delete(oldKey)
+		_, err := c.BatchWrite([]BatchOp{
+			{Op: batchPut, Key: []byte(newKey), Value: schemaData},
+			{Op: batchDelete, Key: []byte(oldKey)},
+			{Op: batchDelete, Key: []byte(m.rowIDKey(oldName))},
+			{Op: batchPut, Key: []byte(m.catalogKey()), Value: catalogData},
+		}, nil)
+		return err
 	})
 	if err != nil {
 		return err
 	}
-
-	// Remove from catalog
-	m.removeFromCatalog(oldName)
-
-	// Move ROWID state.
-	m.pool.WithClient(func(c *KVClient) error {
-		return c.Delete(rowIDKey)
-	})
 
 	// Update cache
 	oldLower := strings.ToLower(oldName)
@@ -1028,19 +1089,6 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	delete(m.rowIDAlloc, oldLower)
 	m.rowIDMu.Unlock()
 
-	// Write new schema
-	newKey := m.schemaKey(newName)
-	data, _ := json.Marshal(schema)
-	err = m.pool.WithClient(func(c *KVClient) error {
-		return c.Write(newKey, string(data))
-	})
-	if err != nil {
-		return err
-	}
-
-	// Add to catalog
-	m.addToCatalog(newName)
-
 	// Update cache
 	m.cache[newLower] = schema
 	m.bumpVersionLocked()
@@ -1048,8 +1096,131 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	return nil
 }
 
+// renameDataKeys moves every durable row of a table from the old name's data
+// prefix to the new name's prefix in a single atomic batch per page.
+func (m *SchemaManager) renameDataKeys(oldName, newName string) error {
+	oldPrefix := []byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(oldName)))
+	newPrefix := fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(newName))
+	return m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.Scan(oldPrefix)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if cerr := cursor.Close(); retErr == nil {
+				retErr = cerr
+			}
+		}()
+
+		ops := make([]BatchOp, 0, scanPageSize*2)
+		batchBytes := 8
+		flush := func() error {
+			if len(ops) == 0 {
+				return nil
+			}
+			if _, err := client.BatchWrite(ops, nil); err != nil {
+				return err
+			}
+			ops = ops[:0]
+			batchBytes = 8
+			return nil
+		}
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				suffix := string(e.Key[len(oldPrefix):])
+				newKey := []byte(newPrefix + suffix)
+				opBytes := 24 + len(newKey) + len(e.Value) + len(e.Key)
+				if len(ops)+2 > maxOperations || batchBytes+opBytes > bulkBatchByteBudget {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+				ops = append(ops,
+					BatchOp{Op: batchPut, Key: newKey, Value: e.Value},
+					BatchOp{Op: batchDelete, Key: append([]byte(nil), e.Key...)},
+				)
+				batchBytes += opBytes
+			}
+			if done {
+				return flush()
+			}
+		}
+	})
+}
+
+// repointIndexesLocked updates indexes whose table was renamed. The caller holds
+// m.mu; it reads the durable index list directly rather than calling the
+// self-locking ListIndexes helper.
+func (m *SchemaManager) repointIndexesLocked(oldName, newName string) error {
+	var names []string
+	if m.indexListCached {
+		names = append([]string(nil), m.indexListCache...)
+	} else {
+		var data string
+		err := m.pool.WithClient(func(c *KVClient) error {
+			var rerr error
+			data, rerr = c.Read(m.indexListKey())
+			return rerr
+		})
+		if err == ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal([]byte(data), &names); err != nil {
+			return err
+		}
+	}
+
+	for _, name := range names {
+		key := m.indexKey(name)
+		var data string
+		err := m.pool.WithClient(func(c *KVClient) error {
+			var rerr error
+			data, rerr = c.Read(key)
+			return rerr
+		})
+		if err != nil {
+			if err == ErrKeyNotFound {
+				continue
+			}
+			return err
+		}
+		var idx Index
+		if err := json.Unmarshal([]byte(data), &idx); err != nil {
+			return err
+		}
+		if !strings.EqualFold(idx.Table, oldName) {
+			continue
+		}
+		idx.Table = newName
+		updated, err := json.Marshal(&idx)
+		if err != nil {
+			return err
+		}
+		if err := m.pool.WithClient(func(c *KVClient) error {
+			return c.Write(key, string(updated))
+		}); err != nil {
+			return err
+		}
+		if cached, ok := m.indexCache[strings.ToLower(name)]; ok {
+			cached.Table = newName
+		}
+	}
+	return nil
+}
+
 // RenameColumn renames a column in a table.
 func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
+	tableLock := m.tableLock(table)
+	tableLock.Lock()
+	defer tableLock.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1084,9 +1255,84 @@ func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 	if !found {
 		return fmt.Errorf("column not found: %s", oldName)
 	}
+	if err := m.rewriteRows(table, func(row Row) bool {
+		for key, value := range row {
+			if strings.EqualFold(key, oldName) {
+				delete(row, key)
+				row[newName] = value
+				return true
+			}
+		}
+		return false
+	}); err != nil {
+		return err
+	}
 
 	// Update schema
 	return m.updateSchemaUnsafe(schema)
+}
+
+// rewriteRows applies an idempotent name-keyed row transformation in bounded
+// batches. Column DDL updates the schema only after all rows are rewritten, so
+// an interrupted operation can safely resume against the old schema.
+func (m *SchemaManager) rewriteRows(table string, transform func(Row) bool) error {
+	prefix := []byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(table)))
+	return m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.Scan(prefix)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if cerr := cursor.Close(); retErr == nil {
+				retErr = cerr
+			}
+		}()
+
+		ops := make([]BatchOp, 0, scanPageSize)
+		batchBytes := 8
+		flush := func() error {
+			if len(ops) == 0 {
+				return nil
+			}
+			if _, err := client.BatchWrite(ops, nil); err != nil {
+				return err
+			}
+			ops = ops[:0]
+			batchBytes = 8
+			return nil
+		}
+
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				row, err := decodeRow(entry.Value)
+				if err != nil {
+					return err
+				}
+				if !transform(row) {
+					continue
+				}
+				value, err := encodeRow(row)
+				if err != nil {
+					return err
+				}
+				opBytes := 12 + len(entry.Key) + len(value)
+				if len(ops) == maxOperations || batchBytes+opBytes > bulkBatchByteBudget {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+				ops = append(ops, BatchOp{Op: batchPut, Key: append([]byte(nil), entry.Key...), Value: value})
+				batchBytes += opBytes
+			}
+			if done {
+				return flush()
+			}
+		}
+	})
 }
 
 // getSchemaUnsafe gets a schema without locking (internal use).

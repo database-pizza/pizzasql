@@ -145,6 +145,7 @@ type InsertStmt struct {
 	ConflictTarget    []string
 	ConflictUpdate    []Assignment
 	ConflictDoNothing bool
+	Returning         []SelectColumn
 }
 
 func (s *InsertStmt) node()     {}
@@ -152,9 +153,11 @@ func (s *InsertStmt) stmtNode() {}
 
 // UpdateStmt represents an UPDATE statement.
 type UpdateStmt struct {
-	Table *TableRef
-	Set   []Assignment
-	Where Expr
+	Table     *TableRef
+	Set       []Assignment
+	From      []TableRef
+	Where     Expr
+	Returning []SelectColumn
 }
 
 func (s *UpdateStmt) node()     {}
@@ -168,8 +171,9 @@ type Assignment struct {
 
 // DeleteStmt represents a DELETE statement.
 type DeleteStmt struct {
-	Table *TableRef
-	Where Expr
+	Table     *TableRef
+	Where     Expr
+	Returning []SelectColumn
 }
 
 func (s *DeleteStmt) node()     {}
@@ -191,6 +195,10 @@ type ColumnDef struct {
 	Name        string
 	Type        DataType
 	Constraints []ColumnConstraint
+	// GeneratedExpr is non-nil for a GENERATED ALWAYS AS (expr) column. A
+	// generated column's value is computed rather than supplied by the user.
+	GeneratedExpr   Expr
+	GeneratedStored bool // true for STORED, false for VIRTUAL
 }
 
 // DataType represents a SQL data type.
@@ -207,6 +215,11 @@ type ColumnConstraint struct {
 	Default   Expr   // for DEFAULT
 	RefTable  string // for REFERENCES
 	RefColumn string // for REFERENCES
+	Check     Expr   // for CHECK
+	// OnConflict is the conflict resolution algorithm declared with
+	// ON CONFLICT REPLACE/etc. (ConflictAbort is the zero value/default).
+	OnConflict    ConflictAction
+	HasOnConflict bool
 }
 
 // ConstraintType represents the type of constraint.
@@ -230,6 +243,10 @@ type TableConstraint struct {
 	RefTable   string   // for FOREIGN KEY
 	RefColumns []string // for FOREIGN KEY
 	Check      Expr     // for CHECK
+	// OnConflict is the conflict resolution declared with ON CONFLICT
+	// REPLACE/etc.; HasOnConflict distinguishes it from the default ABORT.
+	OnConflict    ConflictAction
+	HasOnConflict bool
 }
 
 // DropTableStmt represents a DROP TABLE statement.
@@ -253,10 +270,13 @@ type CreateIndexStmt struct {
 func (s *CreateIndexStmt) node()     {}
 func (s *CreateIndexStmt) stmtNode() {}
 
-// IndexColumn represents a column in an index.
+// IndexColumn represents a column in an index. Expr is set for expression
+// indexes (e.g. an index on lower(email)); a plain column index leaves it nil
+// and uses Name.
 type IndexColumn struct {
 	Name string
 	Desc bool // true for DESC ordering
+	Expr Expr
 }
 
 // DropIndexStmt represents a DROP INDEX statement.
@@ -362,6 +382,15 @@ type PragmaStmt struct {
 
 func (s *PragmaStmt) node()     {}
 func (s *PragmaStmt) stmtNode() {}
+
+// AnalyzeStmt represents an ANALYZE statement. PizzaSQL does not maintain
+// optimizer statistics, so it is accepted and executed as a documented no-op.
+type AnalyzeStmt struct {
+	Name string // optional table name
+}
+
+func (s *AnalyzeStmt) node()     {}
+func (s *AnalyzeStmt) stmtNode() {}
 
 // ExplainStmt represents an EXPLAIN statement.
 type ExplainStmt struct {
@@ -538,6 +567,18 @@ type IsNullExpr struct {
 
 func (e *IsNullExpr) node()     {}
 func (e *IsNullExpr) exprNode() {}
+
+// IsDistinctExpr represents `left IS DISTINCT FROM right` (Not=false) or
+// `left IS NOT DISTINCT FROM right` (Not=true). Unlike `=`, NULLs compare
+// equal to each other and distinct from non-NULLs.
+type IsDistinctExpr struct {
+	Left  Expr
+	Right Expr
+	Not   bool
+}
+
+func (e *IsDistinctExpr) node()     {}
+func (e *IsDistinctExpr) exprNode() {}
 
 // CastExpr represents a CAST expression.
 type CastExpr struct {

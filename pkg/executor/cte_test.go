@@ -72,6 +72,31 @@ func TestCTEChained(t *testing.T) {
 	}
 }
 
+func TestCTECommaCrossJoin(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	res := execMust(t, e, `WITH x AS (SELECT 3 AS total),
+		y AS (SELECT 1 AS total_events),
+		z AS (SELECT 3 AS total_utc)
+		SELECT * FROM x, y, z`)
+	if res.RowCount != 1 {
+		t.Fatalf("expected one row, got %d: %v", res.RowCount, res.Rows)
+	}
+	wantColumns := []string{"total", "total_events", "total_utc"}
+	for i, want := range wantColumns {
+		if res.Columns[i] != want {
+			t.Fatalf("column %d = %q, want %q (all: %v)", i, res.Columns[i], want, res.Columns)
+		}
+	}
+	wantValues := []int64{3, 1, 3}
+	for i, want := range wantValues {
+		if res.Rows[0][i] != want {
+			t.Fatalf("value %d = %v, want %d (row: %v)", i, res.Rows[0][i], want, res.Rows[0])
+		}
+	}
+}
+
 // TestRecursiveCTENonCompound verifies a plain CTE under WITH RECURSIVE is
 // treated as non-recursive.
 func TestRecursiveCTENonCompound(t *testing.T) {

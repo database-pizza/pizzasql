@@ -1,6 +1,7 @@
 package lexer
 
 import (
+	"encoding/hex"
 	"strings"
 	"unicode"
 )
@@ -80,6 +81,14 @@ func (l *Lexer) NextToken() Token {
 		tok.Type = TokenPercent
 		tok.Literal = "%"
 		l.readChar()
+	case '&':
+		tok.Type = TokenBitAnd
+		tok.Literal = "&"
+		l.readChar()
+	case '~':
+		tok.Type = TokenBitNot
+		tok.Literal = "~"
+		l.readChar()
 	case '(':
 		tok.Type = TokenLParen
 		tok.Literal = "("
@@ -113,6 +122,10 @@ func (l *Lexer) NextToken() Token {
 			l.readChar()
 			tok.Type = TokenNeq
 			tok.Literal = "<>"
+		} else if l.peekChar() == '<' {
+			l.readChar()
+			tok.Type = TokenShiftLeft
+			tok.Literal = "<<"
 		} else {
 			tok.Type = TokenLt
 			tok.Literal = "<"
@@ -123,6 +136,10 @@ func (l *Lexer) NextToken() Token {
 			l.readChar()
 			tok.Type = TokenGte
 			tok.Literal = ">="
+		} else if l.peekChar() == '>' {
+			l.readChar()
+			tok.Type = TokenShiftRight
+			tok.Literal = ">>"
 		} else {
 			tok.Type = TokenGt
 			tok.Literal = ">"
@@ -146,8 +163,8 @@ func (l *Lexer) NextToken() Token {
 			tok.Literal = "||"
 			l.readChar()
 		} else {
-			tok.Type = TokenError
-			tok.Literal = "unexpected character: |"
+			tok.Type = TokenBitOr
+			tok.Literal = "|"
 			l.readChar()
 		}
 	case '-':
@@ -168,7 +185,9 @@ func (l *Lexer) NextToken() Token {
 	case '[':
 		tok = l.readBracketIdentifier()
 	default:
-		if isLetter(l.ch) || l.ch == '_' {
+		if (l.ch == 'x' || l.ch == 'X') && l.peekChar() == '\'' {
+			tok = l.readBlob()
+		} else if isLetter(l.ch) || l.ch == '_' {
 			tok = l.readIdentifier()
 		} else if isDigit(l.ch) {
 			tok = l.readNumber()
@@ -320,6 +339,55 @@ func (l *Lexer) readBracketIdentifier() Token {
 	return tok
 }
 
+// readBlob reads a X'hex' blob literal. Whitespace between hex digits is
+// ignored (SQLite allows it). The token literal holds the decoded raw bytes so
+// consumers never have to re-parse the hex form.
+func (l *Lexer) readBlob() Token {
+	tok := Token{
+		Type:   TokenBlob,
+		Line:   l.line,
+		Column: l.column,
+	}
+
+	l.readChar() // skip x/X
+	l.readChar() // skip opening quote
+
+	var sb strings.Builder
+	for l.ch != '\'' && l.ch != 0 {
+		if isHexDigit(l.ch) {
+			sb.WriteByte(l.ch)
+		} else if l.ch != ' ' && l.ch != '\t' && l.ch != '\n' && l.ch != '\r' {
+			tok.Type = TokenError
+			tok.Literal = "invalid character in blob literal: " + string(l.ch)
+			return tok
+		}
+		l.readChar()
+	}
+
+	if l.ch == 0 {
+		tok.Type = TokenError
+		tok.Literal = "unterminated blob literal"
+		return tok
+	}
+	l.readChar() // skip closing quote
+
+	if sb.Len()%2 != 0 {
+		tok.Type = TokenError
+		tok.Literal = "blob literal must contain an even number of hex digits"
+		return tok
+	}
+
+	decoded, err := hex.DecodeString(sb.String())
+	if err != nil {
+		tok.Type = TokenError
+		tok.Literal = "invalid blob literal: " + err.Error()
+		return tok
+	}
+
+	tok.Literal = string(decoded)
+	return tok
+}
+
 // readIdentifier reads an identifier or keyword.
 func (l *Lexer) readIdentifier() Token {
 	tok := Token{
@@ -396,4 +464,8 @@ func isLetter(ch byte) bool {
 
 func isDigit(ch byte) bool {
 	return ch >= '0' && ch <= '9'
+}
+
+func isHexDigit(ch byte) bool {
+	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
 }

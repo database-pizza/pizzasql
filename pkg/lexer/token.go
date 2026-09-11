@@ -14,20 +14,26 @@ const (
 	TokenIdent  // identifiers
 	TokenNumber // integers and floats
 	TokenString // 'string literals'
+	TokenBlob   // X'hex' blob literals
 
 	// Operators
-	TokenPlus    // +
-	TokenMinus   // -
-	TokenStar    // *
-	TokenSlash   // /
-	TokenPercent // %
-	TokenConcat  // ||
-	TokenEq      // =
-	TokenNeq     // <> or !=
-	TokenLt      // <
-	TokenLte     // <=
-	TokenGt      // >
-	TokenGte     // >=
+	TokenPlus       // +
+	TokenMinus      // -
+	TokenStar       // *
+	TokenSlash      // /
+	TokenPercent    // %
+	TokenConcat     // ||
+	TokenEq         // =
+	TokenNeq        // <> or !=
+	TokenLt         // <
+	TokenLte        // <=
+	TokenGt         // >
+	TokenGte        // >=
+	TokenBitAnd     // &
+	TokenBitOr      // |
+	TokenBitNot     // ~
+	TokenShiftLeft  // <<
+	TokenShiftRight // >>
 
 	// Punctuation
 	TokenLParen    // (
@@ -46,6 +52,7 @@ const (
 	TokenAS
 	TokenDISTINCT
 	TokenALL
+	TokenRETURNING
 
 	TokenINSERT
 	TokenINTO
@@ -203,12 +210,15 @@ var keywords = map[string]TokenType{
 	"AS":       TokenAS,
 	"DISTINCT": TokenDISTINCT,
 	"ALL":      TokenALL,
-	"INSERT":   TokenINSERT,
-	"INTO":     TokenINTO,
-	"VALUES":   TokenVALUES,
-	"UPDATE":   TokenUPDATE,
-	"SET":      TokenSET,
-	"DELETE":   TokenDELETE,
+	// RETURNING is a keyword so it is not mistaken for a table/column alias in
+	// INSERT ... SELECT ... RETURNING.
+	"RETURNING": TokenRETURNING,
+	"INSERT":    TokenINSERT,
+	"INTO":      TokenINTO,
+	"VALUES":    TokenVALUES,
+	"UPDATE":    TokenUPDATE,
+	"SET":       TokenSET,
+	"DELETE":    TokenDELETE,
 
 	// DDL
 	"CREATE":   TokenCREATE,
@@ -329,7 +339,6 @@ var keywords = map[string]TokenType{
 	"PRAGMA":  TokenPRAGMA,
 	"EXPLAIN": TokenEXPLAIN,
 	"QUERY":   TokenQUERY,
-	"PLAN":    TokenPLAN,
 	"ATTACH":  TokenATTACH,
 	"DETACH":  TokenDETACH,
 	"VACUUM":  TokenVACUUM,
@@ -380,29 +389,35 @@ func (t Token) IsOperator() bool {
 }
 
 var tokenNames = map[TokenType]string{
-	TokenEOF:       "EOF",
-	TokenError:     "ERROR",
-	TokenComment:   "COMMENT",
-	TokenIdent:     "IDENT",
-	TokenNumber:    "NUMBER",
-	TokenString:    "STRING",
-	TokenPlus:      "+",
-	TokenMinus:     "-",
-	TokenStar:      "*",
-	TokenSlash:     "/",
-	TokenPercent:   "%",
-	TokenConcat:    "||",
-	TokenEq:        "=",
-	TokenNeq:       "<>",
-	TokenLt:        "<",
-	TokenLte:       "<=",
-	TokenGt:        ">",
-	TokenGte:       ">=",
-	TokenLParen:    "(",
-	TokenRParen:    ")",
-	TokenComma:     ",",
-	TokenSemicolon: ";",
-	TokenDot:       ".",
+	TokenEOF:        "EOF",
+	TokenError:      "ERROR",
+	TokenComment:    "COMMENT",
+	TokenIdent:      "IDENT",
+	TokenNumber:     "NUMBER",
+	TokenString:     "STRING",
+	TokenBlob:       "BLOB",
+	TokenPlus:       "+",
+	TokenMinus:      "-",
+	TokenStar:       "*",
+	TokenSlash:      "/",
+	TokenPercent:    "%",
+	TokenConcat:     "||",
+	TokenEq:         "=",
+	TokenNeq:        "<>",
+	TokenLt:         "<",
+	TokenLte:        "<=",
+	TokenGt:         ">",
+	TokenGte:        ">=",
+	TokenBitAnd:     "&",
+	TokenBitOr:      "|",
+	TokenBitNot:     "~",
+	TokenShiftLeft:  "<<",
+	TokenShiftRight: ">>",
+	TokenLParen:     "(",
+	TokenRParen:     ")",
+	TokenComma:      ",",
+	TokenSemicolon:  ";",
+	TokenDot:        ".",
 }
 
 func (t TokenType) String() string {

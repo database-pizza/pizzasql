@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -909,23 +910,19 @@ func parameterLiteral(param boundParameter) (string, error) {
 
 // sendResult sends query results
 func (c *Connection) sendResult(result *executor.Result, stmt parser.Statement) error {
-	// For SELECT statements, send row description and data rows
-	if _, isSelect := stmt.(*parser.SelectStmt); isSelect && len(result.Columns) > 0 {
-		// Send row description
-		if err := c.sendRowDescription(result.Columns, result.ColumnTypes); err != nil {
+	// Any statement that produced a row set (SELECT, or INSERT/UPDATE/DELETE
+	// with RETURNING) sends a row description and its data rows. Other
+	// statements only send the command completion tag.
+	if len(result.Columns) > 0 {
+		if err := c.sendRowDescription(result.Columns, wireColumnTypes(result)); err != nil {
 			return err
 		}
-
-		// Send data rows
 		for _, row := range result.Rows {
 			if err := c.sendDataRow(row, result.Columns); err != nil {
 				return err
 			}
 		}
-
-		// Send command complete
-		tag := fmt.Sprintf("SELECT %d", len(result.Rows))
-		return c.sendCommandComplete(tag)
+		return c.sendCommandComplete(c.getCommandTag(stmt, result))
 	}
 
 	// For other statements, just send command complete
@@ -933,9 +930,34 @@ func (c *Connection) sendResult(result *executor.Result, stmt parser.Statement) 
 	return c.sendCommandComplete(tag)
 }
 
+// wireColumnTypes corrects declared-affinity metadata when SQLite has stored a
+// value of another type. In particular, binding []byte to a VARCHAR column is
+// still a BLOB in SQLite; advertising TEXT while encoding PostgreSQL bytea text
+// would make clients receive the literal "\\x..." instead of the original
+// bytes.
+func wireColumnTypes(result *executor.Result) []string {
+	types := append([]string(nil), result.ColumnTypes...)
+	if len(types) < len(result.Columns) {
+		types = append(types, make([]string, len(result.Columns)-len(types))...)
+	}
+	for _, row := range result.Rows {
+		for i, value := range row {
+			if i >= len(types) {
+				break
+			}
+			if _, ok := value.([]byte); ok {
+				types[i] = "BLOB"
+			}
+		}
+	}
+	return types
+}
+
 // getCommandTag returns the command completion tag
 func (c *Connection) getCommandTag(stmt parser.Statement, result *executor.Result) string {
 	switch s := stmt.(type) {
+	case *parser.SelectStmt:
+		return fmt.Sprintf("SELECT %d", len(result.Rows))
 	case *parser.CreateTableStmt:
 		return "CREATE TABLE"
 	case *parser.DropTableStmt:
@@ -1150,6 +1172,11 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 func (c *Connection) valueToString(value interface{}) string {
 	if value == nil {
 		return ""
+	}
+	// PostgreSQL's text format for bytea is \x followed by hex. Emitting that
+	// lets libpq/pgx decode a BLOB column (OID 17) losslessly.
+	if b, ok := value.([]byte); ok {
+		return `\x` + hex.EncodeToString(b)
 	}
 	return fmt.Sprintf("%v", value)
 }

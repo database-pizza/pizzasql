@@ -2,6 +2,7 @@ package executor
 
 import (
 	"container/heap"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -93,6 +94,12 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 		currentDatabase:   "main",
 		views:             make(map[string]*parser.SelectStmt),
 	}
+
+	// Expression indexes persist only SQL text, so the storage layer needs a
+	// stateless evaluator to compute their values. The evaluator is a package
+	// function with no per-connection state, so registering it here is
+	// idempotent and safe across concurrent executors.
+	table.SetExpressionEvaluator(EvalStoredExpression)
 
 	// Register the main database
 	executor.attachedDatabases["main"] = &DatabaseConnection{
@@ -198,6 +205,8 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeAttach(s)
 	case *parser.DetachStmt:
 		return e.executeDetach(s)
+	case *parser.AnalyzeStmt:
+		return e.executeAnalyze(s)
 	}
 
 	// SQLite catalog/metadata dispatch. SELECTs against sqlite_master /
@@ -324,12 +333,44 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return e.executeSelectExpr(stmt)
 	}
 
+	// Non-recursive CTEs are desugared to derived tables by the parser. Preserve
+	// every entry in a comma-separated list instead of dispatching solely on the
+	// first derived table.
+	if len(stmt.From) > 1 {
+		allSubqueries := true
+		for _, ref := range stmt.From {
+			if ref.Subquery == nil || ref.Join != nil {
+				allSubqueries = false
+				break
+			}
+		}
+		if allSubqueries {
+			return e.executeSelectFromSubqueries(stmt)
+		}
+	}
+
 	// Check if FROM clause is a subquery (derived table)
 	if stmt.From[0].Subquery != nil {
 		return e.executeSelectFromSubquery(stmt)
 	}
 
 	tableName := stmt.From[0].Name
+
+	// A comma-separated list of materialized CTEs is an implicit cross join.
+	// Handle it before the single-CTE shortcut below so later FROM entries are
+	// not silently discarded.
+	if len(stmt.From) > 1 {
+		allCTEs := true
+		for _, ref := range stmt.From {
+			if ref.Subquery != nil || ref.Join != nil || !e.cteTableExists(ref.Name) {
+				allCTEs = false
+				break
+			}
+		}
+		if allCTEs {
+			return e.executeSelectOnMaterializedCTEs(stmt)
+		}
+	}
 
 	// A materialized CTE is served from memory, not from storage.
 	if cte, ok := e.cteTableFor(tableName); ok {
@@ -1098,11 +1139,12 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 								m[k] = v // qualified keys from right always win
 							}
 						}
-						if join.Condition != nil {
-							val, _ := e.evalExpr(join.Condition, m)
-							if !toBool(val) {
-								continue
-							}
+						matches, merr := e.joinMatches(l, r, m, join)
+						if merr != nil {
+							return nil, merr
+						}
+						if !matches {
+							continue
 						}
 						joined = append(joined, m)
 					}
@@ -1188,10 +1230,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		}
 	}
 
-	// Populate column types from schema metadata for single-table projections so
-	// protocol consumers can decode typed values (e.g. timestamps) even when the
-	// result set is empty. Join and multi-table projections defer type metadata.
-	if !isMultiTable && !hasJoin {
+	// Populate column types from schema metadata so protocol consumers can
+	// decode typed values (e.g. timestamps) even when the result set is empty.
+	if isMultiTable || hasJoin {
+		result.ColumnTypes = e.joinedSelectColumnTypes(stmt, allTableRefs)
+	} else {
 		result.ColumnTypes = selectColumnTypes(stmt, schema)
 	}
 
@@ -1416,6 +1459,48 @@ func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, 
 	return e.executeSelectOnMaterialized(stmt, subqueryResult.Columns, subqueryResult.Rows)
 }
 
+func (e *Executor) executeSelectFromSubqueries(stmt *parser.SelectStmt) (*Result, error) {
+	rows := []storage.Row{{}}
+	var columns, starKeys []string
+	for _, ref := range stmt.From {
+		res, err := e.executeSelect(ref.Subquery)
+		if err != nil {
+			return nil, fmt.Errorf("subquery error: %w", err)
+		}
+		columns = append(columns, res.Columns...)
+		for _, column := range res.Columns {
+			starKeys = append(starKeys, ref.Alias+"."+column)
+		}
+
+		right := make([]storage.Row, 0, len(res.Rows))
+		for _, values := range res.Rows {
+			row := make(storage.Row, len(res.Columns))
+			for i, column := range res.Columns {
+				if i < len(values) {
+					row[column] = values[i]
+				}
+			}
+			right = append(right, e.addTableAlias(row, ref.Alias))
+		}
+
+		joined := make([]storage.Row, 0, len(rows)*len(right))
+		for _, leftRow := range rows {
+			for _, rightRow := range right {
+				row := make(storage.Row, len(leftRow)+len(rightRow))
+				for key, value := range leftRow {
+					row[key] = value
+				}
+				for key, value := range rightRow {
+					row[key] = value
+				}
+				joined = append(joined, row)
+			}
+		}
+		rows = joined
+	}
+	return e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
+}
+
 // executeSelectOnMaterialized runs a SELECT whose FROM[0] is already
 // materialized as (columns, rowValues). It is shared by derived tables and
 // materialized CTEs.
@@ -1430,6 +1515,49 @@ func (e *Executor) executeSelectOnMaterialized(stmt *parser.SelectStmt, columns 
 		}
 		derivedRows = append(derivedRows, row)
 	}
+	return e.executeSelectOnMaterializedRows(stmt, columns, columns, derivedRows)
+}
+
+// executeSelectOnMaterializedCTEs cross-joins comma-separated CTEs while
+// retaining qualified keys for expressions and a stable positional key for
+// every SELECT * column, including duplicate column names.
+func (e *Executor) executeSelectOnMaterializedCTEs(stmt *parser.SelectStmt) (*Result, error) {
+	rows := []storage.Row{{}}
+	var columns, starKeys []string
+	for _, ref := range stmt.From {
+		cte, _ := e.cteTableFor(ref.Name)
+		qualifier := ref.Alias
+		if qualifier == "" {
+			qualifier = ref.Name
+		}
+		columns = append(columns, cte.columns...)
+		for _, column := range cte.columns {
+			starKeys = append(starKeys, qualifier+"."+column)
+		}
+
+		right := cloneRows(cte.rows)
+		for i := range right {
+			right[i] = e.addTableAlias(right[i], qualifier)
+		}
+		joined := make([]storage.Row, 0, len(rows)*len(right))
+		for _, leftRow := range rows {
+			for _, rightRow := range right {
+				row := make(storage.Row, len(leftRow)+len(rightRow))
+				for key, value := range leftRow {
+					row[key] = value
+				}
+				for key, value := range rightRow {
+					row[key] = value
+				}
+				joined = append(joined, row)
+			}
+		}
+		rows = joined
+	}
+	return e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
+}
+
+func (e *Executor) executeSelectOnMaterializedRows(stmt *parser.SelectStmt, columns, starKeys []string, derivedRows []storage.Row) (*Result, error) {
 
 	// Handle JOINs if present
 	if stmt.From[0].Join != nil {
@@ -1502,8 +1630,8 @@ func (e *Executor) executeSelectOnMaterialized(stmt *parser.SelectStmt, columns 
 		for _, col := range stmt.Columns {
 			switch {
 			case col.Star:
-				for _, c := range columns {
-					values = append(values, row[c])
+				for _, key := range starKeys {
+					values = append(values, row[key])
 				}
 			case col.Expr != nil:
 				if we, ok := col.Expr.(*parser.WindowExpr); ok {
@@ -1903,6 +2031,9 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 		Condition: tableRef.Join.Condition,
 	}
 	leftKey, rightKey, canHash := extractEqualityJoinKeys(tableRef.Join.Condition, syntheticLeft, syntheticJoin)
+	if len(tableRef.Join.Using) > 0 {
+		canHash = false
+	}
 	var rightRows []storage.Row
 	var rightSchema *storage.Schema
 	var err error
@@ -1968,12 +2099,11 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 			for _, left := range leftRows {
 				for _, right := range rightRows {
 					merged := e.mergeRows(left, right, leftAliasForMerge, rightAlias)
-					if tableRef.Join.Condition != nil {
-						match, _ := e.evalExpr(tableRef.Join.Condition, merged)
-						if toBool(match) {
-							result = append(result, merged)
-						}
-					} else {
+					match, err := e.joinMatches(left, right, merged, tableRef.Join)
+					if err != nil {
+						return nil, err
+					}
+					if match {
 						result = append(result, merged)
 					}
 				}
@@ -2004,12 +2134,13 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 				matched := false
 				for _, right := range rightRows {
 					merged := e.mergeRows(left, right, leftAliasForMerge, rightAlias)
-					if tableRef.Join.Condition != nil {
-						match, _ := e.evalExpr(tableRef.Join.Condition, merged)
-						if toBool(match) {
-							result = append(result, merged)
-							matched = true
-						}
+					match, err := e.joinMatches(left, right, merged, tableRef.Join)
+					if err != nil {
+						return nil, err
+					}
+					if match {
+						result = append(result, merged)
+						matched = true
 					}
 				}
 				if !matched {
@@ -2063,6 +2194,9 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 	switch join.Type {
 	case parser.JoinInner:
 		leftKey, rightKey, canHash := extractEqualityJoinKeys(join.Condition, tableRef, join)
+		if len(join.Using) > 0 {
+			canHash = false
+		}
 		if canHash {
 			// Hash join: build phase on right, probe phase on left — O(N+M) vs O(N*M)
 			hashTable := make(map[string][]storage.Row, len(rightRows))
@@ -2080,12 +2214,11 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 			for _, left := range leftRows {
 				for _, right := range rightRows {
 					merged := e.mergeRows(left, right, tableRef.Alias, join.Table.Alias)
-					if join.Condition != nil {
-						match, _ := e.evalExpr(join.Condition, merged)
-						if toBool(match) {
-							result = append(result, merged)
-						}
-					} else {
+					match, err := e.joinMatches(left, right, merged, join)
+					if err != nil {
+						return nil, err
+					}
+					if match {
 						result = append(result, merged)
 					}
 				}
@@ -2094,6 +2227,9 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 
 	case parser.JoinLeft:
 		leftKey, rightKey, canHash := extractEqualityJoinKeys(join.Condition, tableRef, join)
+		if len(join.Using) > 0 {
+			canHash = false
+		}
 		if canHash {
 			hashTable := make(map[string][]storage.Row, len(rightRows))
 			for _, right := range rightRows {
@@ -2117,12 +2253,13 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 				matched := false
 				for _, right := range rightRows {
 					merged := e.mergeRows(left, right, tableRef.Alias, join.Table.Alias)
-					if join.Condition != nil {
-						match, _ := e.evalExpr(join.Condition, merged)
-						if toBool(match) {
-							result = append(result, merged)
-							matched = true
-						}
+					match, err := e.joinMatches(left, right, merged, join)
+					if err != nil {
+						return nil, err
+					}
+					if match {
+						result = append(result, merged)
+						matched = true
 					}
 				}
 				if !matched {
@@ -2141,6 +2278,21 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 	}
 
 	return result, nil
+}
+
+func (e *Executor) joinMatches(left, right, merged storage.Row, join *parser.JoinClause) (bool, error) {
+	if join.Condition != nil {
+		match, err := e.evalExpr(join.Condition, merged)
+		return toBool(match), err
+	}
+	for _, column := range join.Using {
+		leftValue, leftOK := lookupRowValue(left, column)
+		rightValue, rightOK := lookupRowValue(right, column)
+		if !leftOK || !rightOK || leftValue == nil || rightValue == nil || compare(leftValue, rightValue) != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // extractEqualityJoinKeys checks if a JOIN condition is a simple col = col equality
@@ -2343,21 +2495,75 @@ func isConflictError(err error) bool {
 	return strings.Contains(msg, "duplicate") || strings.Contains(msg, "UNIQUE constraint failed")
 }
 
-// findConflictRow returns the first durable row whose target columns match the
-// inserted row.
-func (e *Executor) findConflictRow(table string, row storage.Row, columns []string) (storage.Row, bool) {
+// findConflictRow returns the first row matching the inserted row on the given
+// target columns. A primary-key target uses a point read and a unique-index
+// target uses an indexed lookup; only an unindexed composite target falls back
+// to a scan.
+func (e *Executor) findConflictRow(table string, schema *storage.Schema, row storage.Row, columns []string) (storage.Row, bool, error) {
+	if len(columns) == 1 && strings.EqualFold(columns[0], schema.PrimaryKey) {
+		pkValue, ok := lookupRowValue(row, schema.PrimaryKey)
+		if !ok || pkValue == nil {
+			return nil, false, nil
+		}
+		found, err := e.session.GetByPK(table, fmt.Sprintf("%v", pkValue))
+		if err == storage.ErrKeyNotFound {
+			return nil, false, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		return found, true, nil
+	}
+
+	indexes, err := e.schema.ListTableIndexes(table)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, idx := range indexes {
+		if !idx.Unique || len(idx.Columns) != len(columns) {
+			continue
+		}
+		matches := true
+		for i, col := range columns {
+			if !strings.EqualFold(idx.Columns[i].Name, col) {
+				matches = false
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		key, err := e.table.IndexRowKey(idx, row)
+		if err != nil {
+			return nil, false, err
+		}
+		rows, err := e.session.SelectByIndexKey(table, idx, key)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(rows) == 0 {
+			return nil, false, nil
+		}
+		return rows[0], true, nil
+	}
+
 	rows, err := e.session.Select(table, func(existing storage.Row) bool {
 		for _, col := range columns {
-			if compare(existing[col], row[col]) != 0 {
+			ev, eok := lookupRowValue(existing, col)
+			cv, cok := lookupRowValue(row, col)
+			if !eok || !cok || ev == nil || cv == nil || compare(ev, cv) != 0 {
 				return false
 			}
 		}
 		return true
 	})
-	if err != nil || len(rows) == 0 {
-		return nil, false
+	if err != nil {
+		return nil, false, err
 	}
-	return rows[0], true
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	return rows[0], true, nil
 }
 
 // applyUpsert implements ON CONFLICT (target) DO UPDATE SET ... for primary-key
@@ -2373,14 +2579,28 @@ func (e *Executor) applyUpsert(table string, schema *storage.Schema, existing, r
 	}
 
 	pk := fmt.Sprintf("%v", existing[schema.PrimaryKey])
-	_, updated, err := e.session.UpdateByPK(table, pk, func(storage.Row) (storage.Row, error) {
+	_, updated, err := e.session.UpdateByPK(table, pk, func(current storage.Row) (storage.Row, error) {
 		updates := make(storage.Row)
+		merged := make(storage.Row, len(current))
+		for k, v := range current {
+			merged[k] = v
+		}
 		for _, assignment := range assignments {
 			value, evalErr := e.evalExpr(assignment.Value, context)
 			if evalErr != nil {
 				return nil, evalErr
 			}
 			updates[assignment.Column] = value
+			merged[assignment.Column] = value
+		}
+		// Recompute STORED generated columns so an upsert keeps them current.
+		if err := e.applyGeneratedColumns(schema, merged); err != nil {
+			return nil, err
+		}
+		for _, col := range schema.Columns {
+			if col.GeneratedExpr != "" {
+				updates[col.Name] = merged[col.Name]
+			}
 		}
 		return updates, nil
 	})
@@ -2401,6 +2621,16 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, err
 	}
 
+	generated := generatedColumnSet(schema)
+	if len(stmt.Columns) > 0 {
+		for _, col := range stmt.Columns {
+			if generated[strings.ToLower(col)] {
+				return nil, fmt.Errorf("cannot INSERT into generated column %s", col)
+			}
+		}
+	}
+	force := stmt.OnConflict == parser.ConflictReplace
+
 	// INSERT ... SELECT: materialise the SELECT result and bulk-insert.
 	if stmt.Select != nil {
 		sel, err := e.executeSelect(stmt.Select)
@@ -2417,44 +2647,64 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 					}
 				}
 			} else {
-				for i, col := range schema.Columns {
-					if i < len(selRow) {
-						row[col.Name] = selRow[i]
+				// Generated columns are not writable, so they are skipped when
+				// values are mapped positionally to the table's columns.
+				dst := 0
+				for _, col := range schema.Columns {
+					if generated[strings.ToLower(col.Name)] {
+						continue
 					}
+					if dst < len(selRow) {
+						row[col.Name] = selRow[dst]
+					}
+					dst++
 				}
+			}
+			if len(generated) > 0 {
+				if err := e.ensureGeneratedRowID(tableName, schema, row); err != nil {
+					return nil, err
+				}
+			}
+			if err := e.applyGeneratedColumns(schema, row); err != nil {
+				return nil, err
 			}
 			rows = append(rows, row)
 		}
-		var count int
+
+		count := 0
 		var lastRowID int64
-		if e.inTransaction {
+		var didInsert bool
+		var affected []storage.Row
+		err = e.runDMLAtomicForce(tableName, force || len(rows) > 1, func() error {
 			for _, row := range rows {
-				rid, err := e.session.InsertWithRowID(tableName, row)
-				if err != nil {
-					return nil, err
+				rid, inserted, wasAffected, stored, ierr := e.insertOneRow(tableName, schema, row, stmt, len(stmt.Returning) > 0)
+				if ierr != nil {
+					return ierr
 				}
-				lastRowID = rid
-				count++
+				if inserted {
+					lastRowID = rid
+					didInsert = true
+				}
+				if wasAffected {
+					count++
+					if len(stmt.Returning) > 0 && stored != nil {
+						affected = append(affected, stored)
+					}
+				}
 			}
-		} else {
-			count, lastRowID, err = e.session.InsertBulkWithLastRowID(tableName, rows)
-		}
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		result := NewResult("INSERT")
-		result.SetRowCount(count)
-		result.SetLastInsertID(lastRowID)
-		if count > 0 {
-			e.lastInsertRowID = lastRowID
-		}
-		e.recordChanges(int64(count))
-		return result, nil
+		return e.finishDML("INSERT", count, lastRowID, didInsert, affected, stmt.Returning, schema)
 	}
 
 	count := 0
 	var lastRowID int64
-	err = e.runDMLAtomic(tableName, func() error {
+	var didInsert bool
+	var affected []storage.Row
+	err = e.runDMLAtomicForce(tableName, force || len(stmt.Values) > 1, func() error {
 		for _, values := range stmt.Values {
 			row := make(storage.Row)
 
@@ -2470,75 +2720,46 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 					}
 				}
 			} else {
-				// All columns in order
-				for i, col := range schema.Columns {
-					if i < len(values) {
-						val, err := e.evalExpr(values[i], nil)
+				// Positional values map to the table's non-generated columns.
+				dst := 0
+				for _, col := range schema.Columns {
+					if generated[strings.ToLower(col.Name)] {
+						continue
+					}
+					if dst < len(values) {
+						val, err := e.evalExpr(values[dst], nil)
 						if err != nil {
 							return err
 						}
 						row[col.Name] = val
 					}
+					dst++
 				}
 			}
 
-			// ON CONFLICT is resolved before inserting. A unique-index conflict
-			// may only surface at transaction commit, so the insert error is not
-			// a reliable signal.
-			if stmt.ConflictDoNothing || len(stmt.ConflictUpdate) > 0 {
-				columns := stmt.ConflictTarget
-				if len(columns) == 0 {
-					columns = []string{schema.PrimaryKey}
-				}
-				if existing, found := e.findConflictRow(tableName, row, columns); found {
-					if stmt.ConflictDoNothing {
-						continue
-					}
-					if err := e.applyUpsert(tableName, schema, existing, row, stmt.ConflictUpdate); err != nil {
-						return err
-					}
-					count++
-					continue
-				}
-			}
-
-			rowID, err := e.session.InsertWithRowID(tableName, row)
-			if err != nil {
-				// Handle conflict based on OnConflict action
-				if isConflictError(err) {
-					switch stmt.OnConflict {
-					case parser.ConflictIgnore:
-						// Silently ignore the duplicate
-						continue
-					case parser.ConflictReplace:
-						// Delete existing row and insert new one
-						pkValue := row[schema.PrimaryKey]
-						if pkValue != nil {
-							e.session.Delete(tableName, func(r storage.Row) bool {
-								return fmt.Sprintf("%v", r[schema.PrimaryKey]) == fmt.Sprintf("%v", pkValue)
-							})
-							// Try insert again
-							replacedID, replaceErr := e.session.InsertWithRowID(tableName, row)
-							if replaceErr != nil {
-								return replaceErr
-							}
-							lastRowID = replacedID
-						}
-					case parser.ConflictAbort, parser.ConflictFail:
-						return err
-					case parser.ConflictRollback:
-						// In a real implementation, this would rollback the transaction
-						return err
-					default:
-						return err
-					}
-				} else {
+			if len(generated) > 0 {
+				if err := e.ensureGeneratedRowID(tableName, schema, row); err != nil {
 					return err
 				}
-			} else {
-				lastRowID = rowID
 			}
-			count++
+			if err := e.applyGeneratedColumns(schema, row); err != nil {
+				return err
+			}
+
+			rowID, inserted, wasAffected, stored, ierr := e.insertOneRow(tableName, schema, row, stmt, len(stmt.Returning) > 0)
+			if ierr != nil {
+				return ierr
+			}
+			if inserted {
+				lastRowID = rowID
+				didInsert = true
+			}
+			if wasAffected {
+				count++
+				if len(stmt.Returning) > 0 && stored != nil {
+					affected = append(affected, stored)
+				}
+			}
 		}
 		return nil
 	})
@@ -2546,13 +2767,140 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, err
 	}
 
-	result := NewResult("INSERT")
-	result.SetRowCount(count)
-	result.SetLastInsertID(lastRowID)
-	if count > 0 {
+	return e.finishDML("INSERT", count, lastRowID, didInsert, affected, stmt.Returning, schema)
+}
+
+// insertOneRow applies ON CONFLICT upsert/ignore/replace rules and then writes a
+// single fully-resolved row (generated columns already computed). It reports
+// whether a new row was inserted (for last_insert_rowid), whether any row was
+// affected (inserted or upsert-updated), and the stored row when requested for
+// RETURNING. An ON CONFLICT DO UPDATE returns the merged existing row, not the
+// candidate, so RETURNING and unique-target upserts observe the real row.
+func (e *Executor) insertOneRow(tableName string, schema *storage.Schema, row storage.Row, stmt *parser.InsertStmt, wantStored bool) (int64, bool, bool, storage.Row, error) {
+	if stmt.OnConflict == parser.ConflictIgnore || (stmt.ConflictDoNothing && len(stmt.ConflictTarget) == 0) {
+		conflict, err := e.hasAnyInsertConflict(tableName, schema, row)
+		if err != nil {
+			return 0, false, false, nil, err
+		}
+		if conflict {
+			return 0, false, false, nil, nil
+		}
+	}
+	if stmt.ConflictDoNothing || len(stmt.ConflictUpdate) > 0 {
+		columns := stmt.ConflictTarget
+		if len(columns) == 0 && schema.PrimaryKey != "" && schema.PrimaryKey != "_rowid_" {
+			columns = []string{schema.PrimaryKey}
+		}
+		if len(columns) > 0 {
+			existing, found, err := e.findConflictRow(tableName, schema, row, columns)
+			if err != nil {
+				return 0, false, false, nil, err
+			}
+			if found {
+				if stmt.ConflictDoNothing {
+					return 0, false, false, nil, nil
+				}
+				generated := generatedColumnSet(schema)
+				for _, assignment := range stmt.ConflictUpdate {
+					if generated[strings.ToLower(assignment.Column)] {
+						return 0, false, false, nil, fmt.Errorf("cannot UPDATE generated column %s", assignment.Column)
+					}
+				}
+				existingPK, _ := lookupRowValue(existing, schema.PrimaryKey)
+				if err := e.applyUpsert(tableName, schema, existing, row, stmt.ConflictUpdate); err != nil {
+					return 0, false, false, nil, err
+				}
+				var stored storage.Row
+				if wantStored {
+					stored = e.fetchByPK(tableName, fmt.Sprintf("%v", existingPK))
+				}
+				return 0, false, true, stored, nil
+			}
+		}
+	}
+
+	// ON CONFLICT REPLACE (statement-level or per-index) removes conflicting
+	// rows before the insert so a unique-index conflict cannot surface later at
+	// commit. Plain inserts have no REPLACE matchers and skip the lookup.
+	if err := e.resolveInsertConflicts(tableName, schema, row, stmt.OnConflict == parser.ConflictReplace); err != nil {
+		return 0, false, false, nil, err
+	}
+
+	rowID, err := e.session.InsertWithRowID(tableName, row)
+	if err != nil {
+		// A unique-index conflict may only surface at transaction commit, so
+		// replacing is resolved up front; this retry covers a plain primary-key
+		// duplicate that appeared without a matching REPLACE matcher.
+		if isConflictError(err) {
+			switch stmt.OnConflict {
+			case parser.ConflictIgnore:
+				return 0, false, false, nil, nil
+			case parser.ConflictReplace:
+				pkValue := row[schema.PrimaryKey]
+				if pkValue != nil {
+					if _, deleted, delErr := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", pkValue)); delErr == nil && deleted {
+						replacedID, replaceErr := e.session.InsertWithRowID(tableName, row)
+						if replaceErr != nil {
+							return 0, false, false, nil, replaceErr
+						}
+						return replacedID, true, true, e.fetchIfRequested(tableName, schema, row, wantStored), nil
+					}
+				}
+				return 0, false, false, nil, err
+			default:
+				return 0, false, false, nil, err
+			}
+		}
+		return 0, false, false, nil, err
+	}
+	return rowID, true, true, e.fetchIfRequested(tableName, schema, row, wantStored), nil
+}
+
+// fetchIfRequested reads back the stored row only when a RETURNING projection
+// needs it, avoiding an extra point read for ordinary inserts.
+func (e *Executor) fetchIfRequested(tableName string, schema *storage.Schema, row storage.Row, want bool) storage.Row {
+	if !want {
+		return nil
+	}
+	pkValue, ok := lookupRowValue(row, schema.PrimaryKey)
+	if !ok || pkValue == nil {
+		return row
+	}
+	return e.fetchByPK(tableName, fmt.Sprintf("%v", pkValue))
+}
+
+// fetchByPK reads a stored row, falling back to nil on a read error; RETURNING
+// then simply omits that row rather than failing the whole statement.
+func (e *Executor) fetchByPK(tableName, pk string) storage.Row {
+	stored, err := e.session.GetByPK(tableName, pk)
+	if err != nil {
+		return nil
+	}
+	return stored
+}
+
+// finishDML records session change counters and builds the statement result,
+// attaching RETURNING rows when the statement requested them. last_insert_rowid
+// is only advanced when a new row was actually inserted, so UPDATE, DELETE, and
+// an ON CONFLICT DO UPDATE do not reset the session value.
+func (e *Executor) finishDML(tag string, count int, lastRowID int64, inserted bool, affected []storage.Row, returning []parser.SelectColumn, schema *storage.Schema) (*Result, error) {
+	e.recordChanges(int64(count))
+	if inserted {
 		e.lastInsertRowID = lastRowID
 	}
-	e.recordChanges(int64(count))
+	if len(returning) > 0 {
+		result, err := e.returningResult(returning, schema, affected)
+		if err != nil {
+			return nil, err
+		}
+		result.CommandTag = tag
+		result.RowsAffected = int64(count)
+		result.LastInsertID = e.lastInsertRowID
+		return result, nil
+	}
+	result := NewResult(tag)
+	result.SetRowCount(count)
+	result.SetLastInsertID(e.lastInsertRowID)
 	return result, nil
 }
 
@@ -2573,6 +2921,13 @@ func (e *Executor) recordChanges(affected int64) {
 // error. When already in an explicit transaction, apply runs directly and the
 // surrounding COMMIT/ROLLBACK governs durability.
 func (e *Executor) runDMLAtomic(tableName string, apply func() error) error {
+	return e.runDMLAtomicForce(tableName, false, apply)
+}
+
+// runDMLAtomicForce is runDMLAtomic with an override that forces an implicit
+// transaction even when the table has no UNIQUE index. INSERT OR REPLACE needs
+// it because a primary-key replacement must delete and insert atomically.
+func (e *Executor) runDMLAtomicForce(tableName string, force bool, apply func() error) error {
 	if e.inTransaction {
 		return apply()
 	}
@@ -2580,7 +2935,7 @@ func (e *Executor) runDMLAtomic(tableName string, apply func() error) error {
 	if err != nil {
 		return err
 	}
-	if !uniq {
+	if !uniq && !force {
 		return apply()
 	}
 	if err := e.session.Begin(); err != nil {
@@ -2656,6 +3011,9 @@ func (e *Executor) primeSubqueries(expr parser.Expr) {
 			walk(n.Escape)
 		case *parser.IsNullExpr:
 			walk(n.Left)
+		case *parser.IsDistinctExpr:
+			walk(n.Left)
+			walk(n.Right)
 		case *parser.CaseExpr:
 			walk(n.Operand)
 			for _, w := range n.Whens {
@@ -2684,6 +3042,20 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
+	generated := generatedColumnSet(schema)
+	for _, assign := range stmt.Set {
+		if generated[strings.ToLower(assign.Column)] {
+			return nil, fmt.Errorf("cannot UPDATE generated column %s", assign.Column)
+		}
+	}
+
+	// UPDATE ... FROM joins the target against materialized source rows. It is
+	// handled separately because SET expressions and WHERE may reference both
+	// the target and the source row.
+	if len(stmt.From) > 0 {
+		return e.executeUpdateFrom(stmt, schema)
+	}
+
 	// Build filter
 	var filter func(storage.Row) bool
 	if stmt.Where != nil {
@@ -2696,18 +3068,42 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		}
 	}
 
-	// Use UpdateFunc to evaluate expressions per-row (supports self-referencing like balance = balance + 100)
+	// Use UpdateFunc to evaluate expressions per-row (supports self-referencing like balance = balance + 100).
+	// Generated columns are recomputed from the post-assignment row and written
+	// back so STORED values stay consistent.
 	updateFn := func(row storage.Row) (storage.Row, error) {
 		updates := make(storage.Row)
+		merged := make(storage.Row, len(row))
+		for k, v := range row {
+			merged[k] = v
+		}
 		for _, assign := range stmt.Set {
 			val, err := e.evalExpr(assign.Value, row)
 			if err != nil {
 				return nil, err
 			}
 			updates[assign.Column] = val
+			merged[assign.Column] = val
+		}
+		if err := e.applyGeneratedColumns(schema, merged); err != nil {
+			return nil, err
+		}
+		for _, col := range schema.Columns {
+			if col.GeneratedExpr != "" {
+				updates[col.Name] = merged[col.Name]
+			}
 		}
 		return updates, nil
 	}
+
+	// Pre-evaluate subqueries in the predicate and assignments before any
+	// session read takes the lock. A correlated subquery evaluated during the
+	// locked scan would re-enter the session lock and deadlock.
+	e.primeSubqueries(stmt.Where)
+	for _, assign := range stmt.Set {
+		e.primeSubqueries(assign.Value)
+	}
+
 	if stmt.Where != nil {
 		column, value, equality := e.extractIndexableCondition(stmt.Where)
 		updatesPrimaryKey := false
@@ -2718,26 +3114,43 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 			}
 		}
 		if equality && strings.EqualFold(column, schema.PrimaryKey) && !updatesPrimaryKey {
-			_, updated, err := e.session.UpdateByPK(tableName, fmt.Sprintf("%v", value), updateFn)
+			pk := fmt.Sprintf("%v", value)
+			_, updated, err := e.session.UpdateByPK(tableName, pk, updateFn)
 			if err != nil {
 				return nil, err
 			}
 			count := 0
+			var affected []storage.Row
 			if updated {
 				count = 1
+				if len(stmt.Returning) > 0 {
+					affected = append(affected, e.fetchByPK(tableName, pk))
+				}
 			}
-			result := NewResult("UPDATE")
-			result.SetRowCount(count)
-			e.recordChanges(int64(count))
-			return result, nil
+			return e.finishDML("UPDATE", count, 0, false, affected, stmt.Returning, schema)
 		}
 	}
 
-	// Pre-evaluate subqueries in the predicate and assignments before the
-	// scan-based update takes the session lock.
-	e.primeSubqueries(stmt.Where)
-	for _, assign := range stmt.Set {
-		e.primeSubqueries(assign.Value)
+	// When RETURNING is requested, capture the matched rows and compute the
+	// post-update primary key for each, so a primary-key UPDATE returns the row
+	// under its NEW key rather than the old one.
+	var returningPKs []string
+	if len(stmt.Returning) > 0 {
+		matched, serr := e.session.Select(tableName, filter)
+		if serr != nil {
+			return nil, serr
+		}
+		for _, r := range matched {
+			merged, merr := applyUpdateRow(updateFn, r, schema)
+			if merr != nil {
+				return nil, merr
+			}
+			key, ok := lookupRowValue(merged, schema.PrimaryKey)
+			if !ok || key == nil {
+				key, _ = lookupRowValue(r, schema.PrimaryKey)
+			}
+			returningPKs = append(returningPKs, fmt.Sprintf("%v", key))
+		}
 	}
 
 	count := 0
@@ -2753,10 +3166,271 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return nil, err
 	}
 
-	result := NewResult("UPDATE")
-	result.SetRowCount(count)
-	e.recordChanges(int64(count))
-	return result, nil
+	var affected []storage.Row
+	if len(stmt.Returning) > 0 {
+		for _, pk := range returningPKs {
+			if stored := e.fetchByPK(tableName, pk); stored != nil {
+				affected = append(affected, stored)
+			}
+		}
+	}
+	return e.finishDML("UPDATE", count, 0, false, affected, stmt.Returning, schema)
+}
+
+// applyUpdateRow runs an update callback against a row and returns the fully
+// merged post-update row (including generated columns). It has no side effects;
+// callers use it to predict the new primary key for RETURNING.
+func applyUpdateRow(updateFn func(storage.Row) (storage.Row, error), row storage.Row, schema *storage.Schema) (storage.Row, error) {
+	updates, err := updateFn(row)
+	if err != nil {
+		return nil, err
+	}
+	merged := make(storage.Row, len(row))
+	for k, v := range row {
+		merged[k] = v
+	}
+	for k, v := range updates {
+		target := k
+		for existing := range merged {
+			if strings.EqualFold(existing, k) {
+				target = existing
+				break
+			}
+		}
+		if target == k {
+			for _, col := range schema.Columns {
+				if strings.EqualFold(col.Name, k) {
+					target = col.Name
+					break
+				}
+			}
+		}
+		merged[target] = v
+	}
+	return merged, nil
+}
+
+// executeUpdateFrom implements UPDATE ... FROM. It materializes the FROM sources
+// once, finds each target row's first matching source row, evaluates SET against
+// the combined context, and applies the changes atomically.
+func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Schema) (*Result, error) {
+	tableName := stmt.Table.Name
+
+	sources, err := e.materializeFrom(stmt.From)
+	if err != nil {
+		return nil, err
+	}
+
+	e.primeSubqueries(stmt.Where)
+	for _, assign := range stmt.Set {
+		e.primeSubqueries(assign.Value)
+	}
+
+	targets, err := e.session.Select(tableName, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	type updateFromPlan struct {
+		oldPK string
+		row   storage.Row
+	}
+	var plans []updateFromPlan
+	for _, target := range targets {
+		var matched storage.Row
+		for _, source := range sources {
+			combined := combineUpdateFrom(tableName, target, source)
+			val, err := e.evalExpr(stmt.Where, combined)
+			if err != nil {
+				return nil, err
+			}
+			if toBool(val) {
+				matched = source
+				break
+			}
+		}
+		if matched == nil {
+			continue
+		}
+
+		combined := combineUpdateFrom(tableName, target, matched)
+		row := make(storage.Row, len(target))
+		for k, v := range target {
+			row[k] = v
+		}
+		for _, assign := range stmt.Set {
+			val, err := e.evalExpr(assign.Value, combined)
+			if err != nil {
+				return nil, err
+			}
+			row[assign.Column] = val
+		}
+		if err := e.applyGeneratedColumns(schema, row); err != nil {
+			return nil, err
+		}
+		plans = append(plans, updateFromPlan{
+			oldPK: fmt.Sprintf("%v", target[schema.PrimaryKey]),
+			row:   row,
+		})
+	}
+
+	count := 0
+	var affected []storage.Row
+	err = e.runDMLAtomicForce(tableName, true, func() error {
+		for _, plan := range plans {
+			newPKVal, _ := lookupRowValue(plan.row, schema.PrimaryKey)
+			newPK := fmt.Sprintf("%v", newPKVal)
+			if newPK != plan.oldPK {
+				if _, gerr := e.session.GetByPK(tableName, newPK); gerr == nil {
+					return fmt.Errorf("duplicate primary key: %v", newPK)
+				} else if gerr != storage.ErrKeyNotFound {
+					return gerr
+				}
+				if _, deleted, derr := e.session.DeleteByPK(tableName, plan.oldPK); derr != nil {
+					return derr
+				} else if !deleted {
+					continue
+				}
+				if _, ierr := e.session.InsertWithRowID(tableName, plan.row); ierr != nil {
+					return ierr
+				}
+			} else {
+				updates := make(storage.Row, len(schema.Columns))
+				for _, col := range schema.Columns {
+					if v, ok := lookupRowValue(plan.row, col.Name); ok {
+						updates[col.Name] = v
+					}
+				}
+				_, updated, uerr := e.session.UpdateByPK(tableName, newPK, func(storage.Row) (storage.Row, error) {
+					return updates, nil
+				})
+				if uerr != nil {
+					return uerr
+				}
+				if !updated {
+					continue
+				}
+			}
+			count++
+			if len(stmt.Returning) > 0 {
+				if stored := e.fetchByPK(tableName, newPK); stored != nil {
+					affected = append(affected, stored)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return e.finishDML("UPDATE", count, 0, false, affected, stmt.Returning, schema)
+}
+
+// combineUpdateFrom builds the evaluation context for UPDATE ... FROM: the
+// target row (plain and table-qualified) overlaid with one source row (plain and
+// alias-qualified).
+func combineUpdateFrom(tableName string, target, source storage.Row) storage.Row {
+	combined := make(storage.Row, len(target)*2+len(source))
+	for k, v := range target {
+		combined[k] = v
+		if !strings.Contains(k, ".") {
+			combined[tableName+"."+k] = v
+		}
+	}
+	for k, v := range source {
+		combined[k] = v
+	}
+	return combined
+}
+
+// materializeTableRef materializes a single FROM entry (table or derived table)
+// into rows, adding the alias prefix when one is present.
+func (e *Executor) materializeTableRef(ref parser.TableRef) ([]storage.Row, error) {
+	alias := ref.Alias
+	if ref.Subquery != nil {
+		if alias == "" {
+			alias = ref.Name
+		}
+		res, err := e.executeSelect(ref.Subquery)
+		if err != nil {
+			return nil, err
+		}
+		rows := make([]storage.Row, 0, len(res.Rows))
+		for _, vals := range res.Rows {
+			row := make(storage.Row, len(res.Columns))
+			for i, name := range res.Columns {
+				if i < len(vals) {
+					row[name] = vals[i]
+				}
+			}
+			rows = append(rows, row)
+		}
+		if alias != "" {
+			for i := range rows {
+				rows[i] = e.addTableAlias(rows[i], alias)
+			}
+		}
+		return rows, nil
+	}
+
+	rows, err := e.session.Select(ref.Name, nil)
+	if err != nil {
+		return nil, err
+	}
+	if alias == "" {
+		alias = ref.Name
+	}
+	if alias != "" {
+		for i := range rows {
+			rows[i] = e.addTableAlias(rows[i], alias)
+		}
+	}
+	return rows, nil
+}
+
+// materializeFrom materializes the full FROM list as a cross product, honoring
+// each entry's JOIN chain.
+func (e *Executor) materializeFrom(from []parser.TableRef) ([]storage.Row, error) {
+	if len(from) == 0 {
+		return nil, nil
+	}
+	rows, err := e.materializeTableRef(from[0])
+	if err != nil {
+		return nil, err
+	}
+	if from[0].Join != nil {
+		rows, err = e.executeJoins(from[0], rows)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, ref := range from[1:] {
+		right, err := e.materializeTableRef(ref)
+		if err != nil {
+			return nil, err
+		}
+		if ref.Join != nil {
+			right, err = e.executeJoins(ref, right)
+			if err != nil {
+				return nil, err
+			}
+		}
+		merged := make([]storage.Row, 0, len(rows)*len(right))
+		for _, l := range rows {
+			for _, r := range right {
+				combined := make(storage.Row, len(l)+len(r))
+				for k, v := range l {
+					combined[k] = v
+				}
+				for k, v := range r {
+					combined[k] = v
+				}
+				merged = append(merged, combined)
+			}
+		}
+		rows = merged
+	}
+	return rows, nil
 }
 
 // executeDelete executes a DELETE statement.
@@ -2778,37 +3452,47 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 			return toBool(val)
 		}
 	}
+	// Pre-evaluate subqueries in the predicate before any session read takes
+	// the lock. Evaluating a correlated subquery during the locked scan would
+	// re-enter the session lock and deadlock.
+	e.primeSubqueries(stmt.Where)
+
 	if stmt.Where != nil {
 		column, value, equality := e.extractIndexableCondition(stmt.Where)
 		if equality && strings.EqualFold(column, schema.PrimaryKey) {
-			_, deleted, err := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", value))
+			deletedRow, deleted, err := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", value))
 			if err != nil {
 				return nil, err
 			}
 			count := 0
+			var affected []storage.Row
 			if deleted {
 				count = 1
+				if len(stmt.Returning) > 0 && deletedRow != nil {
+					affected = append(affected, deletedRow)
+				}
 			}
-			result := NewResult("DELETE")
-			result.SetRowCount(count)
-			e.recordChanges(int64(count))
-			return result, nil
+			return e.finishDML("DELETE", count, 0, false, affected, stmt.Returning, schema)
 		}
 	}
 
-	// Pre-evaluate subqueries in the predicate before the scan-based delete
-	// takes the session lock.
-	e.primeSubqueries(stmt.Where)
+	// Capture the rows that will be deleted so RETURNING can project the
+	// pre-delete values (SQLite/PostgreSQL semantics).
+	var affected []storage.Row
+	if len(stmt.Returning) > 0 {
+		matched, serr := e.session.Select(tableName, filter)
+		if serr != nil {
+			return nil, serr
+		}
+		affected = append(affected, matched...)
+	}
 
 	count, err := e.session.Delete(tableName, filter)
 	if err != nil {
 		return nil, err
 	}
 
-	result := NewResult("DELETE")
-	result.SetRowCount(count)
-	e.recordChanges(int64(count))
-	return result, nil
+	return e.finishDML("DELETE", count, 0, false, affected, stmt.Returning, schema)
 }
 
 // executeCreateTable executes a CREATE TABLE statement.
@@ -2832,6 +3516,18 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			Name:     colDef.Name,
 			Type:     colDef.Type.Name,
 			Nullable: true,
+		}
+
+		if colDef.GeneratedExpr != nil {
+			if !colDef.GeneratedStored {
+				return nil, fmt.Errorf("VIRTUAL generated columns are not supported; declare %s GENERATED ALWAYS AS (...) STORED", colDef.Name)
+			}
+			text := parser.FormatExpr(colDef.GeneratedExpr)
+			if _, err := parseStoredExpr(text); err != nil {
+				return nil, err
+			}
+			col.GeneratedExpr = text
+			col.GeneratedStored = true
 		}
 
 		for _, constraint := range colDef.Constraints {
@@ -2872,6 +3568,17 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	// scan-validated unique Index metadata that explicit CREATE UNIQUE INDEX
 	// produces, so both enforcement and the catalog observe them.
 	uniqIndexes := e.uniqueConstraintIndexes(stmt)
+
+	// Column references in generated expressions must resolve against the new
+	// table, so validate them once every column is known.
+	for _, colDef := range stmt.Columns {
+		if colDef.GeneratedExpr == nil {
+			continue
+		}
+		if err := ValidateIndexColumns(colDef.GeneratedExpr, schema); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := e.schema.CreateTable(schema); err != nil {
 		if stmt.IfNotExists && strings.Contains(err.Error(), "table already exists") {
@@ -2922,8 +3629,11 @@ func (e *Executor) uniqueConstraintIndexes(stmt *parser.CreateTableStmt) []*stor
 		return name
 	}
 
-	add := func(name string, columns []string) {
+	add := func(name string, columns []string, conflict parser.ConflictAction, hasConflict bool) {
 		idx := &storage.Index{Name: uniqueName(name, columns), Table: stmt.Table.Name, Unique: true}
+		if hasConflict {
+			idx.OnConflict = conflictActionName(conflict)
+		}
 		for _, c := range columns {
 			idx.Columns = append(idx.Columns, storage.IndexColumn{Name: c})
 		}
@@ -2932,17 +3642,34 @@ func (e *Executor) uniqueConstraintIndexes(stmt *parser.CreateTableStmt) []*stor
 
 	for _, constraint := range stmt.Constraints {
 		if constraint.Type == parser.ConstraintUnique && len(constraint.Columns) > 0 {
-			add(constraint.Name, constraint.Columns)
+			add(constraint.Name, constraint.Columns, constraint.OnConflict, constraint.HasOnConflict)
 		}
 	}
 	for _, colDef := range stmt.Columns {
 		for _, constraint := range colDef.Constraints {
 			if constraint.Type == parser.ConstraintUnique {
-				add("", []string{colDef.Name})
+				add("", []string{colDef.Name}, constraint.OnConflict, constraint.HasOnConflict)
 			}
 		}
 	}
 	return indexes
+}
+
+// conflictActionName maps a parsed conflict action to the durable index metadata
+// spelling (empty for the default ABORT).
+func conflictActionName(action parser.ConflictAction) string {
+	switch action {
+	case parser.ConflictReplace:
+		return "REPLACE"
+	case parser.ConflictIgnore:
+		return "IGNORE"
+	case parser.ConflictFail:
+		return "FAIL"
+	case parser.ConflictRollback:
+		return "ROLLBACK"
+	default:
+		return "ABORT"
+	}
 }
 
 // executeDropTable executes a DROP TABLE statement.
@@ -3006,6 +3733,19 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 	}
 
 	for _, col := range stmt.Columns {
+		if col.Expr != nil {
+			// Expression indexes are evaluated by the stateless evaluator; make
+			// sure the persisted text parses, is deterministic, and only
+			// references columns of the indexed table.
+			text := parser.FormatExpr(col.Expr)
+			if _, err := parseStoredExpr(text); err != nil {
+				return nil, err
+			}
+			if err := ValidateIndexColumns(col.Expr, schema); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if _, found := schema.GetColumn(col.Name); !found {
 			return nil, fmt.Errorf("column not found: %s", col.Name)
 		}
@@ -3019,10 +3759,14 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 	}
 
 	for _, col := range stmt.Columns {
-		index.Columns = append(index.Columns, storage.IndexColumn{
+		ic := storage.IndexColumn{
 			Name: col.Name,
 			Desc: col.Desc,
-		})
+		}
+		if col.Expr != nil {
+			ic.Expression = parser.FormatExpr(col.Expr)
+		}
+		index.Columns = append(index.Columns, ic)
 	}
 
 	if stmt.Unique {
@@ -3523,6 +4267,20 @@ func (e *Executor) executePragma(stmt *parser.PragmaStmt) (*Result, error) {
 		return e.pragmaDatabaseList()
 	case "version":
 		return e.pragmaVersion()
+	case "foreign_keys":
+		result := NewResult("PRAGMA")
+		if stmt.Value == nil {
+			result.AddColumn("foreign_keys")
+			result.AddRow(int64(0))
+			return result, nil
+		}
+		if ref, ok := stmt.Value.(*parser.ColumnRef); ok && strings.EqualFold(ref.Column, "off") {
+			return result, nil
+		}
+		if literal, ok := stmt.Value.(*parser.LiteralExpr); ok && literal.Value == "0" {
+			return result, nil
+		}
+		return nil, fmt.Errorf("PizzaSQL does not enforce foreign keys; only PRAGMA foreign_keys = OFF is supported")
 	default:
 		return nil, fmt.Errorf("unknown pragma: %s", stmt.Name)
 	}
@@ -3603,6 +4361,13 @@ func (e *Executor) pragmaVersion() (*Result, error) {
 }
 
 // executeExplain executes an EXPLAIN statement.
+// executeAnalyze accepts ANALYZE as a documented no-op. PizzaSQL has no
+// cost-based optimizer or persisted statistics, so there is nothing to gather;
+// the statement exists so SQLite migrations that end with ANALYZE succeed.
+func (e *Executor) executeAnalyze(stmt *parser.AnalyzeStmt) (*Result, error) {
+	return NewResult("ANALYZE"), nil
+}
+
 func (e *Executor) executeExplain(stmt *parser.ExplainStmt) (*Result, error) {
 	result := NewResult("EXPLAIN")
 
@@ -3751,6 +4516,8 @@ func (e *Executor) evalExpr(expr parser.Expr, row storage.Row) (interface{}, err
 		return e.evalLikeExpr(ex, row)
 	case *parser.IsNullExpr:
 		return e.evalIsNullExpr(ex, row)
+	case *parser.IsDistinctExpr:
+		return e.evalIsDistinctExpr(ex, row)
 	case *parser.CastExpr:
 		return e.evalCastExpr(ex, row)
 	case *parser.SubqueryExpr:
@@ -3780,6 +4547,10 @@ func (e *Executor) evalLiteral(lit *parser.LiteralExpr) (interface{}, error) {
 		return strconv.ParseInt(lit.Value, 10, 64)
 	case lexer.TokenString:
 		return lit.Value, nil
+	case lexer.TokenBlob:
+		// The lexer stores the decoded bytes in the literal, so a blob literal
+		// becomes a true []byte value.
+		return []byte(lit.Value), nil
 	case lexer.TokenNULL:
 		return nil, nil
 	case lexer.TokenTRUE:
@@ -3792,6 +4563,15 @@ func (e *Executor) evalLiteral(lit *parser.LiteralExpr) (interface{}, error) {
 }
 
 func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interface{}, error) {
+	// SQLite date/time keywords (CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME)
+	// are lexed as identifiers; resolve them when no real column shadows them.
+	if ref.Table == "" {
+		if _, has := lookupRowValue(row, ref.Column); !has {
+			if val, ok := sqliteCurrentTimeValue(ref.Column); ok {
+				return val, nil
+			}
+		}
+	}
 	if row == nil {
 		return nil, fmt.Errorf("no row context for column: %s", ref.Column)
 	}
@@ -3890,6 +4670,13 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 	right, err := e.evalExpr(expr.Right, row)
 	if err != nil {
 		return nil, err
+	}
+
+	if isBitwiseOp(expr.Op) {
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return applyBitwise(expr.Op, left, right)
 	}
 
 	switch expr.Op {
@@ -4009,8 +4796,12 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 
 // applyBinaryOp applies a binary operator to two already-evaluated values.
 func (e *Executor) applyBinaryOp(op lexer.TokenType, left, right interface{}) (interface{}, error) {
-	dummy := &parser.BinaryExpr{Op: op}
-	_ = dummy
+	if isBitwiseOp(op) {
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return applyBitwise(op, left, right)
+	}
 	switch op {
 	case lexer.TokenPlus:
 		if left == nil || right == nil {
@@ -4123,6 +4914,58 @@ func (e *Executor) applyBinaryOp(op lexer.TokenType, left, right interface{}) (i
 	}
 }
 
+// isBitwiseOp reports whether op is a SQLite bitwise operator.
+func isBitwiseOp(op lexer.TokenType) bool {
+	switch op {
+	case lexer.TokenBitAnd, lexer.TokenBitOr, lexer.TokenShiftLeft, lexer.TokenShiftRight:
+		return true
+	}
+	return false
+}
+
+// applyBitwise applies a bitwise operator with SQLite semantics. Operands are
+// coerced to integers; a negative shift reverses direction, and an
+// out-of-range shift saturates.
+func applyBitwise(op lexer.TokenType, left, right interface{}) (interface{}, error) {
+	li := toInt64(left)
+	ri := toInt64(right)
+	switch op {
+	case lexer.TokenBitAnd:
+		return li & ri, nil
+	case lexer.TokenBitOr:
+		return li | ri, nil
+	case lexer.TokenShiftLeft:
+		return bitShiftLeft(li, ri), nil
+	case lexer.TokenShiftRight:
+		return bitShiftRight(li, ri), nil
+	default:
+		return nil, fmt.Errorf("unsupported bitwise operator: %v", op)
+	}
+}
+
+func bitShiftLeft(v, shift int64) int64 {
+	if shift < 0 {
+		return bitShiftRight(v, -shift)
+	}
+	if shift >= 64 {
+		return 0
+	}
+	return v << uint(shift)
+}
+
+func bitShiftRight(v, shift int64) int64 {
+	if shift < 0 {
+		return bitShiftLeft(v, -shift)
+	}
+	if shift >= 64 {
+		if v < 0 {
+			return -1
+		}
+		return 0
+	}
+	return v >> uint(shift)
+}
+
 // evalBuiltinFunction applies a named scalar function to pre-evaluated args.
 func (e *Executor) evalBuiltinFunction(name string, args []interface{}) (interface{}, error) {
 	switch name {
@@ -4206,6 +5049,11 @@ func (e *Executor) evalUnaryExpr(expr *parser.UnaryExpr, row storage.Row) (inter
 			return nil, nil // NOT NULL = NULL
 		}
 		return !toBool(val), nil
+	case lexer.TokenBitNot:
+		if val == nil {
+			return nil, nil
+		}
+		return ^toInt64(val), nil
 	default:
 		return val, nil
 	}
@@ -4222,6 +5070,11 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 			return nil, err
 		}
 		args[i] = val
+	}
+
+	// JSON1 scalar functions are dispatched separately to keep this switch tidy.
+	if val, handled, err := evalJSONFunction(name, args); handled {
+		return val, err
 	}
 
 	switch name {
@@ -4335,19 +5188,25 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		}
 	case "HEX":
 		if len(args) > 0 {
-			s := toString(args[0])
-			return strings.ToUpper(fmt.Sprintf("%x", []byte(s))), nil
+			if args[0] == nil {
+				return nil, nil
+			}
+			if b, ok := args[0].([]byte); ok {
+				return strings.ToUpper(fmt.Sprintf("%x", b)), nil
+			}
+			return strings.ToUpper(fmt.Sprintf("%x", []byte(toString(args[0])))), nil
 		}
 	case "UNHEX":
 		if len(args) > 0 {
-			s := toString(args[0])
-			var result []byte
-			for i := 0; i < len(s)-1; i += 2 {
-				var b byte
-				fmt.Sscanf(s[i:i+2], "%x", &b)
-				result = append(result, b)
+			if args[0] == nil {
+				return nil, nil
 			}
-			return string(result), nil
+			s := toString(args[0])
+			result, err := hex.DecodeString(strings.TrimSpace(s))
+			if err != nil {
+				return nil, nil
+			}
+			return result, nil
 		}
 	case "RANDOM":
 		return rand.Int63(), nil
@@ -4362,7 +5221,7 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 			}
 			blob := make([]byte, n)
 			rand.Read(blob)
-			return string(blob), nil
+			return blob, nil
 		}
 	case "ZEROBLOB":
 		if len(args) > 0 {
@@ -4373,7 +5232,7 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 			if n > 1000000 {
 				n = 1000000
 			}
-			return string(make([]byte, n)), nil
+			return make([]byte, n), nil
 		}
 	case "INSTR":
 		if len(args) >= 2 {
@@ -4446,8 +5305,12 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		return evalStrftimeFunc(args)
 	case "TIMEDIFF":
 		return evalTimediffFunc(args)
-	case "PIZZASQL_VERSION", "SQLITE_VERSION":
+	case "PERCENT_DIFF":
+		return evalPercentDiff(args)
+	case "PIZZASQL_VERSION":
 		return version.String(), nil
+	case "SQLITE_VERSION":
+		return SQLiteCompatVersion, nil
 	case "LAST_INSERT_ROWID":
 		return e.lastInsertRowID, nil
 	case "CHANGES":
@@ -4697,6 +5560,33 @@ func (e *Executor) evalIsNullExpr(expr *parser.IsNullExpr, row storage.Row) (int
 	return isNull, nil
 }
 
+// evalIsDistinctExpr implements `a IS [NOT] DISTINCT FROM b`. It treats NULL as a
+// comparable value: two NULLs are not distinct, and NULL is distinct from any
+// non-NULL.
+func (e *Executor) evalIsDistinctExpr(expr *parser.IsDistinctExpr, row storage.Row) (interface{}, error) {
+	left, err := e.evalExpr(expr.Left, row)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.evalExpr(expr.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	distinct := false
+	switch {
+	case left == nil && right == nil:
+		distinct = false
+	case left == nil || right == nil:
+		distinct = true
+	default:
+		distinct = compare(left, right) != 0
+	}
+	if expr.Not {
+		return !distinct, nil
+	}
+	return distinct, nil
+}
+
 func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interface{}, error) {
 	val, err := e.evalExpr(expr.Expr, row)
 	if err != nil {
@@ -4713,6 +5603,11 @@ func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interfa
 		return int64(toFloat(val)), nil
 	case strings.Contains(typeName, "REAL"), strings.Contains(typeName, "FLOAT"), strings.Contains(typeName, "DOUBLE"):
 		return toFloat(val), nil
+	case strings.Contains(typeName, "BLOB"):
+		if b, ok := val.([]byte); ok {
+			return b, nil
+		}
+		return []byte(toString(val)), nil
 	case strings.Contains(typeName, "TEXT"), strings.Contains(typeName, "CHAR"):
 		return toString(val), nil
 	default:
@@ -5042,6 +5937,32 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		}
 		return max, nil
 
+	case "JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
+		arr := make([]interface{}, 0, len(rows))
+		var seen map[string]struct{}
+		if fn.Distinct {
+			seen = make(map[string]struct{})
+		}
+		for _, row := range rows {
+			var val interface{}
+			if len(fn.Args) > 0 {
+				val, _ = e.evalExpr(fn.Args[0], row)
+			}
+			if fn.Distinct {
+				key := fmt.Sprintf("%v", val)
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+			}
+			arr = append(arr, jsonArgToNode(val))
+		}
+		s, err := jsonEncode(arr)
+		if err != nil {
+			return nil, err
+		}
+		return jsonText(s), nil
+
 	default:
 		// Non-aggregate scalar function: evaluate args through aggregate context
 		// (so COUNT/MIN/etc. inside NULLIF/COALESCE work correctly).
@@ -5067,7 +5988,8 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 	case *parser.FunctionCall:
 		name := strings.ToUpper(ex.Name)
 		switch name {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
+			"JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
 			return e.evalAggregateExpr(expr, rows)
 		default:
 			// Non-aggregate: evaluate each arg with aggregate context, then apply scalar.
@@ -5159,6 +6081,28 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			return !isNull, nil
 		}
 		return isNull, nil
+	case *parser.IsDistinctExpr:
+		left, err := e.evalExprWithAggregates(ex.Left, rows)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.evalExprWithAggregates(ex.Right, rows)
+		if err != nil {
+			return nil, err
+		}
+		distinct := false
+		switch {
+		case left == nil && right == nil:
+			distinct = false
+		case left == nil || right == nil:
+			distinct = true
+		default:
+			distinct = compare(left, right) != 0
+		}
+		if ex.Not {
+			return !distinct, nil
+		}
+		return distinct, nil
 	case *parser.BetweenExpr:
 		val, err := e.evalExprWithAggregates(ex.Left, rows)
 		if err != nil {
@@ -5350,7 +6294,8 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 	if fn, ok := expr.(*parser.FunctionCall); ok {
 		name := strings.ToUpper(fn.Name)
 		switch name {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
+			"JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
 			return true
 		}
 		// Non-aggregate function: check if any arg contains an aggregate.
@@ -5384,6 +6329,8 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 		return e.isAggregate(ex.Expr)
 	case *parser.IsNullExpr:
 		return e.isAggregate(ex.Left)
+	case *parser.IsDistinctExpr:
+		return e.isAggregate(ex.Left) || e.isAggregate(ex.Right)
 	case *parser.BetweenExpr:
 		return e.isAggregate(ex.Left) || e.isAggregate(ex.Low) || e.isAggregate(ex.High)
 	case *parser.InExpr:
@@ -5788,7 +6735,33 @@ func toString(v interface{}) string {
 	if v == nil {
 		return ""
 	}
-	return fmt.Sprintf("%v", v)
+	switch t := v.(type) {
+	case string:
+		return t
+	case []byte:
+		return string(t)
+	case jsonText:
+		return string(t)
+	case bool:
+		if t {
+			return "1"
+		}
+		return "0"
+	case int:
+		return strconv.FormatInt(int64(t), 10)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case uint:
+		return strconv.FormatUint(uint64(t), 10)
+	case uint64:
+		return strconv.FormatUint(t, 10)
+	case float32:
+		return formatSQLiteReal(float64(t))
+	case float64:
+		return formatSQLiteReal(t)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 func compare(a, b interface{}) int {
@@ -5882,6 +6855,9 @@ func collectColumnRefs(expr parser.Expr) []string {
 			walk(n.Pattern)
 		case *parser.IsNullExpr:
 			walk(n.Left)
+		case *parser.IsDistinctExpr:
+			walk(n.Left)
+			walk(n.Right)
 		case *parser.CaseExpr:
 			walk(n.Operand)
 			for _, w := range n.Whens {
@@ -5947,6 +6923,9 @@ func collectTableColumnRefs(expr parser.Expr) []tableColRef {
 			walk(n.Pattern)
 		case *parser.IsNullExpr:
 			walk(n.Left)
+		case *parser.IsDistinctExpr:
+			walk(n.Left)
+			walk(n.Right)
 		case *parser.CaseExpr:
 			walk(n.Operand)
 			for _, w := range n.Whens {

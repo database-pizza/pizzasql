@@ -153,7 +153,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		// Build response
 		resp := &QueryResponse{
 			Columns:            make([]ColumnInfo, len(result.Columns)),
-			Rows:               result.Rows,
+			Rows:               sanitizeRows(result.Rows),
 			RowsAffected:       result.RowsAffected,
 			LastInsertID:       result.LastInsertID,
 			ExecutionTimeMicro: duration.Microseconds(),

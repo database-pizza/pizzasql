@@ -284,6 +284,18 @@ func TestParseInsertValues(t *testing.T) {
 	}
 }
 
+func TestParseJoinUsingMultipleColumns(t *testing.T) {
+	stmt := parse(t, "SELECT * FROM hit_counts JOIN paths USING (site_id, path_id)")
+	selectStmt, ok := stmt.(*SelectStmt)
+	if !ok || len(selectStmt.From) != 1 || selectStmt.From[0].Join == nil {
+		t.Fatalf("unexpected statement %#v", stmt)
+	}
+	using := selectStmt.From[0].Join.Using
+	if len(using) != 2 || using[0] != "site_id" || using[1] != "path_id" {
+		t.Fatalf("USING columns = %v", using)
+	}
+}
+
 func TestParseInsertMultipleRows(t *testing.T) {
 	stmt := parse(t, "INSERT INTO users VALUES (1, 'John'), (2, 'Jane')")
 	ins := stmt.(*InsertStmt)
@@ -946,10 +958,189 @@ func TestParseMultiple(t *testing.T) {
 	}
 }
 
-func TestParseRejectsTrailingReturning(t *testing.T) {
-	l := lexer.New("INSERT INTO users (id) VALUES (1) RETURNING id")
-	if _, err := New(l).Parse(); err == nil {
-		t.Fatal("expected RETURNING to be rejected before execution")
+func TestParseInsertReturning(t *testing.T) {
+	stmt := parse(t, "INSERT INTO users (id, name) VALUES (1, 'a') RETURNING id, name AS n, id + 1")
+	ins, ok := stmt.(*InsertStmt)
+	if !ok {
+		t.Fatalf("expected InsertStmt, got %T", stmt)
+	}
+	if len(ins.Returning) != 3 {
+		t.Fatalf("expected 3 returning columns, got %d", len(ins.Returning))
+	}
+	if ref, ok := ins.Returning[0].Expr.(*ColumnRef); !ok || ref.Column != "id" {
+		t.Fatalf("unexpected first returning column: %#v", ins.Returning[0])
+	}
+	if ins.Returning[1].Alias != "n" {
+		t.Fatalf("expected alias n, got %q", ins.Returning[1].Alias)
+	}
+	if _, ok := ins.Returning[2].Expr.(*BinaryExpr); !ok {
+		t.Fatalf("expected expression in third returning column, got %T", ins.Returning[2].Expr)
+	}
+}
+
+func TestParseUpdateAndDeleteReturning(t *testing.T) {
+	upd := parse(t, "UPDATE users SET name = 'b' WHERE id = 1 RETURNING id, name")
+	if len(upd.(*UpdateStmt).Returning) != 2 {
+		t.Fatalf("expected 2 returning columns on UPDATE")
+	}
+
+	del := parse(t, "DELETE FROM users WHERE id = 1 RETURNING *")
+	if len(del.(*DeleteStmt).Returning) != 1 || !del.(*DeleteStmt).Returning[0].Star {
+		t.Fatalf("expected RETURNING * on DELETE")
+	}
+}
+
+func TestParseGeneratedColumn(t *testing.T) {
+	stmt := parse(t, `CREATE TABLE t (
+		a INTEGER,
+		b INTEGER,
+		total INTEGER GENERATED ALWAYS AS (a + b) STORED,
+		vit TEXT AS (a || '-') VIRTUAL
+	)`)
+	ct := stmt.(*CreateTableStmt)
+	if len(ct.Columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(ct.Columns))
+	}
+	if ct.Columns[2].GeneratedExpr == nil || !ct.Columns[2].GeneratedStored {
+		t.Fatalf("expected stored generated column, got %#v", ct.Columns[2])
+	}
+	if ct.Columns[3].GeneratedExpr == nil || ct.Columns[3].GeneratedStored {
+		t.Fatalf("expected virtual generated column, got %#v", ct.Columns[3])
+	}
+}
+
+func TestParseTableConstraintOnConflictReplace(t *testing.T) {
+	stmt := parse(t, `CREATE TABLE t (
+		a INTEGER,
+		b INTEGER,
+		CONSTRAINT "t#a#b" UNIQUE(a, b) ON CONFLICT REPLACE
+	)`)
+	ct := stmt.(*CreateTableStmt)
+	if len(ct.Constraints) != 1 {
+		t.Fatalf("expected 1 constraint, got %d", len(ct.Constraints))
+	}
+	c := ct.Constraints[0]
+	if !c.HasOnConflict || c.OnConflict != ConflictReplace {
+		t.Fatalf("expected ON CONFLICT REPLACE, got %#v", c)
+	}
+}
+
+func TestParseExpressionIndex(t *testing.T) {
+	stmt := parse(t, "CREATE UNIQUE INDEX users_email ON users (lower(email))")
+	ci := stmt.(*CreateIndexStmt)
+	if len(ci.Columns) != 1 {
+		t.Fatalf("expected 1 index column, got %d", len(ci.Columns))
+	}
+	if ci.Columns[0].Expr == nil {
+		t.Fatalf("expected expression index column, got %#v", ci.Columns[0])
+	}
+	if ci.Columns[0].Name != "lower(email)" {
+		t.Fatalf("expected name lower(email), got %q", ci.Columns[0].Name)
+	}
+}
+
+func TestParseBitwisePrecedence(t *testing.T) {
+	// 1 + 2 | 4 must parse as (1 + 2) | 4 because + binds tighter than |.
+	expr := parseExpr(t, "1 + 2 | 4")
+	bin, ok := expr.(*BinaryExpr)
+	if !ok || bin.Op != lexer.TokenBitOr {
+		t.Fatalf("expected top-level bit-or, got %#v", expr)
+	}
+	if left, ok := bin.Left.(*BinaryExpr); !ok || left.Op != lexer.TokenPlus {
+		t.Fatalf("expected (1+2) on the left, got %#v", bin.Left)
+	}
+}
+
+func TestParseBlobLiteral(t *testing.T) {
+	expr := parseExpr(t, "X'00FF'")
+	lit, ok := expr.(*LiteralExpr)
+	if !ok || lit.Type != lexer.TokenBlob {
+		t.Fatalf("expected blob literal, got %#v", expr)
+	}
+	if []byte(lit.Value)[0] != 0x00 || []byte(lit.Value)[1] != 0xFF {
+		t.Fatalf("unexpected blob bytes: %v", []byte(lit.Value))
+	}
+}
+
+func TestParseAnalyze(t *testing.T) {
+	if _, ok := parse(t, "ANALYZE").(*AnalyzeStmt); !ok {
+		t.Fatalf("ANALYZE did not parse as AnalyzeStmt")
+	}
+	stmt := parse(t, "ANALYZE main.users")
+	if got := stmt.(*AnalyzeStmt).Name; got != "users" {
+		t.Fatalf("ANALYZE name = %q, want users", got)
+	}
+}
+
+func TestParseIsDistinctFrom(t *testing.T) {
+	expr := parseExpr(t, "a IS DISTINCT FROM b")
+	d, ok := expr.(*IsDistinctExpr)
+	if !ok {
+		t.Fatalf("expected IsDistinctExpr, got %T", expr)
+	}
+	if d.Not {
+		t.Fatalf("IS DISTINCT FROM should not set Not")
+	}
+	expr = parseExpr(t, "a IS NOT DISTINCT FROM b")
+	if d, ok := expr.(*IsDistinctExpr); !ok || !d.Not {
+		t.Fatalf("expected IsDistinctExpr with Not=true, got %#v", expr)
+	}
+}
+
+func TestParseUpdateFrom(t *testing.T) {
+	stmt := parse(t, "UPDATE users SET access = 'x' FROM other WHERE other.id = users.id RETURNING users.id")
+	upd, ok := stmt.(*UpdateStmt)
+	if !ok {
+		t.Fatalf("expected UpdateStmt, got %T", stmt)
+	}
+	if len(upd.From) != 1 || upd.From[0].Name != "other" {
+		t.Fatalf("unexpected FROM: %#v", upd.From)
+	}
+	if len(upd.Returning) != 1 {
+		t.Fatalf("expected 1 RETURNING column, got %d", len(upd.Returning))
+	}
+}
+
+func TestParseWithUpdate(t *testing.T) {
+	stmt := parse(t, `WITH x AS (SELECT count(*) AS c, site_id FROM users GROUP BY site_id)
+		UPDATE users SET access = 'y' FROM x WHERE x.c = 1 AND users.site_id = x.site_id`)
+	upd, ok := stmt.(*UpdateStmt)
+	if !ok {
+		t.Fatalf("expected UpdateStmt, got %T", stmt)
+	}
+	if len(upd.From) != 1 || upd.From[0].Subquery == nil {
+		t.Fatalf("CTE was not desugared into the FROM clause: %#v", upd.From)
+	}
+}
+
+func TestParseInsertSelectReturning(t *testing.T) {
+	// RETURNING after INSERT ... SELECT must not be swallowed as a table alias.
+	stmt := parse(t, "INSERT INTO dst (a, b) SELECT a, b FROM src RETURNING a")
+	ins, ok := stmt.(*InsertStmt)
+	if !ok {
+		t.Fatalf("expected InsertStmt, got %T", stmt)
+	}
+	if ins.Select == nil || len(ins.Select.From) != 1 {
+		t.Fatalf("unexpected SELECT: %#v", ins.Select)
+	}
+	if ins.Select.From[0].Alias != "" {
+		t.Fatalf("RETURNING was parsed as a table alias: %q", ins.Select.From[0].Alias)
+	}
+	if len(ins.Returning) != 1 {
+		t.Fatalf("expected 1 RETURNING column, got %d", len(ins.Returning))
+	}
+}
+
+func TestParseInsertWithSelect(t *testing.T) {
+	stmt := parse(t, `INSERT INTO dst (id, value)
+		WITH source AS (SELECT id, value FROM src WHERE id > 1)
+		SELECT id, value FROM source`)
+	insert, ok := stmt.(*InsertStmt)
+	if !ok {
+		t.Fatalf("expected InsertStmt, got %T", stmt)
+	}
+	if insert.Select == nil || len(insert.Select.From) != 1 || insert.Select.From[0].Subquery == nil {
+		t.Fatalf("WITH SELECT was not attached to INSERT: %#v", insert.Select)
 	}
 }
 

@@ -46,6 +46,31 @@ type TableManager struct {
 	genMu                sync.Mutex
 	generations          map[string]uint64
 	predicateGenerations map[string]uint64
+
+	// exprMu guards exprEval, the pluggable evaluator for expression-index
+	// columns. It is set by the SQL executor so storage stays independent of
+	// the SQL front end.
+	exprMu   sync.RWMutex
+	exprEval ExpressionEvaluator
+}
+
+// ExpressionEvaluator computes the value of a persisted index expression for a
+// row. The SQL executor registers one so the storage layer can enforce
+// expression indexes without importing the parser/executor.
+type ExpressionEvaluator func(expression string, row Row) (interface{}, error)
+
+// SetExpressionEvaluator installs the evaluator used to compute expression-index
+// values during uniqueness validation and index maintenance.
+func (m *TableManager) SetExpressionEvaluator(eval ExpressionEvaluator) {
+	m.exprMu.Lock()
+	m.exprEval = eval
+	m.exprMu.Unlock()
+}
+
+func (m *TableManager) expressionEvaluator() ExpressionEvaluator {
+	m.exprMu.RLock()
+	defer m.exprMu.RUnlock()
+	return m.exprEval
 }
 
 // NewTableManager creates a new table manager.
@@ -123,10 +148,10 @@ func (m *TableManager) predicateGeneration(key string) uint64 {
 	return gen
 }
 
-func (m *TableManager) bumpIndexPredicates(table string, rows ...Row) {
+func (m *TableManager) bumpIndexPredicates(table string, rows ...Row) error {
 	indexes, err := m.schema.ListTableIndexes(table)
 	if err != nil || len(indexes) == 0 {
-		return
+		return err
 	}
 	m.genMu.Lock()
 	defer m.genMu.Unlock()
@@ -135,14 +160,14 @@ func (m *TableManager) bumpIndexPredicates(table string, rows ...Row) {
 			continue
 		}
 		for _, index := range indexes {
-			columns := make([]string, len(index.Columns))
-			for i, column := range index.Columns {
-				columns[i] = column.Name
+			value, err := m.buildIndexValue(row, index.Columns)
+			if err != nil {
+				return err
 			}
-			value := formatIndexValue(m.buildIndexValue(row, columns))
 			m.predicateGenerations[indexPredicateKey(table, index.Name, value)]++
 		}
 	}
+	return nil
 }
 
 func (m *TableManager) bumpIndexPredicateWildcard(table string) {
@@ -573,11 +598,15 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, fmt.Errorf("duplicate primary key: %v", row[schemaPrimaryKey(m.schema, table)])
 	}
 
-	m.updateIndexesForRow(table, nr, true)
+	if err := m.updateIndexesForRow(table, nr, true); err != nil {
+		return 0, err
+	}
 	// Publish derived index state before its generations. A reader that races
 	// with publication either sees the old generation and aborts or sees the
 	// complete new state.
-	m.bumpIndexPredicates(table, nr)
+	if err := m.bumpIndexPredicates(table, nr); err != nil {
+		return 0, err
+	}
 	m.bumpGeneration(table)
 	if schema, serr := m.schema.GetSchema(table); serr == nil {
 		m.incrCount(table, schema.CreatedAt, 1, wasInit)
@@ -796,11 +825,15 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 	}
 	// Maintain indexes for the rows that persisted (the first numOK ops).
 	for i := 0; i < numOK; i++ {
-		m.updateIndexesForRow(table, encoded[i], true)
+		if err := m.updateIndexesForRow(table, encoded[i], true); err != nil {
+			return numOK, 0, err
+		}
 	}
 	if numOK > 0 {
 		m.bumpGeneration(table)
-		m.bumpIndexPredicates(table, encoded[:numOK]...)
+		if err := m.bumpIndexPredicates(table, encoded[:numOK]...); err != nil {
+			return numOK, 0, err
+		}
 	}
 	m.incrCount(table, schema.CreatedAt, numOK, wasInit)
 
@@ -814,15 +847,15 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 // updateIndexesForRow adds or removes entries from already-built in-memory
 // indexes. Index entries are rebuildable from durable row data, so this method
 // intentionally does not write idx:* keys to KV.
-func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) {
+func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) error {
 	indexes, err := m.schema.ListTableIndexes(table)
 	if err != nil || len(indexes) == 0 {
-		return
+		return err
 	}
 
 	rowid, ok := rowIDFromRow(row)
 	if !ok {
-		return
+		return nil
 	}
 	tableKey := strings.ToLower(table)
 	tableSchema, schemaErr := m.schema.GetSchema(table)
@@ -847,11 +880,10 @@ func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) {
 			continue
 		}
 
-		columns := make([]string, len(idx.Columns))
-		for i, col := range idx.Columns {
-			columns[i] = col.Name
+		colValue, err := m.buildIndexValue(row, idx.Columns)
+		if err != nil {
+			return err
 		}
-		colValue := m.buildIndexValue(row, columns)
 
 		if add {
 			m.AddIndexEntry(idx.Name, colValue, rowid)
@@ -859,6 +891,7 @@ func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) {
 			m.RemoveIndexEntry(idx.Name, colValue, rowid)
 		}
 	}
+	return nil
 }
 
 // Select retrieves rows from a table by scanning durable rows and collecting
@@ -949,77 +982,20 @@ func (m *TableManager) SelectWithLimit(table string, filter func(Row) bool, limi
 
 // Update updates rows matching the filter.
 func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) (int, error) {
-	tl := m.tableLock(strings.ToLower(table))
-	tl.Lock()
-	defer tl.Unlock()
-	rows, err := m.selectRows(table, filter)
-	if err != nil {
-		return 0, err
-	}
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
-		return 0, err
-	}
-
-	count := 0
-	for _, row := range rows {
-		// Snapshot the pre-update row so removed index entries can be restored
-		// if persistence fails.
-		oldRow := cloneRow(row)
-		m.updateIndexesForRow(table, row, false)
-
-		// Apply updates
-		for k, v := range updates {
-			// Normalize column name
-			for _, col := range schema.Columns {
-				if strings.EqualFold(k, col.Name) {
-					row[col.Name] = v
-					break
-				}
-			}
-		}
-
-		// Get primary key
-		pkValue := row[schema.PrimaryKey]
-		pk := fmt.Sprintf("%v", pkValue)
-
-		// Serialize row
-		data, err := encodeRow(row)
-		if err != nil {
-			m.updateIndexesForRow(table, oldRow, true)
-			continue
-		}
-
-		if err := m.validateUniqueRows(table, []Row{row}, excludedKey(m.dataKey(table, fmt.Sprintf("%v", oldRow[schema.PrimaryKey])))); err != nil {
-			m.updateIndexesForRow(table, oldRow, true)
-			return count, err
-		}
-
-		// Write back
-		key := m.dataKey(table, pk)
-		err = m.pool.WithClient(func(c *KVClient) error {
-			_, err := c.Put([]byte(key), data)
-			return err
-		})
-		if err == nil {
-			// Add new index entries after update
-			m.updateIndexesForRow(table, row, true)
-			m.bumpIndexPredicates(table, oldRow, row)
-			count++
-		} else {
-			m.updateIndexesForRow(table, oldRow, true)
-		}
-	}
-
-	if count > 0 {
-		m.bumpGeneration(table)
-	}
-	return count, nil
+	return m.updateLocked(table, func(Row) (Row, error) { return updates, nil }, filter)
 }
 
 // UpdateFunc updates rows matching the filter using a function to compute new values.
 // The updateFn receives the current row and returns the updates to apply.
 func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error), filter func(Row) bool) (int, error) {
+	return m.updateLocked(table, updateFn, filter)
+}
+
+// updateLocked is the shared scan-based update implementation. It applies
+// per-row updates, revalidates unique indexes, and moves a row when its primary
+// key changes (deleting the old key and refusing to overwrite an occupied new
+// key) so an UPDATE of the primary key does not orphan or clobber rows.
+func (m *TableManager) updateLocked(table string, updateFn func(Row) (Row, error), filter func(Row) bool) (int, error) {
 	tl := m.tableLock(strings.ToLower(table))
 	tl.Lock()
 	defer tl.Unlock()
@@ -1035,18 +1011,17 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 	count := 0
 	for _, row := range rows {
 		oldRow := cloneRow(row)
-		m.updateIndexesForRow(table, row, false)
-
-		// Compute updates using the provided function
-		updates, err := updateFn(row)
-		if err != nil {
-			m.updateIndexesForRow(table, oldRow, true)
+		oldKey := m.dataKey(table, fmt.Sprintf("%v", oldRow[schema.PrimaryKey]))
+		if err := m.updateIndexesForRow(table, row, false); err != nil {
 			return count, err
 		}
 
-		// Apply updates
+		updates, err := updateFn(row)
+		if err != nil {
+			_ = m.updateIndexesForRow(table, oldRow, true)
+			return count, err
+		}
 		for k, v := range updates {
-			// Normalize column name
 			for _, col := range schema.Columns {
 				if strings.EqualFold(k, col.Name) {
 					row[col.Name] = v
@@ -1055,36 +1030,51 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 			}
 		}
 
-		// Get primary key
-		pkValue := row[schema.PrimaryKey]
-		pk := fmt.Sprintf("%v", pkValue)
-
-		// Serialize row
+		newKey := m.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
 		data, err := encodeRow(row)
 		if err != nil {
-			m.updateIndexesForRow(table, oldRow, true)
+			_ = m.updateIndexesForRow(table, oldRow, true)
 			continue
 		}
 
-		if err := m.validateUniqueRows(table, []Row{row}, excludedKey(m.dataKey(table, fmt.Sprintf("%v", oldRow[schema.PrimaryKey])))); err != nil {
-			m.updateIndexesForRow(table, oldRow, true)
+		excluded := map[string]bool{oldKey: true}
+		if err := m.validateUniqueRows(table, []Row{row}, excluded); err != nil {
+			_ = m.updateIndexesForRow(table, oldRow, true)
 			return count, err
 		}
 
-		// Write back
-		key := m.dataKey(table, pk)
-		err = m.pool.WithClient(func(c *KVClient) error {
-			_, err := c.Put([]byte(key), data)
-			return err
-		})
-		if err == nil {
-			// Add new index entries after update
-			m.updateIndexesForRow(table, row, true)
-			m.bumpIndexPredicates(table, oldRow, row)
-			count++
-		} else {
-			m.updateIndexesForRow(table, oldRow, true)
+		if newKey != oldKey {
+			// Refuse to move onto an existing primary key.
+			if _, _, gerr := m.getByPKWithLSN(table, fmt.Sprintf("%v", row[schema.PrimaryKey])); gerr == nil {
+				_ = m.updateIndexesForRow(table, oldRow, true)
+				return count, fmt.Errorf("duplicate primary key: %v", row[schema.PrimaryKey])
+			} else if gerr != ErrKeyNotFound {
+				_ = m.updateIndexesForRow(table, oldRow, true)
+				return count, gerr
+			}
+			if err := m.pool.WithClient(func(c *KVClient) error {
+				_, derr := c.Del([]byte(oldKey))
+				return derr
+			}); err != nil {
+				_ = m.updateIndexesForRow(table, oldRow, true)
+				continue
+			}
 		}
+
+		if err := m.pool.WithClient(func(c *KVClient) error {
+			_, perr := c.Put([]byte(newKey), data)
+			return perr
+		}); err != nil {
+			_ = m.updateIndexesForRow(table, oldRow, true)
+			continue
+		}
+		if err := m.updateIndexesForRow(table, row, true); err != nil {
+			return count, err
+		}
+		if err := m.bumpIndexPredicates(table, oldRow, row); err != nil {
+			return count, err
+		}
+		count++
 	}
 
 	if count > 0 {
@@ -1154,9 +1144,15 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 		return nil, false, ErrSerialization
 	}
 
-	m.updateIndexesForRow(table, oldRow, false)
-	m.updateIndexesForRow(table, row, true)
-	m.bumpIndexPredicates(table, oldRow, row)
+	if err := m.updateIndexesForRow(table, oldRow, false); err != nil {
+		return nil, false, err
+	}
+	if err := m.updateIndexesForRow(table, row, true); err != nil {
+		return nil, false, err
+	}
+	if err := m.bumpIndexPredicates(table, oldRow, row); err != nil {
+		return nil, false, err
+	}
 	m.bumpGeneration(table)
 	return oldRow, true, nil
 }
@@ -1179,7 +1175,9 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 	count := 0
 	for _, row := range rows {
 		// Remove index entries before deleting row
-		m.updateIndexesForRow(table, row, false)
+		if err := m.updateIndexesForRow(table, row, false); err != nil {
+			return count, err
+		}
 
 		pkValue := row[schema.PrimaryKey]
 		pk := fmt.Sprintf("%v", pkValue)
@@ -1190,11 +1188,13 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 			return err
 		})
 		if err == nil {
-			m.bumpIndexPredicates(table, row)
+			if err := m.bumpIndexPredicates(table, row); err != nil {
+				return count, err
+			}
 			count++
 		} else {
 			// Restore the index entries removed above.
-			m.updateIndexesForRow(table, row, true)
+			_ = m.updateIndexesForRow(table, row, true)
 		}
 	}
 
@@ -1241,8 +1241,12 @@ func (m *TableManager) DeleteByPK(table, pk string) (Row, bool, error) {
 		return nil, false, ErrSerialization
 	}
 
-	m.updateIndexesForRow(table, row, false)
-	m.bumpIndexPredicates(table, row)
+	if err := m.updateIndexesForRow(table, row, false); err != nil {
+		return nil, false, err
+	}
+	if err := m.bumpIndexPredicates(table, row); err != nil {
+		return nil, false, err
+	}
 	m.bumpGeneration(table)
 	m.incrCount(table, schema.CreatedAt, -1, wasInit)
 	return row, true, nil
@@ -1413,10 +1417,6 @@ func (m *TableManager) ensureIndex(index *Index) error {
 		return nil
 	}
 
-	columns := make([]string, len(index.Columns))
-	for i, col := range index.Columns {
-		columns[i] = col.Name
-	}
 	tableSchema, err := m.schema.GetSchema(table)
 	if err != nil {
 		return err
@@ -1429,7 +1429,10 @@ func (m *TableManager) ensureIndex(index *Index) error {
 		if !ok {
 			return false, nil
 		}
-		colValue := m.buildIndexValue(row, columns)
+		colValue, err := m.buildIndexValue(row, index.Columns)
+		if err != nil {
+			return true, err
+		}
 		valueKey := formatIndexValue(colValue)
 		values[valueKey] = append(values[valueKey], rowid)
 		rowKeys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
@@ -1566,6 +1569,10 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 	if schemaErr != nil {
 		return schemaErr
 	}
+	indexCols := make([]IndexColumn, len(columns))
+	for i, name := range columns {
+		indexCols[i] = IndexColumn{Name: name}
+	}
 	values := make(map[string][]int64)
 	rowKeys := make(map[int64]string)
 	if err := m.scanRows(tableName, func(row Row) (bool, error) {
@@ -1573,7 +1580,10 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 		if !ok {
 			return false, nil
 		}
-		colValue := m.buildIndexValue(row, columns)
+		colValue, err := m.buildIndexValue(row, indexCols)
+		if err != nil {
+			return true, err
+		}
 		values[formatIndexValue(colValue)] = append(values[formatIndexValue(colValue)], rowid)
 		rowKeys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
 		return false, nil
@@ -1590,35 +1600,49 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 	return nil
 }
 
-// buildIndexValue creates the index key value from row columns.
-func (m *TableManager) buildIndexValue(row Row, columns []string) string {
-	formatValue := func(v interface{}) string {
-		switch val := v.(type) {
-		case float64:
-			// Check if it's actually an integer value
-			if val == float64(int64(val)) {
-				return fmt.Sprintf("%d", int64(val))
-			}
-			return fmt.Sprintf("%f", val)
-		case int64:
-			return fmt.Sprintf("%d", val)
-		case int:
-			return fmt.Sprintf("%d", val)
-		default:
-			return fmt.Sprintf("%v", val)
+// indexColumnValue resolves a single index column's value for a row. A plain
+// column is looked up case-insensitively; an expression column is evaluated
+// through the registered expression evaluator.
+func (m *TableManager) indexColumnValue(row Row, col IndexColumn) (interface{}, error) {
+	if col.Expression != "" {
+		eval := m.expressionEvaluator()
+		if eval == nil {
+			return nil, fmt.Errorf("expression index column %q requires an expression evaluator", col.Expression)
+		}
+		return eval(col.Expression, row)
+	}
+	if v, ok := row[col.Name]; ok {
+		return v, nil
+	}
+	for k, v := range row {
+		if strings.EqualFold(k, col.Name) {
+			return v, nil
 		}
 	}
+	return nil, nil
+}
 
+// buildIndexValue creates the index key value from an index's columns. Single
+// column values are formatted directly; composite values are joined with a NUL
+// separator.
+func (m *TableManager) buildIndexValue(row Row, columns []IndexColumn) (string, error) {
 	if len(columns) == 1 {
-		return formatValue(row[columns[0]])
+		v, err := m.indexColumnValue(row, columns[0])
+		if err != nil {
+			return "", err
+		}
+		return formatIndexValue(v), nil
 	}
 
-	// Multi-column index: concatenate values with separator
-	var parts []string
+	parts := make([]string, 0, len(columns))
 	for _, col := range columns {
-		parts = append(parts, formatValue(row[col]))
+		v, err := m.indexColumnValue(row, col)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, formatIndexValue(v))
 	}
-	return strings.Join(parts, "\x00")
+	return strings.Join(parts, "\x00"), nil
 }
 
 // ── UNIQUE index enforcement ────────────────────────────────────────────────
@@ -1666,29 +1690,24 @@ func (m *TableManager) HasUniqueIndex(table string) (bool, error) {
 // encodeUniqueValue encodes the indexed value of a row with per-column type tags
 // and length prefixes. It returns isNull=true when any indexed column is NULL, in
 // which case the row is exempt from uniqueness. The length prefix makes composite
-// encodings collision-free.
-func encodeUniqueValue(row Row, columns []string) (string, bool) {
+// encodings collision-free. Expression columns are evaluated through the
+// registered evaluator.
+func (m *TableManager) encodeUniqueValue(row Row, columns []IndexColumn) (string, bool, error) {
 	var sb strings.Builder
 	for _, col := range columns {
-		v, ok := row[col]
-		if !ok {
-			for k, val := range row {
-				if strings.EqualFold(k, col) {
-					v = val
-					ok = true
-					break
-				}
-			}
+		v, err := m.indexColumnValue(row, col)
+		if err != nil {
+			return "", false, err
 		}
-		if !ok || v == nil {
-			return "", true
+		if v == nil {
+			return "", true, nil
 		}
 		s := encodeUniqueScalar(v)
 		sb.WriteString(strconv.Itoa(len(s)))
 		sb.WriteByte(':')
 		sb.WriteString(s)
 	}
-	return sb.String(), false
+	return sb.String(), false, nil
 }
 
 // encodeUniqueScalar encodes a scalar for uniqueness comparison. Integral
@@ -1772,8 +1791,10 @@ func (m *TableManager) validateUniqueRows(table string, pending []Row, excludedK
 	seen := make(map[string]map[string]bool, len(indexes))
 	for _, row := range pending {
 		for _, idx := range indexes {
-			columns := indexColumnNames(idx)
-			encoded, isNull := encodeUniqueValue(row, columns)
+			encoded, isNull, err := m.encodeUniqueValue(row, idx.Columns)
+			if err != nil {
+				return err
+			}
 			if isNull {
 				continue
 			}
@@ -1813,8 +1834,10 @@ func (m *TableManager) validateUniqueRows(table string, pending []Row, excludedK
 					return err
 				}
 				for _, idx := range indexes {
-					columns := indexColumnNames(idx)
-					encoded, isNull := encodeUniqueValue(row, columns)
+					encoded, isNull, encErr := m.encodeUniqueValue(row, idx.Columns)
+					if encErr != nil {
+						return encErr
+					}
 					if isNull {
 						continue
 					}
@@ -1879,21 +1902,15 @@ func (m *TableManager) lockForWrite(table string) (unlock func(), unique bool, e
 	}
 }
 
-func indexColumnNames(idx *Index) []string {
-	names := make([]string, len(idx.Columns))
-	for i, c := range idx.Columns {
-		names[i] = c.Name
-	}
-	return names
-}
-
 // ValidateUniqueIndex rejects a UNIQUE index definition if existing rows already
 // contain duplicate non-NULL values for the indexed columns.
 func (m *TableManager) ValidateUniqueIndex(index *Index) error {
-	columns := indexColumnNames(index)
 	seen := make(map[string]bool)
 	return m.scanRows(index.Table, func(row Row) (bool, error) {
-		encoded, isNull := encodeUniqueValue(row, columns)
+		encoded, isNull, err := m.encodeUniqueValue(row, index.Columns)
+		if err != nil {
+			return true, err
+		}
 		if isNull {
 			return false, nil
 		}
@@ -1934,6 +1951,33 @@ type indexPredicateSnapshot struct {
 // selectByIndexWithLSN retrieves indexed rows and their durable versions. The
 // transaction layer uses the versions for optimistic commit validation.
 func (m *TableManager) selectByIndexWithLSN(table, indexName string, colValue interface{}) ([]indexedRowVersion, indexPredicateSnapshot, error) {
+	return m.selectByIndexKeyWithLSN(table, indexName, formatIndexValue(colValue))
+}
+
+// IndexRowKey computes the formatted in-memory index key a row maps to for an
+// index. Expression columns are evaluated through the same registered evaluator
+// used by uniqueness enforcement, so the key matches both durable index entries
+// and staged overlay rows.
+func (m *TableManager) IndexRowKey(idx *Index, row Row) (string, error) {
+	value, err := m.buildIndexValue(row, idx.Columns)
+	if err != nil {
+		return "", err
+	}
+	return formatIndexValue(value), nil
+}
+
+// IndexValueContainsNull reports whether any column contributing to an index
+// key evaluates to NULL. UNIQUE indexes exempt such rows from conflicts under
+// SQLite semantics.
+func (m *TableManager) IndexValueContainsNull(idx *Index, row Row) (bool, error) {
+	_, isNull, err := m.encodeUniqueValue(row, idx.Columns)
+	return isNull, err
+}
+
+// selectByIndexKeyWithLSN is selectByIndexWithLSN with an already-computed
+// formatted index key, so callers can look up composite and expression indexes
+// without re-deriving the key from a single column value.
+func (m *TableManager) selectByIndexKeyWithLSN(table, indexName, valueKey string) ([]indexedRowVersion, indexPredicateSnapshot, error) {
 	index, err := m.schema.GetIndex(indexName)
 	if err != nil {
 		return nil, indexPredicateSnapshot{}, err
@@ -1951,7 +1995,6 @@ func (m *TableManager) selectByIndexWithLSN(table, indexName string, colValue in
 	}
 
 	indexKey := strings.ToLower(indexName)
-	valueKey := formatIndexValue(colValue)
 	predicateKey, predicateGen, wildcardKey, wildcardGen := m.predicateSnapshot(table, indexName, valueKey)
 	snapshot := indexPredicateSnapshot{
 		valueKey: predicateKey, valueGen: predicateGen,

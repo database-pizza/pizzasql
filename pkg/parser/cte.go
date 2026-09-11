@@ -102,14 +102,14 @@ func (p *Parser) parseWithStatement() (Statement, error) {
 		return nil, err
 	}
 
-	sel, ok := stmt.(*SelectStmt)
-	if !ok {
-		return nil, p.curError("WITH is only supported before a SELECT statement")
-	}
-
 	if recursive {
 		// Recursive CTEs are materialized by the executor, which needs the
-		// definitions; desugaring cannot express self-reference.
+		// definitions; desugaring cannot express self-reference. Only SELECT
+		// carries that machinery today.
+		sel, ok := stmt.(*SelectStmt)
+		if !ok {
+			return nil, p.curError("WITH RECURSIVE is only supported before a SELECT statement")
+		}
 		sel.With = make([]*CTE, 0, len(ctes))
 		for _, c := range ctes {
 			sel.With = append(sel.With, &CTE{
@@ -128,10 +128,64 @@ func (p *Parser) parseWithStatement() (Statement, error) {
 			return nil, err
 		}
 	}
-	if err := substituteSelectCTEs(sel, ctes); err != nil {
+	if err := substituteStatementCTEs(stmt, ctes); err != nil {
 		return nil, err
 	}
-	return sel, nil
+	return stmt, nil
+}
+
+// substituteStatementCTEs desugars named CTE references inside any DML
+// statement. UPDATE reads them from its FROM clause (and expressions); DELETE
+// and INSERT read them from subqueries.
+func substituteStatementCTEs(stmt Statement, ctes []*cteDef) error {
+	switch s := stmt.(type) {
+	case *SelectStmt:
+		return substituteSelectCTEs(s, ctes)
+	case *UpdateStmt:
+		for i := range s.From {
+			if err := substituteTableRefCTEs(&s.From[i], ctes); err != nil {
+				return err
+			}
+		}
+		for i := range s.Set {
+			if err := substituteExprCTEs(s.Set[i].Value, ctes); err != nil {
+				return err
+			}
+		}
+		if err := substituteExprCTEs(s.Where, ctes); err != nil {
+			return err
+		}
+		for i := range s.Returning {
+			if err := substituteExprCTEs(s.Returning[i].Expr, ctes); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *DeleteStmt:
+		if err := substituteExprCTEs(s.Where, ctes); err != nil {
+			return err
+		}
+		for i := range s.Returning {
+			if err := substituteExprCTEs(s.Returning[i].Expr, ctes); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *InsertStmt:
+		if s.Select != nil {
+			return substituteSelectCTEs(s.Select, ctes)
+		}
+		for _, row := range s.Values {
+			for _, v := range row {
+				if err := substituteExprCTEs(v, ctes); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("WITH is not supported before this statement")
+	}
 }
 
 // applyCTEColumnNames aliases the CTE query's projection columns with the names
@@ -285,6 +339,11 @@ func substituteExprCTEs(expr Expr, ctes []*cteDef) error {
 		return substituteExprCTEs(e.Escape, ctes)
 	case *IsNullExpr:
 		return substituteExprCTEs(e.Left, ctes)
+	case *IsDistinctExpr:
+		if err := substituteExprCTEs(e.Left, ctes); err != nil {
+			return err
+		}
+		return substituteExprCTEs(e.Right, ctes)
 	case *CaseExpr:
 		if err := substituteExprCTEs(e.Operand, ctes); err != nil {
 			return err

@@ -523,6 +523,60 @@ func (s *Session) SelectByIndex(table, indexName string, colValue interface{}) (
 	return rows, nil
 }
 
+// SelectByIndexKey retrieves the rows whose index key equals valueKey, merging
+// the staged overlay so a transaction sees its own writes. valueKey is the
+// formatted key from TableManager.IndexRowKey, which supports plain, composite,
+// and expression indexes uniformly.
+func (s *Session) SelectByIndexKey(table string, idx *Index, valueKey string) ([]Row, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inTx {
+		versions, _, err := s.table.selectByIndexKeyWithLSN(table, idx.Name, valueKey)
+		if err != nil {
+			return nil, err
+		}
+		rows := make([]Row, len(versions))
+		for i := range versions {
+			rows[i] = versions[i].row
+		}
+		return rows, nil
+	}
+
+	tableKey := strings.ToLower(table)
+	versions, predicate, err := s.table.selectByIndexKeyWithLSN(table, idx.Name, valueKey)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := s.predicateGens[predicate.valueKey]; !ok {
+		s.predicateGens[predicate.valueKey] = predicateRead{table: tableKey, gen: predicate.valueGen}
+	}
+	if _, ok := s.predicateGens[predicate.wildcardKey]; !ok {
+		s.predicateGens[predicate.wildcardKey] = predicateRead{table: tableKey, gen: predicate.wildcardGen}
+	}
+	overlay := s.overlay[tableKey]
+	rows := make([]Row, 0, len(versions)+len(overlay))
+	for _, version := range versions {
+		if _, staged := overlay[version.key]; staged {
+			continue
+		}
+		s.reads[version.key] = version.lsn
+		rows = append(rows, version.row)
+	}
+	for _, entry := range overlay {
+		if entry.absent {
+			continue
+		}
+		key, kerr := s.table.IndexRowKey(idx, entry.row)
+		if kerr != nil {
+			return nil, kerr
+		}
+		if key == valueKey {
+			rows = append(rows, cloneRow(entry.row))
+		}
+	}
+	return rows, nil
+}
+
 // CountFast returns the exact row count, observing the staged overlay in a
 // transaction.
 func (s *Session) CountFast(table string) (int, error) {
@@ -730,6 +784,8 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 	}
 	count := 0
 	for _, row := range rows {
+		oldRow := cloneRow(row)
+		oldKey := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
 		updates, err := s.runUpdateFn(updateFn, row)
 		if err != nil {
 			return count, err
@@ -742,8 +798,18 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 				}
 			}
 		}
-		key := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
-		s.stagePut(table, key, row)
+		newKey := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
+		if newKey != oldKey {
+			// The primary key changed: move the staged row instead of leaving a
+			// stale copy under the old key, and refuse to overwrite another row.
+			if _, gerr := s.getByPKLocked(table, fmt.Sprintf("%v", row[schema.PrimaryKey])); gerr == nil {
+				return count, fmt.Errorf("duplicate primary key: %v", row[schema.PrimaryKey])
+			} else if gerr != ErrKeyNotFound {
+				return count, gerr
+			}
+			s.stageDelete(table, oldKey, oldRow)
+		}
+		s.stagePut(table, newKey, row)
 		count++
 	}
 	return count, nil

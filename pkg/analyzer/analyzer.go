@@ -89,6 +89,9 @@ func (a *Analyzer) Analyze(stmt parser.Statement) error {
 		*parser.SavepointStmt, *parser.ReleaseStmt:
 		// Transaction statements don't need semantic analysis
 		return nil
+	case *parser.AnalyzeStmt:
+		// ANALYZE is a documented no-op; nothing to validate.
+		return nil
 	case *parser.CreateIndexStmt, *parser.DropIndexStmt:
 		// Index statements don't need semantic analysis
 		return nil
@@ -481,7 +484,10 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 		}
 	}
 
-	// Validate column list if specified
+	a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns, IsView: table.IsView})
+
+	// Validate column list if specified. Generated columns may never be written
+	// explicitly.
 	var targetCols []ColumnInfo
 	if len(stmt.Columns) > 0 {
 		for _, colName := range stmt.Columns {
@@ -492,10 +498,21 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 					Message: fmt.Sprintf("column not found: %s", colName),
 				}
 			}
+			if col.Generated {
+				return &AnalysisError{
+					Type:    ErrTypeMismatch,
+					Message: fmt.Sprintf("cannot INSERT into generated column %s", colName),
+				}
+			}
 			targetCols = append(targetCols, *col)
 		}
 	} else {
-		targetCols = table.Columns
+		// Positional values map to the table's non-generated columns.
+		for _, col := range table.Columns {
+			if !col.Generated {
+				targetCols = append(targetCols, col)
+			}
+		}
 	}
 
 	// Validate VALUES
@@ -507,31 +524,47 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 			}
 		}
 
-		for i, expr := range row {
-			info, err := a.analyzeExpr(expr)
+		for _, expr := range row {
+			_, err := a.analyzeExpr(expr)
 			if err != nil {
 				return err
-			}
-
-			// Check type compatibility
-			if !info.Type.IsComparable(targetCols[i].Type) && info.Type != TypeNull {
-				return &AnalysisError{
-					Type: ErrTypeMismatch,
-					Message: fmt.Sprintf("type mismatch for column %s: expected %s, got %s",
-						targetCols[i].Name, targetCols[i].Type, info.Type),
-				}
 			}
 		}
 	}
 
 	// Analyze INSERT ... SELECT
 	if stmt.Select != nil {
-		a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns, IsView: table.IsView})
 		if err := a.analyzeSelect(stmt.Select); err != nil {
 			return err
 		}
 	}
 
+	// Analyze RETURNING in the target table's scope.
+	if err := a.analyzeReturning(stmt.Returning); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// analyzeReturning validates a RETURNING projection. Wildcards are accepted; a
+// projection may not contain aggregates.
+func (a *Analyzer) analyzeReturning(cols []parser.SelectColumn) error {
+	for _, col := range cols {
+		if col.Star || col.TableStar != "" || col.Expr == nil {
+			continue
+		}
+		info, err := a.analyzeExpr(col.Expr)
+		if err != nil {
+			return err
+		}
+		if info.IsAggregate {
+			return &AnalysisError{
+				Type:    ErrAggregateInWhere,
+				Message: "aggregate functions are not allowed in RETURNING",
+			}
+		}
+	}
 	return nil
 }
 
@@ -547,6 +580,14 @@ func (a *Analyzer) analyzeUpdate(stmt *parser.UpdateStmt) error {
 
 	a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns, Alias: stmt.Table.Alias, IsView: table.IsView})
 
+	// UPDATE ... FROM: source tables/derived tables join the target in scope so
+	// SET and WHERE may reference their columns.
+	if len(stmt.From) > 0 {
+		if err := a.resolveFromClause(stmt.From); err != nil {
+			return err
+		}
+	}
+
 	// Validate SET assignments
 	for _, assign := range stmt.Set {
 		col, ok := table.GetColumn(assign.Column)
@@ -556,18 +597,16 @@ func (a *Analyzer) analyzeUpdate(stmt *parser.UpdateStmt) error {
 				Message: fmt.Sprintf("column not found: %s", assign.Column),
 			}
 		}
-
-		info, err := a.analyzeExpr(assign.Value)
-		if err != nil {
-			return err
+		if col.Generated {
+			return &AnalysisError{
+				Type:    ErrTypeMismatch,
+				Message: fmt.Sprintf("cannot UPDATE generated column %s", assign.Column),
+			}
 		}
 
-		if !info.Type.IsComparable(col.Type) && info.Type != TypeNull {
-			return &AnalysisError{
-				Type: ErrTypeMismatch,
-				Message: fmt.Sprintf("type mismatch for column %s: expected %s, got %s",
-					col.Name, col.Type, info.Type),
-			}
+		_, err := a.analyzeExpr(assign.Value)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -583,6 +622,10 @@ func (a *Analyzer) analyzeUpdate(stmt *parser.UpdateStmt) error {
 				Message: "aggregate functions not allowed in WHERE clause",
 			}
 		}
+	}
+
+	if err := a.analyzeReturning(stmt.Returning); err != nil {
+		return err
 	}
 
 	return nil
@@ -612,6 +655,10 @@ func (a *Analyzer) analyzeDelete(stmt *parser.DeleteStmt) error {
 				Message: "aggregate functions not allowed in WHERE clause",
 			}
 		}
+	}
+
+	if err := a.analyzeReturning(stmt.Returning); err != nil {
+		return err
 	}
 
 	return nil
@@ -651,6 +698,7 @@ func (a *Analyzer) analyzeCreateTable(stmt *parser.CreateTableStmt) error {
 			Type:      TypeFromName(colDef.Type.Name),
 			Nullable:  true,
 			TableName: stmt.Table.Name,
+			Generated: colDef.GeneratedExpr != nil,
 		}
 
 		// Process constraints
@@ -682,6 +730,23 @@ func (a *Analyzer) analyzeCreateTable(stmt *parser.CreateTableStmt) error {
 					}
 				}
 			}
+		}
+	}
+
+	// Validate generated-column expressions against the new table's columns.
+	// Column references resolve within the table being created.
+	for _, colDef := range stmt.Columns {
+		if colDef.GeneratedExpr == nil {
+			continue
+		}
+		genScope := NewScope(nil)
+		genScope.DefineTable(tableInfo)
+		oldScope := a.scope
+		a.scope = genScope
+		_, err := a.analyzeExpr(colDef.GeneratedExpr)
+		a.scope = oldScope
+		if err != nil {
+			return err
 		}
 	}
 
@@ -736,6 +801,20 @@ func (a *Analyzer) analyzeExpr(expr parser.Expr) (*ExprInfo, error) {
 		return a.analyzeLikeExpr(e)
 	case *parser.IsNullExpr:
 		return a.analyzeIsNullExpr(e)
+	case *parser.IsDistinctExpr:
+		left, err := a.analyzeExpr(e.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := a.analyzeExpr(e.Right)
+		if err != nil {
+			return nil, err
+		}
+		return &ExprInfo{
+			Type:        TypeBoolean,
+			IsAggregate: left.IsAggregate || right.IsAggregate,
+			Nullable:    false,
+		}, nil
 	case *parser.ExistsExpr:
 		return a.analyzeExistsExpr(e)
 	case *parser.SubqueryExpr:
@@ -788,6 +867,8 @@ func (a *Analyzer) analyzeLiteral(e *parser.LiteralExpr) (*ExprInfo, error) {
 		}
 	case lexer.TokenString:
 		info.Type = TypeText
+	case lexer.TokenBlob:
+		info.Type = TypeBlob
 	case lexer.TokenNULL:
 		info.Type = TypeNull
 		info.Nullable = true
@@ -889,6 +970,17 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 				Message: fmt.Sprintf("cannot compare %s with %s", left.Type, right.Type),
 			}
 		}
+	case lexer.TokenBitAnd, lexer.TokenBitOr, lexer.TokenShiftLeft, lexer.TokenShiftRight:
+		// Bitwise operators coerce operands to integers.
+		info.Type = TypeInteger
+		for _, operand := range []Type{left.Type, right.Type} {
+			if !operand.IsNumeric() && operand != TypeNull && operand != TypeUnknown && operand != TypeAny {
+				return nil, &AnalysisError{
+					Type:    ErrTypeMismatch,
+					Message: fmt.Sprintf("bitwise operator requires numeric type, got %s", operand),
+				}
+			}
+		}
 	case lexer.TokenAND, lexer.TokenOR:
 		// Logical operators
 		info.Type = TypeBoolean
@@ -928,6 +1020,8 @@ func (a *Analyzer) analyzeUnaryExpr(e *parser.UnaryExpr) (*ExprInfo, error) {
 		}
 	case lexer.TokenNOT:
 		info.Type = TypeBoolean
+	case lexer.TokenBitNot:
+		info.Type = TypeInteger
 	default:
 		info.Type = operand.Type
 	}
@@ -984,8 +1078,9 @@ func (a *Analyzer) analyzeFunctionCall(e *parser.FunctionCall) (*ExprInfo, error
 		}
 	}
 
-	// Special case: MIN/MAX/COALESCE return type depends on argument
-	if sig.ReturnType == TypeAny && len(e.Args) > 0 {
+	// Special case: polymorphic functions (MIN/MAX/COALESCE/...) return a value
+	// whose type follows their first argument.
+	if sig.ReturnType == TypeAny && len(e.Args) > 0 && isPolymorphicFunction(e.Name) {
 		argInfo, _ := a.analyzeExpr(e.Args[0])
 		if argInfo != nil {
 			info.Type = argInfo.Type
@@ -993,6 +1088,16 @@ func (a *Analyzer) analyzeFunctionCall(e *parser.FunctionCall) (*ExprInfo, error
 	}
 
 	return info, nil
+}
+
+// isPolymorphicFunction reports whether a function's result type follows its
+// first argument rather than a fixed signature type.
+func isPolymorphicFunction(name string) bool {
+	switch strings.ToUpper(name) {
+	case "MIN", "MAX", "COALESCE", "IFNULL", "NVL", "NULLIF", "IIF":
+		return true
+	}
+	return false
 }
 
 func (a *Analyzer) analyzeCaseExpr(e *parser.CaseExpr) (*ExprInfo, error) {

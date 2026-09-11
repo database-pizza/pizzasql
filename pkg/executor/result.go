@@ -31,6 +31,11 @@ func (r *Result) AddColumn(name string) {
 
 // AddRow adds a row to the result.
 func (r *Result) AddRow(values ...interface{}) {
+	for i, v := range values {
+		if jt, ok := v.(jsonText); ok {
+			values[i] = string(jt)
+		}
+	}
 	r.Rows = append(r.Rows, values)
 	r.RowCount = len(r.Rows)
 }

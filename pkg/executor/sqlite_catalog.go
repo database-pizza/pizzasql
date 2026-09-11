@@ -294,7 +294,16 @@ func (e *Executor) pragmaTableXInfo(table string) (*Result, error) {
 		if col.PrimaryKey {
 			pk = 1
 		}
-		result.AddRow(int64(i), col.Name, col.Type, notnull, col.Default, pk, int64(0))
+		// Hidden flag: 0 normal, 2 generated VIRTUAL, 3 generated STORED.
+		hidden := int64(0)
+		if col.GeneratedExpr != "" {
+			if col.GeneratedStored {
+				hidden = 3
+			} else {
+				hidden = 2
+			}
+		}
+		result.AddRow(int64(i), col.Name, col.Type, notnull, col.Default, pk, hidden)
 	}
 	return result, nil
 }
@@ -332,6 +341,16 @@ func recreateColumnDef(s *storage.Schema, col storage.Column) string {
 	if col.Default != nil {
 		b.WriteString(" DEFAULT ")
 		b.WriteString(sqlLiteral(col.Default))
+	}
+	if col.GeneratedExpr != "" {
+		b.WriteString(" GENERATED ALWAYS AS (")
+		b.WriteString(col.GeneratedExpr)
+		b.WriteString(")")
+		if col.GeneratedStored {
+			b.WriteString(" STORED")
+		} else {
+			b.WriteString(" VIRTUAL")
+		}
 	}
 	return b.String()
 }

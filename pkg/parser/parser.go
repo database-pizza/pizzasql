@@ -41,6 +41,21 @@ func (p *Parser) Parse() (Statement, error) {
 	return stmt, nil
 }
 
+// ParseExpr parses a standalone SQL expression, used for persisted generated
+// column and expression-index definitions. It rejects trailing tokens so a
+// malformed stored expression surfaces immediately.
+func ParseExpr(input string) (Expr, error) {
+	p := New(lexer.New(input))
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.curTokenIs(lexer.TokenEOF) {
+		return nil, p.curError("unexpected trailing token: " + p.curToken.Type.String())
+	}
+	return expr, nil
+}
+
 // ParseMultiple parses multiple SQL statements.
 func (p *Parser) ParseMultiple() ([]Statement, error) {
 	var stmts []Statement
@@ -87,6 +102,14 @@ func (p *Parser) expectPeek(t lexer.TokenType) error {
 	return p.peekError(t)
 }
 
+// curIdentIs reports whether the current token is an identifier spelling word
+// case-insensitively. It lets context-sensitive keywords (GENERATED, ALWAYS,
+// STORED, VIRTUAL) be recognized only in the positions where they are
+// meaningful, so they remain usable as ordinary identifiers elsewhere.
+func (p *Parser) curIdentIs(word string) bool {
+	return p.curToken.Type == lexer.TokenIdent && strings.EqualFold(p.curToken.Literal, word)
+}
+
 func (p *Parser) peekError(t lexer.TokenType) error {
 	return newError(
 		"expected "+t.String()+", got "+p.peekToken.Type.String(),
@@ -130,6 +153,8 @@ func (p *Parser) parseStatement() (Statement, error) {
 		return p.parseDetach()
 	case lexer.TokenPRAGMA:
 		return p.parsePragma()
+	case lexer.TokenANALYZE:
+		return p.parseAnalyze()
 	case lexer.TokenEXPLAIN:
 		return p.parseExplain()
 	case lexer.TokenBEGIN:
@@ -675,8 +700,8 @@ func (p *Parser) parseJoin() (*JoinClause, error) {
 		join.Condition = cond
 	} else if p.curTokenIs(lexer.TokenUSING) {
 		p.nextToken()
-		if err := p.expectPeek(lexer.TokenLParen); err != nil {
-			return nil, err
+		if !p.curTokenIs(lexer.TokenLParen) {
+			return nil, p.curError("expected (")
 		}
 		p.nextToken()
 		cols, err := p.parseIdentList()
@@ -792,7 +817,7 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 		p.nextToken()
 	}
 
-	// Parse VALUES or SELECT
+	// Parse VALUES, SELECT, or SQLite's INSERT ... WITH ... SELECT form.
 	if p.curTokenIs(lexer.TokenVALUES) {
 		p.nextToken()
 		values, err := p.parseValuesList()
@@ -806,8 +831,18 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 			return nil, err
 		}
 		stmt.Select = sel
+	} else if p.isWithStart() {
+		withStmt, err := p.parseWithStatement()
+		if err != nil {
+			return nil, err
+		}
+		sel, ok := withStmt.(*SelectStmt)
+		if !ok {
+			return nil, p.curError("expected SELECT after WITH")
+		}
+		stmt.Select = sel
 	} else {
-		return nil, p.curError("expected VALUES or SELECT")
+		return nil, p.curError("expected VALUES, SELECT, or WITH")
 	}
 
 	if p.curTokenIs(lexer.TokenON) {
@@ -864,6 +899,14 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 		} else {
 			return nil, p.curError("expected NOTHING or UPDATE after DO")
 		}
+	}
+
+	if p.curTokenIs(lexer.TokenRETURNING) {
+		returning, err := p.parseReturningClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = returning
 	}
 
 	return stmt, nil
@@ -943,6 +986,16 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 		p.nextToken()
 	}
 
+	// Parse optional FROM clause (SQLite UPDATE ... FROM).
+	if p.curTokenIs(lexer.TokenFROM) {
+		p.nextToken()
+		from, err := p.parseTableRefs()
+		if err != nil {
+			return nil, err
+		}
+		stmt.From = from
+	}
+
 	// Parse optional WHERE
 	if p.curTokenIs(lexer.TokenWHERE) {
 		p.nextToken()
@@ -951,6 +1004,14 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 			return nil, err
 		}
 		stmt.Where = where
+	}
+
+	if p.curTokenIs(lexer.TokenRETURNING) {
+		returning, err := p.parseReturningClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = returning
 	}
 
 	return stmt, nil
@@ -984,7 +1045,29 @@ func (p *Parser) parseDelete() (*DeleteStmt, error) {
 		stmt.Where = where
 	}
 
+	if p.curTokenIs(lexer.TokenRETURNING) {
+		returning, err := p.parseReturningClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = returning
+	}
+
 	return stmt, nil
+}
+
+// parseReturningClause parses the projection after a RETURNING keyword. The
+// caller must leave curToken on the RETURNING identifier.
+func (p *Parser) parseReturningClause() ([]SelectColumn, error) {
+	p.nextToken() // consume RETURNING
+	cols, err := p.parseSelectColumns()
+	if err != nil {
+		return nil, err
+	}
+	if len(cols) == 0 {
+		return nil, p.curError("RETURNING requires at least one expression")
+	}
+	return cols, nil
 }
 
 // parseCreate parses CREATE statements.
@@ -1089,7 +1172,7 @@ func (p *Parser) isTableConstraintStart() bool {
 func (p *Parser) parseColumnDef() (*ColumnDef, error) {
 	col := &ColumnDef{}
 
-	if !p.curTokenIs(lexer.TokenIdent) {
+	if !p.curIsName() {
 		return nil, p.curError("expected column name")
 	}
 	col.Name = p.curToken.Literal
@@ -1104,6 +1187,11 @@ func (p *Parser) parseColumnDef() (*ColumnDef, error) {
 
 	// Parse column constraints
 	for {
+		if consumed, err := p.tryParseGeneratedColumn(col); err != nil {
+			return nil, err
+		} else if consumed {
+			continue
+		}
 		constraint, ok, err := p.parseColumnConstraint()
 		if err != nil {
 			return nil, err
@@ -1117,6 +1205,50 @@ func (p *Parser) parseColumnDef() (*ColumnDef, error) {
 	}
 
 	return col, nil
+}
+
+// tryParseGeneratedColumn parses a GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]
+// clause, or the shorthand AS (expr) [STORED|VIRTUAL]. It reports whether a
+// clause was consumed. Generated columns cannot be written by the user.
+func (p *Parser) tryParseGeneratedColumn(col *ColumnDef) (bool, error) {
+	started := false
+	if p.curIdentIs("GENERATED") {
+		started = true
+		p.nextToken()
+		if !p.curIdentIs("ALWAYS") {
+			return false, p.curError("expected ALWAYS after GENERATED")
+		}
+		p.nextToken()
+	}
+	if !p.curTokenIs(lexer.TokenAS) {
+		if started {
+			return false, p.curError("expected AS in generated column definition")
+		}
+		return false, nil
+	}
+	p.nextToken() // consume AS
+	if !p.curTokenIs(lexer.TokenLParen) {
+		return false, p.curError("expected ( after AS")
+	}
+	p.nextToken()
+	expr, err := p.parseExpr()
+	if err != nil {
+		return false, err
+	}
+	if !p.curTokenIs(lexer.TokenRParen) {
+		return false, p.curError("expected ) after generated expression")
+	}
+	p.nextToken()
+
+	col.GeneratedExpr = expr
+	if p.curIdentIs("STORED") {
+		col.GeneratedStored = true
+		p.nextToken()
+	} else if p.curIdentIs("VIRTUAL") {
+		col.GeneratedStored = false
+		p.nextToken()
+	}
+	return true, nil
 }
 
 // identTypeAliases maps non-reserved type names (lexed as plain identifiers)
@@ -1199,6 +1331,12 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 		}
 		constraint.Type = ConstraintPrimaryKey
 		p.nextToken()
+		if action, ok, err := p.parseOnConflictAction(); err != nil {
+			return nil, false, err
+		} else if ok {
+			constraint.OnConflict = action
+			constraint.HasOnConflict = true
+		}
 
 	case lexer.TokenNOT:
 		p.nextToken()
@@ -1211,6 +1349,12 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 	case lexer.TokenUNIQUE:
 		constraint.Type = ConstraintUnique
 		p.nextToken()
+		if action, ok, err := p.parseOnConflictAction(); err != nil {
+			return nil, false, err
+		} else if ok {
+			constraint.OnConflict = action
+			constraint.HasOnConflict = true
+		}
 
 	case lexer.TokenDEFAULT:
 		p.nextToken()
@@ -1250,6 +1394,23 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 		constraint.Type = ConstraintAutoIncrement
 		p.nextToken()
 
+	case lexer.TokenCHECK:
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenLParen) {
+			return nil, false, p.curError("expected ( after CHECK")
+		}
+		p.nextToken()
+		check, err := p.parseExpr()
+		if err != nil {
+			return nil, false, err
+		}
+		if !p.curTokenIs(lexer.TokenRParen) {
+			return nil, false, p.curError("expected ) after CHECK expression")
+		}
+		p.nextToken()
+		constraint.Type = ConstraintCheck
+		constraint.Check = check
+
 	case lexer.TokenNULL:
 		// Explicit NULL is a no-op: columns are nullable by default, so an
 		// explicit NULL declaration carries no constraint. Consume it so
@@ -1263,6 +1424,58 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 	}
 
 	return constraint, true, nil
+}
+
+// parseOnConflictAction parses an optional constraint clause of the form
+// ON CONFLICT IGNORE|REPLACE|FAIL|ABORT|ROLLBACK. It reports ok=false and leaves
+// the cursor unchanged when no ON CONFLICT follows.
+func (p *Parser) parseOnConflictAction() (ConflictAction, bool, error) {
+	if !p.curTokenIs(lexer.TokenON) {
+		return ConflictAbort, false, nil
+	}
+	p.nextToken()
+	if !p.curTokenIs(lexer.TokenCONFLICT) {
+		return ConflictAbort, false, p.curError("expected CONFLICT after ON")
+	}
+	p.nextToken()
+	switch p.curToken.Type {
+	case lexer.TokenREPLACE:
+		p.nextToken()
+		return ConflictReplace, true, nil
+	case lexer.TokenIGNORE:
+		p.nextToken()
+		return ConflictIgnore, true, nil
+	case lexer.TokenFAIL:
+		p.nextToken()
+		return ConflictFail, true, nil
+	case lexer.TokenABORT:
+		p.nextToken()
+		return ConflictAbort, true, nil
+	case lexer.TokenROLLBACK:
+		p.nextToken()
+		return ConflictRollback, true, nil
+	default:
+		return ConflictAbort, false, p.curError("expected REPLACE, IGNORE, FAIL, ABORT, or ROLLBACK after ON CONFLICT")
+	}
+}
+
+// consumeReferentialAction consumes one foreign-key referential action
+// (CASCADE, RESTRICT, SET NULL, SET DEFAULT, NO ACTION). It is a no-op for the
+// engine, which does not enforce foreign keys.
+func (p *Parser) consumeReferentialAction() {
+	if p.curTokenIs(lexer.TokenSET) {
+		p.nextToken() // NULL or DEFAULT
+		p.nextToken()
+		return
+	}
+	if p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "NO") {
+		p.nextToken()
+		if p.curTokenIs(lexer.TokenIdent) {
+			p.nextToken() // ACTION
+		}
+		return
+	}
+	p.nextToken() // CASCADE, RESTRICT, ...
 }
 
 func (p *Parser) parseTableConstraint() (*TableConstraint, error) {
@@ -1291,6 +1504,12 @@ func (p *Parser) parseTableConstraint() (*TableConstraint, error) {
 			return nil, err
 		}
 		constraint.Columns = cols
+		if action, ok, err := p.parseOnConflictAction(); err != nil {
+			return nil, err
+		} else if ok {
+			constraint.OnConflict = action
+			constraint.HasOnConflict = true
+		}
 
 	case lexer.TokenUNIQUE:
 		p.nextToken()
@@ -1300,6 +1519,12 @@ func (p *Parser) parseTableConstraint() (*TableConstraint, error) {
 			return nil, err
 		}
 		constraint.Columns = cols
+		if action, ok, err := p.parseOnConflictAction(); err != nil {
+			return nil, err
+		} else if ok {
+			constraint.OnConflict = action
+			constraint.HasOnConflict = true
+		}
 
 	case lexer.TokenFOREIGN:
 		p.nextToken()
@@ -1328,6 +1553,17 @@ func (p *Parser) parseTableConstraint() (*TableConstraint, error) {
 			return nil, err
 		}
 		constraint.RefColumns = refCols
+
+		// Consume and ignore referential actions (ON DELETE/UPDATE ...). The
+		// engine does not enforce foreign keys, but the clause must parse.
+		for p.curTokenIs(lexer.TokenON) {
+			p.nextToken()
+			if !p.curTokenIs(lexer.TokenDELETE) && !p.curTokenIs(lexer.TokenUPDATE) {
+				return nil, p.curError("expected DELETE or UPDATE after ON")
+			}
+			p.nextToken()
+			p.consumeReferentialAction()
+		}
 
 	case lexer.TokenCHECK:
 		p.nextToken()
@@ -1415,17 +1651,24 @@ func (p *Parser) parseCreateIndex(unique bool) (*CreateIndexStmt, error) {
 	}
 	p.nextToken()
 
-	// Parse column list
+	// Parse column list. Each element is either a bare column name or an
+	// arbitrary deterministic expression (e.g. lower(email)).
 	for {
 		if p.curTokenIs(lexer.TokenRParen) {
 			break
 		}
 
-		if !p.curTokenIs(lexer.TokenIdent) {
-			return nil, p.curError("expected column name")
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
 		}
-		col := IndexColumn{Name: p.curToken.Literal}
-		p.nextToken()
+		col := IndexColumn{}
+		if ref, ok := expr.(*ColumnRef); ok && ref.Table == "" {
+			col.Name = ref.Column
+		} else {
+			col.Expr = expr
+			col.Name = FormatExpr(expr)
+		}
 
 		// Check for ASC/DESC
 		if p.curTokenIs(lexer.TokenASC) {
@@ -1675,7 +1918,7 @@ func (p *Parser) parseAlterTableDrop(stmt *AlterTableStmt) (*AlterTableStmt, err
 	}
 
 	// Parse column name
-	if !p.curTokenIs(lexer.TokenIdent) {
+	if !p.curIsName() {
 		return nil, p.curError("expected column name")
 	}
 
@@ -1766,16 +2009,38 @@ func (p *Parser) parsePragma() (*PragmaStmt, error) {
 	return stmt, nil
 }
 
+// parseAnalyze parses ANALYZE [schema.]table. PizzaSQL does not maintain
+// optimizer statistics, so the statement is accepted and ignored at execution.
+func (p *Parser) parseAnalyze() (*AnalyzeStmt, error) {
+	stmt := &AnalyzeStmt{}
+	p.nextToken() // consume ANALYZE
+
+	if p.curTokenIs(lexer.TokenIdent) {
+		stmt.Name = p.curToken.Literal
+		p.nextToken()
+		if p.curTokenIs(lexer.TokenDot) {
+			p.nextToken()
+			if !p.curTokenIs(lexer.TokenIdent) {
+				return nil, p.curError("expected table name after .")
+			}
+			stmt.Name = p.curToken.Literal
+			p.nextToken()
+		}
+	}
+	return stmt, nil
+}
+
 // parseExplain parses an EXPLAIN statement.
 func (p *Parser) parseExplain() (*ExplainStmt, error) {
 	stmt := &ExplainStmt{}
 
 	p.nextToken() // consume EXPLAIN
 
-	// Check for QUERY PLAN
+	// Check for QUERY PLAN. PLAN is not a reserved lexer keyword so it can be a
+	// column name; recognize it contextually here.
 	if p.curTokenIs(lexer.TokenQUERY) {
 		p.nextToken()
-		if !p.curTokenIs(lexer.TokenPLAN) {
+		if !p.curIdentIs("PLAN") {
 			return nil, p.curError("expected PLAN after QUERY")
 		}
 		stmt.QueryPlan = true
@@ -1989,12 +2254,12 @@ func (p *Parser) parseNotExpr() (Expr, error) {
 }
 
 func (p *Parser) parseComparisonExpr() (Expr, error) {
-	left, err := p.parseAddExpr()
+	left, err := p.parseBitwiseExpr()
 	if err != nil {
 		return nil, err
 	}
 
-	// Handle IS NULL / IS NOT NULL
+	// Handle IS NULL / IS NOT NULL and IS [NOT] DISTINCT FROM.
 	if p.curTokenIs(lexer.TokenIS) {
 		p.nextToken()
 		not := false
@@ -2002,8 +2267,20 @@ func (p *Parser) parseComparisonExpr() (Expr, error) {
 			not = true
 			p.nextToken()
 		}
+		if p.curTokenIs(lexer.TokenDISTINCT) {
+			p.nextToken()
+			if !p.curTokenIs(lexer.TokenFROM) {
+				return nil, p.curError("expected FROM after IS [NOT] DISTINCT")
+			}
+			p.nextToken()
+			right, err := p.parseBitwiseExpr()
+			if err != nil {
+				return nil, err
+			}
+			return &IsDistinctExpr{Left: left, Right: right, Not: not}, nil
+		}
 		if !p.curTokenIs(lexer.TokenNULL) {
-			return nil, p.curError("expected NULL after IS")
+			return nil, p.curError("expected NULL or DISTINCT FROM after IS")
 		}
 		p.nextToken()
 		return &IsNullExpr{Left: left, Not: not}, nil
@@ -2042,7 +2319,7 @@ func (p *Parser) parseComparisonExpr() (Expr, error) {
 	if isComparisonOp(p.curToken.Type) {
 		op := p.curToken.Type
 		p.nextToken()
-		right, err := p.parseAddExpr()
+		right, err := p.parseBitwiseExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -2059,6 +2336,30 @@ func isComparisonOp(t lexer.TokenType) bool {
 		return true
 	}
 	return false
+}
+
+// parseBitwiseExpr parses the SQLite bitwise layer: << >> & | bind more tightly
+// than comparisons but more loosely than + and -.
+func (p *Parser) parseBitwiseExpr() (Expr, error) {
+	left, err := p.parseAddExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		switch p.curToken.Type {
+		case lexer.TokenShiftLeft, lexer.TokenShiftRight, lexer.TokenBitAnd, lexer.TokenBitOr:
+			op := p.curToken.Type
+			p.nextToken()
+			right, err := p.parseAddExpr()
+			if err != nil {
+				return nil, err
+			}
+			left = &BinaryExpr{Left: left, Op: op, Right: right}
+		default:
+			return left, nil
+		}
+	}
 }
 
 func (p *Parser) parseInExpr(left Expr, not bool) (Expr, error) {
@@ -2094,7 +2395,7 @@ func (p *Parser) parseInExpr(left Expr, not bool) (Expr, error) {
 }
 
 func (p *Parser) parseBetweenExpr(left Expr, not bool) (Expr, error) {
-	low, err := p.parseAddExpr()
+	low, err := p.parseBitwiseExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -2104,7 +2405,7 @@ func (p *Parser) parseBetweenExpr(left Expr, not bool) (Expr, error) {
 	}
 	p.nextToken()
 
-	high, err := p.parseAddExpr()
+	high, err := p.parseBitwiseExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -2113,7 +2414,7 @@ func (p *Parser) parseBetweenExpr(left Expr, not bool) (Expr, error) {
 }
 
 func (p *Parser) parseLikeExpr(left Expr, not bool) (Expr, error) {
-	pattern, err := p.parseAddExpr()
+	pattern, err := p.parseBitwiseExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -2123,7 +2424,7 @@ func (p *Parser) parseLikeExpr(left Expr, not bool) (Expr, error) {
 	// Check for ESCAPE
 	if p.curTokenIs(lexer.TokenESCAPE) {
 		p.nextToken()
-		esc, err := p.parseAddExpr()
+		esc, err := p.parseBitwiseExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -2138,7 +2439,6 @@ func (p *Parser) parseAddExpr() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	for p.curTokenIs(lexer.TokenPlus) || p.curTokenIs(lexer.TokenMinus) || p.curTokenIs(lexer.TokenConcat) {
 		op := p.curToken.Type
 		p.nextToken()
@@ -2172,7 +2472,7 @@ func (p *Parser) parseMulExpr() (Expr, error) {
 }
 
 func (p *Parser) parseUnaryExpr() (Expr, error) {
-	if p.curTokenIs(lexer.TokenMinus) || p.curTokenIs(lexer.TokenPlus) {
+	if p.curTokenIs(lexer.TokenMinus) || p.curTokenIs(lexer.TokenPlus) || p.curTokenIs(lexer.TokenBitNot) {
 		op := p.curToken.Type
 		p.nextToken()
 		operand, err := p.parseUnaryExpr()
@@ -2194,6 +2494,11 @@ func (p *Parser) parsePrimaryExpr() (Expr, error) {
 
 	case lexer.TokenString:
 		expr := &LiteralExpr{Type: lexer.TokenString, Value: p.curToken.Literal}
+		p.nextToken()
+		return expr, nil
+
+	case lexer.TokenBlob:
+		expr := &LiteralExpr{Type: lexer.TokenBlob, Value: p.curToken.Literal}
 		p.nextToken()
 		return expr, nil
 
@@ -2249,6 +2554,21 @@ func (p *Parser) parsePrimaryExpr() (Expr, error) {
 	case lexer.TokenCOALESCE, lexer.TokenNULLIF, lexer.TokenIF, lexer.TokenREPLACE, lexer.TokenGLOB:
 		// These keywords can be used as function names
 		return p.parseKeywordFunction()
+
+	case lexer.TokenJSON, lexer.TokenJSONB:
+		// json(expr) / jsonb(expr) are JSON1 constructor functions. They lex as
+		// data-type keywords but are also callable.
+		return p.parseIdentOrFunction()
+
+	case lexer.TokenDATE, lexer.TokenTIME, lexer.TokenTIMESTAMP, lexer.TokenDATETIME:
+		// Date/time functions (date(), time(), datetime(), ...) lex as data-type
+		// keywords but are callable.
+		return p.parseIdentOrFunction()
+
+	case lexer.TokenKEY:
+		// KEY is a lexer keyword (PRIMARY KEY) that SQLite also permits as a
+		// column name, e.g. store.key.
+		return p.parseIdentOrFunction()
 
 	case lexer.TokenIdent:
 		return p.parseIdentOrFunction()
@@ -2513,7 +2833,7 @@ func (p *Parser) parseIdentList() ([]string, error) {
 	var idents []string
 
 	for {
-		if !p.curTokenIs(lexer.TokenIdent) {
+		if !p.curIsName() {
 			return nil, p.curError("expected identifier")
 		}
 		idents = append(idents, p.curToken.Literal)
@@ -2526,6 +2846,20 @@ func (p *Parser) parseIdentList() ([]string, error) {
 	}
 
 	return idents, nil
+}
+
+// curIsName reports whether the current token can serve as a name (column or
+// table identifier). A few lexer keywords, notably KEY, are commonly used as
+// column names in the GoatCounter schema and SQLite allows them.
+func (p *Parser) curIsName() bool {
+	if p.curTokenIs(lexer.TokenIdent) {
+		return true
+	}
+	switch p.curToken.Type {
+	case lexer.TokenKEY:
+		return true
+	}
+	return false
 }
 
 // Helper functions

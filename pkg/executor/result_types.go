@@ -52,3 +52,58 @@ func projectionColumnType(col parser.SelectColumn, schema *storage.Schema) strin
 	}
 	return "TEXT"
 }
+
+// joinedSelectColumnTypes resolves direct projections against every table in a
+// joined or comma-separated FROM clause. Expressions retain TEXT metadata.
+func (e *Executor) joinedSelectColumnTypes(stmt *parser.SelectStmt, refs []parser.TableRef) []string {
+	types := make([]string, 0, len(stmt.Columns))
+	for _, projection := range stmt.Columns {
+		if projection.Star {
+			for _, ref := range refs {
+				if schema, err := e.schema.GetSchema(ref.Name); err == nil {
+					for _, column := range schema.Columns {
+						types = append(types, column.Type)
+					}
+				}
+			}
+			continue
+		}
+		if projection.TableStar != "" {
+			if columns, _, err := e.resolveTableStar(stmt.From, projection.TableStar); err == nil {
+				for _, column := range columns {
+					types = append(types, column.Type)
+				}
+			}
+			continue
+		}
+
+		ref, ok := projection.Expr.(*parser.ColumnRef)
+		if !ok {
+			types = append(types, "TEXT")
+			continue
+		}
+		columnType := "TEXT"
+		found := false
+		for _, table := range refs {
+			if ref.Table != "" && !strings.EqualFold(ref.Table, table.Alias) && !strings.EqualFold(ref.Table, table.Name) {
+				continue
+			}
+			schema, err := e.schema.GetSchema(table.Name)
+			if err != nil {
+				continue
+			}
+			for _, column := range schema.Columns {
+				if strings.EqualFold(column.Name, ref.Column) {
+					columnType = column.Type
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		types = append(types, columnType)
+	}
+	return types
+}

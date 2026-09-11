@@ -71,6 +71,40 @@ func TestSelectColumnTypesEmptyResult(t *testing.T) {
 	}
 }
 
+func TestSelectColumnTypesJoin(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE hits (hit_id INTEGER PRIMARY KEY, path_id INTEGER, created_at TIMESTAMP)`)
+	execMust(t, e, `CREATE TABLE paths (path_id INTEGER PRIMARY KEY, path TEXT)`)
+	execMust(t, e, `INSERT INTO paths VALUES (1, '/home')`)
+	execMust(t, e, `INSERT INTO hits VALUES (1, 1, '2024-05-06 07:08:09')`)
+
+	res := execMust(t, e, `SELECT paths.path, hits.created_at FROM hits JOIN paths USING (path_id)`)
+	want := []string{"TEXT", "TIMESTAMP"}
+	if len(res.ColumnTypes) != len(want) {
+		t.Fatalf("column types = %v, want %v", res.ColumnTypes, want)
+	}
+	for i := range want {
+		if res.ColumnTypes[i] != want[i] {
+			t.Fatalf("column types = %v, want %v", res.ColumnTypes, want)
+		}
+	}
+}
+
+func TestSelectColumnTypesJoinUsesFirstUnqualifiedMatch(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE a (id INTEGER PRIMARY KEY, value TEXT)`)
+	execMust(t, e, `CREATE TABLE b (id INTEGER PRIMARY KEY, value INTEGER)`)
+	execMust(t, e, `INSERT INTO a VALUES (1, 'one')`)
+	execMust(t, e, `INSERT INTO b VALUES (1, 2)`)
+
+	res := execMust(t, e, `SELECT value FROM a JOIN b ON a.id = b.id`)
+	if len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != "TEXT" {
+		t.Fatalf("column types = %v, want [TEXT]", res.ColumnTypes)
+	}
+}
+
 func TestUUIDColumnRoundTrip(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
