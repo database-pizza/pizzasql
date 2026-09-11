@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -525,22 +527,38 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 // persist. The shared table gate is acquired before the key's striped lock so
 // a queued scan writer cannot invert the lock order with point operations.
 func (m *TableManager) Insert(table string, row Row) error {
+	_, err := m.InsertWithRowID(table, row)
+	return err
+}
+
+// InsertWithRowID returns the actual row identifier, never a concurrent counter.
+func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 	nr, key, err := m.prepareInsert(table, row)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	rowid, _ := rowIDFromRow(nr)
 	data, err := encodeRow(nr)
 	if err != nil {
-		return fmt.Errorf("failed to serialize row: %w", err)
+		return 0, fmt.Errorf("failed to serialize row: %w", err)
 	}
 	wasInit := m.countInitialized(table)
 
 	// Point writers share this gate with each other. Transaction commits and
 	// scan-based writes take it exclusively, so generation validation and cache
 	// publication are ordered without serializing writes to different keys.
-	tl := m.tableLock(table)
-	tl.RLock()
-	defer tl.RUnlock()
+	// A UNIQUE index forces the exclusive gate so the validating scan below
+	// cannot race another writer (or a concurrent CREATE UNIQUE INDEX).
+	unlock, uniq, err := m.lockForWrite(table)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	if uniq {
+		if err := m.validateUniqueRows(table, []Row{nr}, nil); err != nil {
+			return 0, err
+		}
+	}
 	st := m.stripeKey(key)
 	st.Lock()
 	defer st.Unlock()
@@ -549,10 +567,10 @@ func (m *TableManager) Insert(table string, row Row) error {
 		[]BatchOp{{Op: batchPut, Key: []byte(key), Value: data}},
 	)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !committed {
-		return fmt.Errorf("duplicate primary key: %v", row[schemaPrimaryKey(m.schema, table)])
+		return 0, fmt.Errorf("duplicate primary key: %v", row[schemaPrimaryKey(m.schema, table)])
 	}
 
 	m.updateIndexesForRow(table, nr, true)
@@ -564,7 +582,7 @@ func (m *TableManager) Insert(table string, row Row) error {
 	if schema, serr := m.schema.GetSchema(table); serr == nil {
 		m.incrCount(table, schema.CreatedAt, 1, wasInit)
 	}
-	return nil
+	return rowid, nil
 }
 
 func schemaPrimaryKey(s *SchemaManager, table string) string {
@@ -613,8 +631,15 @@ func chunkBatchOps(ops []BatchOp) [][]BatchOp {
 // bounded by the PKBFI operation-count and frame-size limits. Skips per-row
 // duplicate checks (caller must ensure uniqueness). Used by INSERT ... SELECT.
 func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
+	count, _, err := m.InsertBulkWithLastRowID(table, rows)
+	return count, err
+}
+
+// InsertBulkWithLastRowID is InsertBulk, additionally returning the ROWID of the
+// last persisted row (0 when nothing persisted).
+func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, int64, error) {
 	if len(rows) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	tl := m.tableLock(table)
 	tl.Lock()
@@ -622,7 +647,7 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 
 	schema, err := m.schema.GetSchema(table)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	wasInit := m.countInitialized(table)
 
@@ -653,7 +678,7 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 			switch v := nr[schema.PrimaryKey].(type) {
 			case float64:
 				if math.Trunc(v) != v {
-					return 0, fmt.Errorf("invalid integer primary key: %v", v)
+					return 0, 0, fmt.Errorf("invalid integer primary key: %v", v)
 				}
 				rowid = int64(v)
 				hasRowid = true
@@ -666,18 +691,28 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 			}
 		}
 		if !hasRowid {
-			if schema.PrimaryKey != "_rowid_" {
+			// Auto-generate for an INTEGER primary key or the synthetic _rowid_,
+			// mirroring prepareInsert so INSERT ... SELECT works on AUTOINCREMENT
+			// tables.
+			if isIntegerPK || schema.PrimaryKey == "_rowid_" {
+				rowid, err = m.schema.GetNextRowID(table)
+				if err != nil {
+					return 0, 0, err
+				}
+				if isIntegerPK {
+					nr[schema.PrimaryKey] = rowid
+				} else {
+					nr["_rowid_"] = rowid
+				}
+			} else {
 				pk, ok := nr[schema.PrimaryKey]
 				if !ok || pk == nil {
-					return 0, fmt.Errorf("missing primary key: %s", schema.PrimaryKey)
+					return 0, 0, fmt.Errorf("missing primary key: %s", schema.PrimaryKey)
 				}
-			}
-			rowid, err = m.schema.GetNextRowID(table)
-			if err != nil {
-				return 0, err
-			}
-			if schema.PrimaryKey == "_rowid_" {
-				nr[schema.PrimaryKey] = rowid
+				rowid, err = m.schema.GetNextRowID(table)
+				if err != nil {
+					return 0, 0, err
+				}
 			}
 		}
 		nr["_rowid_"] = rowid
@@ -699,7 +734,7 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 		pk := fmt.Sprintf("%v", nr[schema.PrimaryKey])
 		data, err := encodeRow(nr)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		ops = append(ops, BatchOp{Op: batchPut, Key: []byte(m.dataKey(table, pk)), Value: data})
 		encoded = append(encoded, nr)
@@ -709,7 +744,7 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 	for i, op := range ops {
 		key := string(op.Key)
 		if _, duplicate := seen[key]; duplicate {
-			return 0, fmt.Errorf("duplicate primary key: %s", key)
+			return 0, 0, fmt.Errorf("duplicate primary key: %s", key)
 		}
 		seen[key] = struct{}{}
 		keys[i] = op.Key
@@ -729,12 +764,16 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 		}
 		return nil
 	}); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	for i, found := range existing {
 		if found {
-			return 0, fmt.Errorf("duplicate primary key: %s", ops[i].Key)
+			return 0, 0, fmt.Errorf("duplicate primary key: %s", ops[i].Key)
 		}
+	}
+
+	if err := m.validateUniqueRows(table, encoded, nil); err != nil {
+		return 0, 0, err
 	}
 
 	// Write rows in atomic BATCH_WRITE chunks. Maintain in-memory indexes only
@@ -765,7 +804,11 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 	}
 	m.incrCount(table, schema.CreatedAt, numOK, wasInit)
 
-	return numOK, firstErr
+	var lastRowID int64
+	if numOK > 0 {
+		lastRowID, _ = rowIDFromRow(encoded[numOK-1])
+	}
+	return numOK, lastRowID, firstErr
 }
 
 // updateIndexesForRow adds or removes entries from already-built in-memory
@@ -947,6 +990,11 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 			continue
 		}
 
+		if err := m.validateUniqueRows(table, []Row{row}, excludedKey(m.dataKey(table, fmt.Sprintf("%v", oldRow[schema.PrimaryKey])))); err != nil {
+			m.updateIndexesForRow(table, oldRow, true)
+			return count, err
+		}
+
 		// Write back
 		key := m.dataKey(table, pk)
 		err = m.pool.WithClient(func(c *KVClient) error {
@@ -1018,6 +1066,11 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 			continue
 		}
 
+		if err := m.validateUniqueRows(table, []Row{row}, excludedKey(m.dataKey(table, fmt.Sprintf("%v", oldRow[schema.PrimaryKey])))); err != nil {
+			m.updateIndexesForRow(table, oldRow, true)
+			return count, err
+		}
+
 		// Write back
 		key := m.dataKey(table, pk)
 		err = m.pool.WithClient(func(c *KVClient) error {
@@ -1050,9 +1103,11 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 	}
 
 	key := m.dataKey(table, pk)
-	tl := m.tableLock(table)
-	tl.RLock()
-	defer tl.RUnlock()
+	unlock, uniq, err := m.lockForWrite(table)
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlock()
 	st := m.stripeKey(key)
 	st.Lock()
 	defer st.Unlock()
@@ -1082,6 +1137,11 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 	data, err := encodeRow(row)
 	if err != nil {
 		return nil, false, err
+	}
+	if uniq {
+		if err := m.validateUniqueRows(table, []Row{row}, excludedKey(key)); err != nil {
+			return nil, false, err
+		}
 	}
 	committed, err := m.compareWritePoint(
 		[]CompareCheck{{Key: []byte(key), LSN: lsn}},
@@ -1498,6 +1558,9 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 	if err == nil {
 		return m.ensureIndex(index)
 	}
+	if !errors.Is(err, ErrIndexNotFound) {
+		return err
+	}
 
 	tableSchema, schemaErr := m.schema.GetSchema(tableName)
 	if schemaErr != nil {
@@ -1556,6 +1619,303 @@ func (m *TableManager) buildIndexValue(row Row, columns []string) string {
 		parts = append(parts, formatValue(row[col]))
 	}
 	return strings.Join(parts, "\x00")
+}
+
+// ── UNIQUE index enforcement ────────────────────────────────────────────────
+//
+// Uniqueness is enforced by scanning durable rows rather than by persisting a
+// separate claim key. There is therefore no storage migration and no new durable
+// state: a table with a UNIQUE index takes its exclusive table gate for writes so
+// a validating scan can never race a concurrent writer. NULL values are exempt
+// (SQLite permits multiple NULLs in a unique index), and composite values are
+// encoded with length prefixes so "a\x00b" in one column can never collide with
+// "a", "b" across two columns.
+
+// uniqueIndexes returns the UNIQUE indexes defined on a table.
+func (m *TableManager) uniqueIndexes(table string) ([]*Index, error) {
+	indexes, err := m.schema.ListTableIndexes(table)
+	if err != nil {
+		return nil, err
+	}
+	var uniq []*Index
+	for _, idx := range indexes {
+		if idx.Unique {
+			uniq = append(uniq, idx)
+		}
+	}
+	return uniq, nil
+}
+
+// hasUniqueIndex reports whether the table has any UNIQUE index. An IO error is
+// surfaced so callers never silently skip uniqueness enforcement.
+func (m *TableManager) hasUniqueIndex(table string) (bool, error) {
+	indexes, err := m.uniqueIndexes(table)
+	if err != nil {
+		return false, err
+	}
+	return len(indexes) > 0, nil
+}
+
+// HasUniqueIndex reports whether the table has any UNIQUE index, surfacing IO
+// errors. It is the exported form used by the executor to decide whether to run a
+// DML statement inside an implicit transaction for statement-level atomicity.
+func (m *TableManager) HasUniqueIndex(table string) (bool, error) {
+	return m.hasUniqueIndex(table)
+}
+
+// encodeUniqueValue encodes the indexed value of a row with per-column type tags
+// and length prefixes. It returns isNull=true when any indexed column is NULL, in
+// which case the row is exempt from uniqueness. The length prefix makes composite
+// encodings collision-free.
+func encodeUniqueValue(row Row, columns []string) (string, bool) {
+	var sb strings.Builder
+	for _, col := range columns {
+		v, ok := row[col]
+		if !ok {
+			for k, val := range row {
+				if strings.EqualFold(k, col) {
+					v = val
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok || v == nil {
+			return "", true
+		}
+		s := encodeUniqueScalar(v)
+		sb.WriteString(strconv.Itoa(len(s)))
+		sb.WriteByte(':')
+		sb.WriteString(s)
+	}
+	return sb.String(), false
+}
+
+// encodeUniqueScalar encodes a scalar for uniqueness comparison. Integral
+// numerics are canonicalized across their integer/float/unsigned Go
+// representations so a computed value such as 1.5-0.5 (float64) collides with
+// the literal 1 (int64) the same way SQLite's numeric affinity does. Non-integral
+// reals keep a full-precision tag so no distinct value is lost. TEXT and BLOB
+// remain distinct from numbers.
+func encodeUniqueScalar(v interface{}) string {
+	switch t := v.(type) {
+	case bool:
+		if t {
+			return "b1"
+		}
+		return "b0"
+	case int:
+		return "i" + strconv.FormatInt(int64(t), 10)
+	case int64:
+		return "i" + strconv.FormatInt(t, 10)
+	case uint:
+		return "i" + strconv.FormatUint(uint64(t), 10)
+	case uint8:
+		return "i" + strconv.FormatUint(uint64(t), 10)
+	case uint16:
+		return "i" + strconv.FormatUint(uint64(t), 10)
+	case uint32:
+		return "i" + strconv.FormatUint(uint64(t), 10)
+	case uint64:
+		return "i" + strconv.FormatUint(t, 10)
+	case uintptr:
+		return "i" + strconv.FormatUint(uint64(t), 10)
+	case float64:
+		if s, ok := encodeIntegralFloat(t); ok {
+			return s
+		}
+		return "r" + strconv.FormatFloat(t, 'g', -1, 64)
+	case string:
+		return "s" + t
+	case []byte:
+		return "x" + string(t)
+	default:
+		return "s" + fmt.Sprintf("%v", t)
+	}
+}
+
+// encodeIntegralFloat canonicalizes a whole float64 to the same "i" encoding used
+// by integer values, without precision loss, so integral reals and integers are
+// not treated as distinct under a unique index. It reports false (and returns
+// nothing) for non-integral values or values outside the int64 range.
+func encodeIntegralFloat(v float64) (string, bool) {
+	if v != math.Trunc(v) {
+		return "", false
+	}
+	if v < -9223372036854775808.0 || v >= 9223372036854775808.0 {
+		return "", false
+	}
+	return "i" + strconv.FormatInt(int64(v), 10), true
+}
+
+// validateUniqueRows checks that pending rows do not conflict with one another or
+// with durable rows on any UNIQUE index. excludedKeys lists the actual durable
+// data keys whose rows are being replaced in this operation (delete, or an update
+// of a non-indexed column), so those rows' own unique values do not self-conflict
+// and swapping two unique values remains possible. Matching is done against the
+// raw scanned KV key rather than a re-stringified primary key, so numeric and
+// composite keys are unambiguous. The caller must hold the table's exclusive gate.
+func (m *TableManager) validateUniqueRows(table string, pending []Row, excludedKeys map[string]bool) error {
+	indexes, err := m.uniqueIndexes(table)
+	if err != nil {
+		return err
+	}
+	if len(indexes) == 0 {
+		return nil
+	}
+
+	// seen tracks, per unique index, the encoded values already claimed by the
+	// pending rows. Keying by index name (not just the encoded value) is essential:
+	// a single row can legitimately carry the same value in two different unique
+	// indexes (e.g. name and lower_name both "alice"), which must not collide with
+	// itself. Two rows only conflict when they share a value within the SAME index.
+	seen := make(map[string]map[string]bool, len(indexes))
+	for _, row := range pending {
+		for _, idx := range indexes {
+			columns := indexColumnNames(idx)
+			encoded, isNull := encodeUniqueValue(row, columns)
+			if isNull {
+				continue
+			}
+			perIndex := seen[idx.Name]
+			if perIndex == nil {
+				perIndex = make(map[string]bool)
+				seen[idx.Name] = perIndex
+			}
+			if perIndex[encoded] {
+				return fmt.Errorf("UNIQUE constraint failed: %s", idx.Name)
+			}
+			perIndex[encoded] = true
+		}
+	}
+
+	return m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.ScanWithLimit([]byte(m.dataPrefix(table)), scanPageSize)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cursor.Close(); retErr == nil {
+				retErr = err
+			}
+		}()
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				if excludedKeys != nil && excludedKeys[string(e.Key)] {
+					continue
+				}
+				row, err := decodeRow(e.Value)
+				if err != nil {
+					return err
+				}
+				for _, idx := range indexes {
+					columns := indexColumnNames(idx)
+					encoded, isNull := encodeUniqueValue(row, columns)
+					if isNull {
+						continue
+					}
+					if perIndex := seen[idx.Name]; perIndex != nil && perIndex[encoded] {
+						return fmt.Errorf("UNIQUE constraint failed: %s", idx.Name)
+					}
+				}
+			}
+			if done {
+				return nil
+			}
+		}
+	})
+}
+
+// excludedKey returns the exclusion set that exempts a single row's durable value
+// from the uniqueness scan, keyed by its actual durable data key.
+func excludedKey(dataKey string) map[string]bool {
+	return map[string]bool{dataKey: true}
+}
+
+// lockForWrite acquires the table gate appropriate for a point write: exclusive
+// when the table has a UNIQUE index (so the validating scan cannot race another
+// writer), shared otherwise. The uniqueness decision is re-checked under the lock
+// so a concurrent CREATE UNIQUE INDEX cannot slip in between the unlocked probe
+// and the lock acquisition; the returned unlock closes the gate.
+func (m *TableManager) lockForWrite(table string) (unlock func(), unique bool, err error) {
+	tl := m.tableLock(table)
+	for {
+		uniq, err := m.hasUniqueIndex(table)
+		if err != nil {
+			return nil, false, err
+		}
+		if uniq {
+			tl.Lock()
+			// Re-check under the exclusive gate (authoritative): CreateUniqueIndex
+			// also takes the exclusive gate, so it cannot run while we hold it.
+			uniq, err = m.hasUniqueIndex(table)
+			if err != nil {
+				tl.Unlock()
+				return nil, false, err
+			}
+			if uniq {
+				return tl.Unlock, true, nil
+			}
+			tl.Unlock()
+			continue
+		}
+		tl.RLock()
+		// A unique index could have appeared before we acquired the shared gate;
+		// re-check and escalate if so.
+		uniq, err = m.hasUniqueIndex(table)
+		if err != nil {
+			tl.RUnlock()
+			return nil, false, err
+		}
+		if uniq {
+			tl.RUnlock()
+			continue
+		}
+		return tl.RUnlock, false, nil
+	}
+}
+
+func indexColumnNames(idx *Index) []string {
+	names := make([]string, len(idx.Columns))
+	for i, c := range idx.Columns {
+		names[i] = c.Name
+	}
+	return names
+}
+
+// ValidateUniqueIndex rejects a UNIQUE index definition if existing rows already
+// contain duplicate non-NULL values for the indexed columns.
+func (m *TableManager) ValidateUniqueIndex(index *Index) error {
+	columns := indexColumnNames(index)
+	seen := make(map[string]bool)
+	return m.scanRows(index.Table, func(row Row) (bool, error) {
+		encoded, isNull := encodeUniqueValue(row, columns)
+		if isNull {
+			return false, nil
+		}
+		if seen[encoded] {
+			return true, fmt.Errorf("UNIQUE constraint failed: %s", index.Name)
+		}
+		seen[encoded] = true
+		return false, nil
+	})
+}
+
+// CreateUniqueIndex validates existing rows and registers the index while
+// holding the table's exclusive gate, so a concurrent writer cannot insert a
+// conflicting value between validation and registration.
+func (m *TableManager) CreateUniqueIndex(index *Index) error {
+	tl := m.tableLock(index.Table)
+	tl.Lock()
+	defer tl.Unlock()
+	if err := m.ValidateUniqueIndex(index); err != nil {
+		return err
+	}
+	return m.schema.CreateIndex(index)
 }
 
 type indexedRowVersion struct {

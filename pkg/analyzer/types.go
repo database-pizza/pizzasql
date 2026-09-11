@@ -62,6 +62,11 @@ func TypeFromName(name string) Type {
 		return TypeText
 	}
 
+	// UUID is stored as text (SQLite-style), not as a native PostgreSQL UUID.
+	if upper == "UUID" {
+		return TypeText
+	}
+
 	// Rule 3: If the type contains "BLOB" or is empty -> BLOB
 	if strings.Contains(upper, "BLOB") || upper == "" {
 		return TypeBlob
@@ -171,23 +176,23 @@ func CommonType(a, b Type) Type {
 
 // FunctionSignature describes a SQL function.
 type FunctionSignature struct {
-	Name         string
-	MinArgs      int
-	MaxArgs      int   // -1 for variadic
-	ArgTypes     []Type // Expected argument types (TypeAny for flexible)
-	ReturnType   Type
-	IsAggregate  bool
+	Name        string
+	MinArgs     int
+	MaxArgs     int    // -1 for variadic
+	ArgTypes    []Type // Expected argument types (TypeAny for flexible)
+	ReturnType  Type
+	IsAggregate bool
 }
 
 // builtinFunctions contains all built-in SQL functions.
 var builtinFunctions = map[string]FunctionSignature{
 	// Aggregate functions
-	"COUNT": {Name: "COUNT", MinArgs: 0, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeInteger, IsAggregate: true},
-	"SUM":   {Name: "SUM", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeNumeric}, ReturnType: TypeNumeric, IsAggregate: true},
-	"AVG":   {Name: "AVG", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeNumeric}, ReturnType: TypeReal, IsAggregate: true},
-	"MIN":   {Name: "MIN", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: true},
-	"MAX":   {Name: "MAX", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: true},
-	"TOTAL": {Name: "TOTAL", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeNumeric}, ReturnType: TypeReal, IsAggregate: true},
+	"COUNT":        {Name: "COUNT", MinArgs: 0, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeInteger, IsAggregate: true},
+	"SUM":          {Name: "SUM", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeNumeric}, ReturnType: TypeNumeric, IsAggregate: true},
+	"AVG":          {Name: "AVG", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeNumeric}, ReturnType: TypeReal, IsAggregate: true},
+	"MIN":          {Name: "MIN", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: true},
+	"MAX":          {Name: "MAX", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: true},
+	"TOTAL":        {Name: "TOTAL", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeNumeric}, ReturnType: TypeReal, IsAggregate: true},
 	"GROUP_CONCAT": {Name: "GROUP_CONCAT", MinArgs: 1, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeText, IsAggregate: true},
 
 	// String functions
@@ -231,17 +236,17 @@ var builtinFunctions = map[string]FunctionSignature{
 	"TIMEDIFF":  {Name: "TIMEDIFF", MinArgs: 2, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeAny}, ReturnType: TypeText, IsAggregate: false},
 
 	// SQLite specific
-	"SQLITE_VERSION": {Name: "SQLITE_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
-	"PIZZASQL_VERSION": {Name: "PIZZASQL_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
+	"SQLITE_VERSION":    {Name: "SQLITE_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
+	"PIZZASQL_VERSION":  {Name: "PIZZASQL_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
 	"LAST_INSERT_ROWID": {Name: "LAST_INSERT_ROWID", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
-	"CHANGES": {Name: "CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
-	"TOTAL_CHANGES": {Name: "TOTAL_CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
+	"CHANGES":           {Name: "CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
+	"TOTAL_CHANGES":     {Name: "TOTAL_CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
 
 	// Other
-	"HEX":    {Name: "HEX", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeBlob}, ReturnType: TypeText, IsAggregate: false},
-	"UNHEX":  {Name: "UNHEX", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeText}, ReturnType: TypeBlob, IsAggregate: false},
+	"HEX":      {Name: "HEX", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeBlob}, ReturnType: TypeText, IsAggregate: false},
+	"UNHEX":    {Name: "UNHEX", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeText}, ReturnType: TypeBlob, IsAggregate: false},
 	"ZEROBLOB": {Name: "ZEROBLOB", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeInteger}, ReturnType: TypeBlob, IsAggregate: false},
-	"QUOTE":  {Name: "QUOTE", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"QUOTE":    {Name: "QUOTE", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
 }
 
 // LookupFunction returns the function signature for a function name.

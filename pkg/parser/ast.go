@@ -62,9 +62,10 @@ func (s *SelectStmt) stmtNode() {}
 
 // SelectColumn represents a column in SELECT.
 type SelectColumn struct {
-	Expr  Expr
-	Alias string
-	Star  bool // true if this is *
+	Expr      Expr
+	Alias     string
+	Star      bool   // true if this is *
+	TableStar string // table name/alias if this is a qualified wildcard (table.*)
 }
 
 // TableRef represents a table reference.

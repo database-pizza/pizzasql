@@ -160,48 +160,14 @@ func (s *Session) Commit() error {
 		return fmt.Errorf("current transaction is aborted")
 	}
 
-	// Collect affected tables and lock them in sorted order. Tables read through
-	// scans or predicates need an exclusive validation gate. Tables that are
-	// only written use the shared publication gate, allowing disjoint optimistic
-	// commits to proceed concurrently while still excluding scanner commits.
-	affected := make(map[string]bool)
-	for t := range s.overlay {
-		affected[t] = false
+	// Acquire the per-table gates, escalating any table whose UNIQUE index
+	// appeared after the initial unlocked probe. See acquireCommitLocks.
+	_, _, unlockAll, uniqueTables, err := s.acquireCommitLocks()
+	if err != nil {
+		s.resetLocked()
+		return err
 	}
-	for t := range s.scanGens {
-		affected[t] = true
-	}
-	for _, predicate := range s.predicateGens {
-		affected[predicate.table] = true
-	}
-	tables := make([]string, 0, len(affected))
-	for t := range affected {
-		tables = append(tables, t)
-	}
-	sort.Strings(tables)
-
-	locks := make([]*sync.RWMutex, len(tables))
-	exclusive := make([]bool, len(tables))
-	for i, t := range tables {
-		locks[i] = s.table.tableLock(t)
-		exclusive[i] = affected[t]
-	}
-	for i, lock := range locks {
-		if exclusive[i] {
-			lock.Lock()
-		} else {
-			lock.RLock()
-		}
-	}
-	defer func() {
-		for i := len(locks) - 1; i >= 0; i-- {
-			if exclusive[i] {
-				locks[i].Unlock()
-			} else {
-				locks[i].RUnlock()
-			}
-		}
-	}()
+	defer unlockAll()
 
 	// Validate scan generations for phantom detection.
 	for t, gen := range s.scanGens {
@@ -214,6 +180,30 @@ func (s *Session) Commit() error {
 		if s.table.predicateGeneration(key) != predicate.gen {
 			s.resetLocked()
 			return ErrSerialization
+		}
+	}
+
+	// Validate the final overlay of every unique-indexed written table against
+	// durable rows. This runs under the exclusive gate acquired above, so it
+	// cannot race a concurrent writer. Duplicate unique values fail the commit
+	// with a "UNIQUE constraint failed" error rather than ErrSerialization.
+	for t := range uniqueTables {
+		entries := s.overlay[t]
+		pending := make([]Row, 0, len(entries))
+		// Exclude every overlay data key: rows being written, updated, or deleted
+		// are all replaced by this transaction, so their durable unique values
+		// must not self-conflict with the staged state (e.g. delete a row and
+		// re-insert the same primary key with a different rowid).
+		excluded := make(map[string]bool, len(entries))
+		for key, e := range entries {
+			excluded[key] = true
+			if !e.absent {
+				pending = append(pending, e.row)
+			}
+		}
+		if err := s.table.validateUniqueRows(t, pending, excluded); err != nil {
+			s.resetLocked()
+			return err
 		}
 	}
 
@@ -233,6 +223,7 @@ func (s *Session) Commit() error {
 			} else {
 				data, err := encodeRow(e.row)
 				if err != nil {
+					s.resetLocked()
 					return err
 				}
 				ops = append(ops, BatchOp{Op: batchPut, Key: []byte(key), Value: data})
@@ -248,12 +239,13 @@ func (s *Session) Commit() error {
 	}
 
 	var committed bool
-	err := s.table.pool.WithClient(func(c *KVClient) error {
+	err = s.table.pool.WithClient(func(c *KVClient) error {
 		_, ok, err := c.CompareBatchWrite(checks, ops, nil)
 		committed = ok
 		return err
 	})
 	if err != nil {
+		s.resetLocked()
 		return err
 	}
 	if !committed {
@@ -270,6 +262,106 @@ func (s *Session) Commit() error {
 
 	s.resetLocked()
 	return nil
+}
+
+// acquireCommitLocks acquires the per-table gates needed to commit the staged
+// transaction, returning the held locks, whether each is exclusive, an unlock
+// function, and the set of written tables that carry a UNIQUE index. A written
+// table with a UNIQUE index is locked exclusively so its final overlay can be
+// validated against durable rows. The uniqueness probe is re-checked under the
+// held gates so a concurrent CREATE UNIQUE INDEX cannot slip in after the probe
+// and leave a duplicate unvalidated.
+func (s *Session) acquireCommitLocks() (locks []*sync.RWMutex, exclusive []bool, unlockAll func(), uniqueTables map[string]bool, err error) {
+	unlock := func(ls []*sync.RWMutex, ex []bool) {
+		for i := len(ls) - 1; i >= 0; i-- {
+			if ex[i] {
+				ls[i].Unlock()
+			} else {
+				ls[i].RUnlock()
+			}
+		}
+	}
+	for {
+		// Tables read through scans or predicates need an exclusive validation
+		// gate. Tables that are only written use the shared publication gate,
+		// allowing disjoint optimistic commits to proceed concurrently while
+		// still excluding scanner commits.
+		affected := make(map[string]bool)
+		for t := range s.overlay {
+			affected[t] = false
+		}
+		for t := range s.scanGens {
+			affected[t] = true
+		}
+		for _, predicate := range s.predicateGens {
+			affected[predicate.table] = true
+		}
+
+		// Tables written in this transaction that carry a UNIQUE index need the
+		// exclusive gate so their final overlay can be validated against durable
+		// rows without racing another writer.
+		uniqueTables = make(map[string]bool)
+		for t := range s.overlay {
+			uniq, err := s.table.hasUniqueIndex(t)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			if uniq {
+				uniqueTables[t] = true
+				affected[t] = true
+			}
+		}
+
+		tables := make([]string, 0, len(affected))
+		for t := range affected {
+			tables = append(tables, t)
+		}
+		sort.Strings(tables)
+
+		locks = make([]*sync.RWMutex, len(tables))
+		exclusive = make([]bool, len(tables))
+		for i, t := range tables {
+			locks[i] = s.table.tableLock(t)
+			exclusive[i] = affected[t]
+		}
+		for i, lock := range locks {
+			if exclusive[i] {
+				lock.Lock()
+			} else {
+				lock.RLock()
+			}
+		}
+
+		// Re-check under the held gates. A concurrent CREATE UNIQUE INDEX can
+		// only have completed before we acquired the gate (it needs the exclusive
+		// gate), so this probe is authoritative; escalate and retry if a written
+		// table gained a unique index.
+		retry := false
+		for i, t := range tables {
+			if exclusive[i] {
+				continue
+			}
+			if _, written := s.overlay[t]; !written {
+				continue
+			}
+			uniq, err := s.table.hasUniqueIndex(t)
+			if err != nil {
+				unlock(locks, exclusive)
+				return nil, nil, nil, nil, err
+			}
+			if uniq {
+				retry = true
+				break
+			}
+		}
+		if retry {
+			unlock(locks, exclusive)
+			continue
+		}
+
+		unlockAll = func() { unlock(locks, exclusive) }
+		return locks, exclusive, unlockAll, uniqueTables, nil
+	}
 }
 
 func (s *Session) resetLocked() {
@@ -294,13 +386,15 @@ func (s *Session) stagePut(table, key string, row Row) {
 	}
 }
 
-func (s *Session) stageDelete(table, key string) {
+func (s *Session) stageDelete(table, key string, row Row) {
 	tl := strings.ToLower(table)
 	if s.overlay[tl] == nil {
 		s.overlay[tl] = make(map[string]*overlayEntry)
 	}
 	s.log = append(s.log, txMutation{table: tl, key: key, prev: s.overlay[tl][key]})
-	s.overlay[tl][key] = &overlayEntry{absent: true}
+	// Keep the deleted row so COMMIT can exempt its rowid from the unique-index
+	// scan and release its unique value.
+	s.overlay[tl][key] = &overlayEntry{row: cloneRow(row), absent: true}
 	if _, ok := s.reads[key]; !ok {
 		s.reads[key] = 0
 	}
@@ -447,91 +541,80 @@ func (s *Session) CountFast(table string) (int, error) {
 // Insert stages an insert in a transaction, or performs a durable autocommit
 // insert otherwise.
 func (s *Session) Insert(table string, row Row) error {
+	_, err := s.InsertWithRowID(table, row)
+	return err
+}
+
+// InsertWithRowID stages an insert in a transaction, or performs a durable
+// autocommit insert otherwise, returning the actual generated ROWID.
+func (s *Session) InsertWithRowID(table string, row Row) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.inTx {
-		return s.table.Insert(table, row)
+		return s.table.InsertWithRowID(table, row)
 	}
-
-	nr, key, err := s.table.prepareInsert(table, row)
-	if err != nil {
-		return err
-	}
-	schema, err := s.schema.GetSchema(table)
-	if err != nil {
-		return err
-	}
-	pk := fmt.Sprintf("%v", nr[schema.PrimaryKey])
-	tl := strings.ToLower(table)
-
-	if e, ok := s.overlay[tl][key]; ok {
-		if !e.absent {
-			return fmt.Errorf("duplicate primary key: %s", pk)
-		}
-	} else {
-		_, lsn, err := s.table.getByPKWithLSN(table, pk)
-		if err == nil {
-			s.reads[key] = lsn
-			return fmt.Errorf("duplicate primary key: %s", pk)
-		}
-		if err != ErrKeyNotFound {
-			return err
-		}
-		s.reads[key] = 0
-	}
-
-	s.stagePut(table, key, nr)
-	return nil
+	return s.insertLocked(table, row)
 }
 
 // InsertBulk stages or durably bulk-inserts multiple rows.
 func (s *Session) InsertBulk(table string, rows []Row) (int, error) {
+	count, _, err := s.InsertBulkWithLastRowID(table, rows)
+	return count, err
+}
+
+// InsertBulkWithLastRowID is InsertBulk, additionally returning the ROWID of the
+// last staged/persisted row (0 when nothing was inserted).
+func (s *Session) InsertBulkWithLastRowID(table string, rows []Row) (int, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.inTx {
-		return s.table.InsertBulk(table, rows)
+		return s.table.InsertBulkWithLastRowID(table, rows)
 	}
+	var lastRowID int64
 	count := 0
 	for _, row := range rows {
-		if err := s.insertLocked(table, row); err != nil {
-			return count, err
+		rid, err := s.insertLocked(table, row)
+		if err != nil {
+			return count, lastRowID, err
 		}
+		lastRowID = rid
 		count++
 	}
-	return count, nil
+	return count, lastRowID, nil
 }
 
 // insertLocked is the transaction insert helper (caller holds s.mu).
-func (s *Session) insertLocked(table string, row Row) error {
+func (s *Session) insertLocked(table string, row Row) (int64, error) {
 	nr, key, err := s.table.prepareInsert(table, row)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	rowid, _ := rowIDFromRow(nr)
 	schema, err := s.schema.GetSchema(table)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	pk := fmt.Sprintf("%v", nr[schema.PrimaryKey])
 	tl := strings.ToLower(table)
 
 	if e, ok := s.overlay[tl][key]; ok {
 		if !e.absent {
-			return fmt.Errorf("duplicate primary key: %s", pk)
+			return 0, fmt.Errorf("duplicate primary key: %s", pk)
 		}
 	} else {
 		_, lsn, err := s.table.getByPKWithLSN(table, pk)
 		if err == nil {
 			s.reads[key] = lsn
-			return fmt.Errorf("duplicate primary key: %s", pk)
+			return 0, fmt.Errorf("duplicate primary key: %s", pk)
 		}
 		if err != ErrKeyNotFound {
-			return err
+			return 0, err
 		}
 		s.reads[key] = 0
 	}
 
 	s.stagePut(table, key, nr)
-	return nil
+	return rowid, nil
 }
 
 // UpdateByPK stages or durably applies a single-row update.
@@ -558,7 +641,7 @@ func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) 
 	}
 
 	oldRow := cloneRow(row)
-	updates, err := updateFn(row)
+	updates, err := s.runUpdateFn(updateFn, row)
 	if err != nil {
 		return nil, false, err
 	}
@@ -573,6 +656,17 @@ func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) 
 
 	s.stagePut(table, key, row)
 	return oldRow, true, nil
+}
+
+// runUpdateFn releases the session lock while invoking the update callback so the
+// callback can run nested reads (e.g. a scalar subquery in SET) through the same
+// session without deadlocking on s.mu. A connection executes one statement at a
+// time, so the staged overlay cannot change while the callback runs. The lock is
+// re-acquired before returning.
+func (s *Session) runUpdateFn(updateFn func(Row) (Row, error), row Row) (Row, error) {
+	s.mu.Unlock()
+	defer s.mu.Lock()
+	return updateFn(row)
 }
 
 // DeleteByPK stages or durably applies a single-row delete.
@@ -591,7 +685,7 @@ func (s *Session) DeleteByPK(table, pk string) (Row, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	s.stageDelete(table, key)
+	s.stageDelete(table, key, row)
 	return row, true, nil
 }
 
@@ -636,7 +730,7 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 	}
 	count := 0
 	for _, row := range rows {
-		updates, err := updateFn(row)
+		updates, err := s.runUpdateFn(updateFn, row)
 		if err != nil {
 			return count, err
 		}
@@ -675,7 +769,7 @@ func (s *Session) Delete(table string, filter func(Row) bool) (int, error) {
 	count := 0
 	for _, row := range rows {
 		key := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
-		s.stageDelete(table, key)
+		s.stageDelete(table, key, row)
 		count++
 	}
 	return count, nil

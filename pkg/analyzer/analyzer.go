@@ -145,6 +145,14 @@ func (a *Analyzer) analyzeSelect(stmt *parser.SelectStmt) error {
 			// SELECT * - all columns from all tables
 			continue
 		}
+		if col.TableStar != "" {
+			// Qualified wildcard (table.*) - validate the qualifier names a
+			// table or alias in scope; expansion happens at execution time.
+			if err := a.validateTableStar(col.TableStar); err != nil {
+				return err
+			}
+			continue
+		}
 
 		info, err := a.analyzeExpr(col.Expr)
 		if err != nil {
@@ -174,6 +182,12 @@ func (a *Analyzer) analyzeSelect(stmt *parser.SelectStmt) error {
 				return &AnalysisError{
 					Type:    ErrNonAggregateInSelect,
 					Message: "SELECT * not allowed with aggregate functions without GROUP BY",
+				}
+			}
+			if col.TableStar != "" {
+				return &AnalysisError{
+					Type:    ErrNonAggregateInSelect,
+					Message: fmt.Sprintf("SELECT %s.* not allowed with aggregate functions without GROUP BY", col.TableStar),
 				}
 			}
 			info, exprErr := a.analyzeExpr(col.Expr)
@@ -307,6 +321,19 @@ func (a *Analyzer) resolveFromClause(tables []parser.TableRef) error {
 			if err := a.resolveJoin(ref.Join); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// validateTableStar checks that a qualified wildcard qualifier names a table or
+// alias present in scope, returning an error for unknown qualifiers instead of
+// silently falling back to a plain column expansion.
+func (a *Analyzer) validateTableStar(qualifier string) error {
+	if _, ok := a.scope.LookupTable(qualifier); !ok {
+		return &AnalysisError{
+			Type:    ErrTableNotFound,
+			Message: fmt.Sprintf("no such table or alias: %s", qualifier),
 		}
 	}
 	return nil
@@ -669,6 +696,20 @@ func (a *Analyzer) analyzeColumnRef(e *parser.ColumnRef) (*ExprInfo, error) {
 		if len(a.scope.GetTables()) == 0 {
 			return &ExprInfo{Type: TypeUnknown}, nil
 		}
+		// Hidden rowid alias (rowid/oid/_rowid_) when the table has no real column
+		// of that name. LookupColumn already resolved a real column, so this only
+		// fires for the alias (SQLite gives explicit columns precedence).
+		if isRowIDAlias(e.Column) {
+			if e.Table != "" {
+				if _, found := a.scope.LookupTable(e.Table); !found {
+					return nil, &AnalysisError{
+						Type:    ErrColumnNotFound,
+						Message: fmt.Sprintf("column not found: %s", formatColumnRef(e)),
+					}
+				}
+			}
+			return &ExprInfo{Type: TypeInteger}, nil
+		}
 		return nil, &AnalysisError{
 			Type:    ErrColumnNotFound,
 			Message: fmt.Sprintf("column not found: %s", formatColumnRef(e)),
@@ -679,6 +720,16 @@ func (a *Analyzer) analyzeColumnRef(e *parser.ColumnRef) (*ExprInfo, error) {
 		Type:     col.Type,
 		Nullable: col.Nullable,
 	}, nil
+}
+
+// isRowIDAlias reports whether a column name is a hidden rowid alias (rowid, oid,
+// or _rowid_), matching the storage layer's IsRowIDColumn.
+func isRowIDAlias(name string) bool {
+	switch strings.ToLower(name) {
+	case "rowid", "oid", "_rowid_":
+		return true
+	}
+	return false
 }
 
 func formatColumnRef(e *parser.ColumnRef) string {

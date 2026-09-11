@@ -313,25 +313,25 @@ var pizzasqlReservedKeywords = map[string]bool{
 }
 
 var (
-	reAutoincrement  = regexp.MustCompile(`(?i)\bAUTOINCREMENT\b`)
-	reWithoutRowid   = regexp.MustCompile(`(?i)\bWITHOUT\s+ROWID\b`)
-	reStrict         = regexp.MustCompile(`(?i),?\s*\bSTRICT\b`)
+	reAutoincrement = regexp.MustCompile(`(?i)\bAUTOINCREMENT\b`)
+	reWithoutRowid  = regexp.MustCompile(`(?i)\bWITHOUT\s+ROWID\b`)
+	reStrict        = regexp.MustCompile(`(?i),?\s*\bSTRICT\b`)
 	// REFERENCES x(y) ON DELETE/UPDATE action — strip whole inline FK clause.
 	// Use \w+ (not \S+) so the trailing comma of the column is preserved.
-	reInlineRefs     = regexp.MustCompile(`(?i)\bREFERENCES\s+\w+\s*(?:\([^)]*\))?\s*(?:(?:ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))\s*)*`)
+	reInlineRefs = regexp.MustCompile(`(?i)\bREFERENCES\s+\w+\s*(?:\([^)]*\))?\s*(?:(?:ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))\s*)*`)
 	// Table-level FOREIGN KEY constraint lines
-	reTableFK        = regexp.MustCompile(`(?i),?\s*FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+\w+\s*(?:\([^)]*\))?\s*(?:(?:ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))\s*)*`)
+	reTableFK = regexp.MustCompile(`(?i),?\s*FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+\w+\s*(?:\([^)]*\))?\s*(?:(?:ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))\s*)*`)
 	// Table-level CHECK constraints
-	reTableCheck     = regexp.MustCompile(`(?i),?\s*CHECK\s*\([^)]*\)`)
-	reOnConflict     = regexp.MustCompile(`(?i)\bON\s+CONFLICT\s+\w+`)
+	reTableCheck = regexp.MustCompile(`(?i),?\s*CHECK\s*\([^)]*\)`)
+	reOnConflict = regexp.MustCompile(`(?i)\bON\s+CONFLICT\s+\w+`)
 	// Complex DEFAULT expressions: DEFAULT (...) — strip entirely, keep no default
 	reComplexDefault = regexp.MustCompile(`(?i)\bDEFAULT\s*\([^)]*\)`)
 	// Trailing comma before closing paren
-	reTableTrailing  = regexp.MustCompile(`(?m),\s*\)`)
+	reTableTrailing = regexp.MustCompile(`(?m),\s*\)`)
 	// DESC/ASC in index column lists
-	reIndexColOrder  = regexp.MustCompile(`(?i)\b(ASC|DESC)\b`)
+	reIndexColOrder = regexp.MustCompile(`(?i)\b(ASC|DESC)\b`)
 	// Column name (first word) followed by a type keyword on each column line
-	reColumnName     = regexp.MustCompile(`(?m)^\s{1,}(\w+)(\s+)`)
+	reColumnName = regexp.MustCompile(`(?m)^\s{1,}(\w+)(\s+)`)
 )
 
 // sanitizeDDL strips SQLite-specific clauses that PizzaSQL doesn't support.

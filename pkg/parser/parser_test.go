@@ -69,6 +69,58 @@ func TestParseSelectColumns(t *testing.T) {
 	}
 }
 
+func TestParseSelectQualifiedWildcard(t *testing.T) {
+	stmt := parse(t, "SELECT DISTINCT repo.* FROM repository AS repo LEFT JOIN access ON access.repo_id = repo.id")
+	sel := stmt.(*SelectStmt)
+
+	if !sel.Distinct {
+		t.Error("expected DISTINCT")
+	}
+	if len(sel.Columns) != 1 {
+		t.Fatalf("expected 1 column, got %d", len(sel.Columns))
+	}
+	col := sel.Columns[0]
+	if col.TableStar != "repo" {
+		t.Errorf("expected TableStar=repo, got %q", col.TableStar)
+	}
+	if col.Star || col.Expr != nil || col.Alias != "" {
+		t.Errorf("qualified wildcard should not set Star/Expr/Alias: %+v", col)
+	}
+}
+
+func TestParseSelectQualifiedWildcardMixed(t *testing.T) {
+	stmt := parse(t, "SELECT repo.*, access.mode FROM repository AS repo LEFT JOIN access ON access.repo_id = repo.id")
+	sel := stmt.(*SelectStmt)
+
+	if len(sel.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(sel.Columns))
+	}
+	if sel.Columns[0].TableStar != "repo" {
+		t.Errorf("column 0 TableStar = %q, want repo", sel.Columns[0].TableStar)
+	}
+	ref, ok := sel.Columns[1].Expr.(*ColumnRef)
+	if !ok || ref.Table != "access" || ref.Column != "mode" {
+		t.Errorf("column 1 = %+v, want access.mode ColumnRef", sel.Columns[1].Expr)
+	}
+}
+
+func TestParseSelectCountStarStillWorks(t *testing.T) {
+	stmt := parse(t, "SELECT COUNT(*) FROM users")
+	sel := stmt.(*SelectStmt)
+
+	if len(sel.Columns) != 1 {
+		t.Fatalf("expected 1 column, got %d", len(sel.Columns))
+	}
+	col := sel.Columns[0]
+	if col.TableStar != "" || col.Star {
+		t.Errorf("COUNT(*) should not be a wildcard: %+v", col)
+	}
+	fn, ok := col.Expr.(*FunctionCall)
+	if !ok || !fn.Star || fn.Name != "COUNT" {
+		t.Errorf("expected COUNT(*) FunctionCall, got %+v", col.Expr)
+	}
+}
+
 func TestParseSelectWithAlias(t *testing.T) {
 	stmt := parse(t, "SELECT id AS user_id, name AS full_name FROM users u")
 	sel := stmt.(*SelectStmt)
@@ -414,6 +466,45 @@ func TestParseCreateTableWithConstraints(t *testing.T) {
 	}
 }
 
+func TestParseCreateTableExplicitNullable(t *testing.T) {
+	stmt := parse(t, `CREATE TABLE users (
+		id INTEGER,
+		full_name TEXT NULL,
+		nickname TEXT NOT NULL,
+		created_at TIMESTAMP NULL NOT NULL
+	)`)
+
+	create, ok := stmt.(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected CreateTableStmt, got %T", stmt)
+	}
+
+	if len(create.Columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(create.Columns))
+	}
+
+	// full_name TEXT NULL: explicit NULL is a no-op, so no constraint is added.
+	fullName := create.Columns[1]
+	if fullName.Name != "full_name" || fullName.Type.Name != "TEXT" {
+		t.Fatalf("unexpected full_name column: %+v", fullName)
+	}
+	if len(fullName.Constraints) != 0 {
+		t.Errorf("explicit NULL should not produce a constraint, got %d", len(fullName.Constraints))
+	}
+
+	// nickname TEXT NOT NULL still records NOT NULL.
+	nickname := create.Columns[2]
+	if len(nickname.Constraints) != 1 || nickname.Constraints[0].Type != ConstraintNotNull {
+		t.Errorf("expected NOT NULL on nickname, got %+v", nickname.Constraints)
+	}
+
+	// created_at TIMESTAMP NULL NOT NULL: NOT NULL wins regardless of ordering.
+	created := create.Columns[3]
+	if len(created.Constraints) != 1 || created.Constraints[0].Type != ConstraintNotNull {
+		t.Errorf("expected NOT NULL on created_at, got %+v", created.Constraints)
+	}
+}
+
 // DROP TABLE tests
 
 func TestParseDropTable(t *testing.T) {
@@ -425,6 +516,93 @@ func TestParseDropTable(t *testing.T) {
 
 	if len(drop.Tables) != 1 || drop.Tables[0].Name != "users" {
 		t.Error("expected DROP TABLE users")
+	}
+}
+
+func TestParseCreateTableDefaultSignedNumeric(t *testing.T) {
+	stmt := parse(t, `CREATE TABLE repo (
+		id INTEGER PRIMARY KEY,
+		max_repo_creation INTEGER DEFAULT -1 NOT NULL,
+		delta INTEGER DEFAULT +5,
+		tally INTEGER DEFAULT (-7)
+	)`)
+
+	create, ok := stmt.(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected CreateTableStmt, got %T", stmt)
+	}
+	if len(create.Columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(create.Columns))
+	}
+
+	// xorm real shape: DEFAULT -1 followed by NOT NULL.
+	col := create.Columns[1]
+	if len(col.Constraints) != 2 {
+		t.Fatalf("expected DEFAULT + NOT NULL, got %d constraints", len(col.Constraints))
+	}
+	var defaultExpr Expr
+	var notNull bool
+	for _, c := range col.Constraints {
+		switch c.Type {
+		case ConstraintDefault:
+			defaultExpr = c.Default
+		case ConstraintNotNull:
+			notNull = true
+		}
+	}
+	if !notNull {
+		t.Error("expected NOT NULL constraint on max_repo_creation")
+	}
+	unary, ok := defaultExpr.(*UnaryExpr)
+	if !ok || unary.Op != lexer.TokenMinus {
+		t.Fatalf("expected unary minus default, got %T %+v", defaultExpr, defaultExpr)
+	}
+	lit, ok := unary.Operand.(*LiteralExpr)
+	if !ok || lit.Value != "1" {
+		t.Fatalf("expected -1 literal, got %+v", unary.Operand)
+	}
+
+	// Positive signed default: DEFAULT +5.
+	plus, ok := create.Columns[2].Constraints[0].Default.(*UnaryExpr)
+	if !ok || plus.Op != lexer.TokenPlus {
+		t.Fatalf("expected unary plus default, got %+v", create.Columns[2].Constraints[0].Default)
+	}
+
+	// Parenthesized signed default: DEFAULT (-7).
+	paren, ok := create.Columns[3].Constraints[0].Default.(*ParenExpr)
+	if !ok {
+		t.Fatalf("expected parenthesized default, got %T", create.Columns[3].Constraints[0].Default)
+	}
+	inner, ok := paren.Expr.(*UnaryExpr)
+	if !ok || inner.Op != lexer.TokenMinus {
+		t.Fatalf("expected unary minus inside parens, got %T %+v", paren.Expr, paren.Expr)
+	}
+}
+
+func TestParseCreateTableUUIDType(t *testing.T) {
+	stmt := parse(t, `CREATE TABLE upload (
+		id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+		uuid UUID NULL,
+		name TEXT NULL
+	)`)
+
+	create, ok := stmt.(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected CreateTableStmt, got %T", stmt)
+	}
+	if len(create.Columns) != 3 {
+		t.Fatalf("expected 3 columns, got %d", len(create.Columns))
+	}
+
+	uuidCol := create.Columns[1]
+	if uuidCol.Name != "uuid" {
+		t.Errorf("column name = %q, want %q", uuidCol.Name, "uuid")
+	}
+	if uuidCol.Type.Name != "UUID" {
+		t.Errorf("column type = %q, want %q", uuidCol.Type.Name, "UUID")
+	}
+	if len(uuidCol.Constraints) != 0 {
+		t.Errorf("explicit NULL should produce no constraints, got %d", len(uuidCol.Constraints))
 	}
 }
 

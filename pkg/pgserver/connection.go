@@ -1103,7 +1103,11 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 	switch strings.ToUpper(typeName) {
 	case "INTEGER", "INT":
 		return 23 // INT4OID
-	case "TEXT", "VARCHAR", "CHAR":
+	case "BIGINT":
+		return 20 // INT8OID
+	case "TEXT", "VARCHAR", "CHAR", "UUID":
+		// UUID is stored as text (SQLite-style), so it reports TEXTOID rather
+		// than the native PG UUID OID.
 		return 25 // TEXTOID
 	case "REAL", "FLOAT":
 		return 700 // FLOAT4OID
@@ -1113,6 +1117,10 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 		return 16 // BOOLOID
 	case "BLOB":
 		return 17 // BYTEAOID
+	case "DATETIME", "TIMESTAMP":
+		// Datetime values are exchanged as UTC RFC3339 (ISO8601 with a timezone
+		// offset), which timestamptz decodes directly.
+		return 1184 // TIMESTAMPTZOID
 	default:
 		return 25 // Default to TEXT
 	}
@@ -1123,12 +1131,16 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 	switch strings.ToUpper(typeName) {
 	case "INTEGER", "INT":
 		return 4
+	case "BIGINT":
+		return 8
 	case "REAL", "FLOAT":
 		return 4
 	case "DOUBLE":
 		return 8
 	case "BOOLEAN", "BOOL":
 		return 1
+	case "DATETIME", "TIMESTAMP":
+		return 8
 	default:
 		return -1 // Variable length
 	}

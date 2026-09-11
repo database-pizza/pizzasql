@@ -411,20 +411,28 @@ func (p *Parser) parseSelectColumns() ([]SelectColumn, error) {
 			if err != nil {
 				return nil, err
 			}
-			col.Expr = expr
 
-			// Check for AS alias
-			if p.curTokenIs(lexer.TokenAS) {
-				p.nextToken()
-				if !p.curTokenIs(lexer.TokenIdent) {
-					return nil, p.curError("expected identifier after AS")
+			// Qualified wildcard (table.*): the expression grammar parses this as
+			// ColumnRef{Table: table, Column: "*"}. Lift it into a scoped wildcard
+			// projection instead of a column reference literally named "*".
+			if ref, ok := expr.(*ColumnRef); ok && ref.Table != "" && ref.Column == "*" {
+				col.TableStar = ref.Table
+			} else {
+				col.Expr = expr
+
+				// Check for AS alias
+				if p.curTokenIs(lexer.TokenAS) {
+					p.nextToken()
+					if !p.curTokenIs(lexer.TokenIdent) {
+						return nil, p.curError("expected identifier after AS")
+					}
+					col.Alias = p.curToken.Literal
+					p.nextToken()
+				} else if p.curTokenIs(lexer.TokenIdent) {
+					// Alias without AS
+					col.Alias = p.curToken.Literal
+					p.nextToken()
 				}
-				col.Alias = p.curToken.Literal
-				p.nextToken()
-			} else if p.curTokenIs(lexer.TokenIdent) {
-				// Alias without AS
-				col.Alias = p.curToken.Literal
-				p.nextToken()
 			}
 		}
 
@@ -1083,21 +1091,41 @@ func (p *Parser) parseColumnDef() (*ColumnDef, error) {
 		if !ok {
 			break
 		}
-		col.Constraints = append(col.Constraints, *constraint)
+		if constraint != nil {
+			col.Constraints = append(col.Constraints, *constraint)
+		}
 	}
 
 	return col, nil
 }
 
+// identTypeAliases maps non-reserved type names (lexed as plain identifiers)
+// to their canonical data type name. These are stored with SQLite text
+// affinity and never gain native PostgreSQL semantics.
+var identTypeAliases = map[string]string{
+	"UUID": "UUID",
+}
+
 func (p *Parser) parseDataType() (*DataType, error) {
 	dt := &DataType{}
 
-	if !p.isDataTypeKeyword() {
-		return nil, p.curError("expected data type")
+	if p.curTokenIs(lexer.TokenIdent) {
+		// A few well-known type names (e.g. UUID) are not reserved keywords and
+		// lex as identifiers. Recognize them as type aliases so they can be used
+		// in column definitions.
+		name, ok := identTypeAliases[strings.ToUpper(p.curToken.Literal)]
+		if !ok {
+			return nil, p.curError("expected data type")
+		}
+		dt.Name = name
+		p.nextToken()
+	} else {
+		if !p.isDataTypeKeyword() {
+			return nil, p.curError("expected data type")
+		}
+		dt.Name = strings.ToUpper(p.curToken.Literal)
+		p.nextToken()
 	}
-
-	dt.Name = strings.ToUpper(p.curToken.Literal)
-	p.nextToken()
 
 	// Check for precision/scale
 	if p.curTokenIs(lexer.TokenLParen) {
@@ -1166,7 +1194,11 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 
 	case lexer.TokenDEFAULT:
 		p.nextToken()
-		expr, err := p.parsePrimaryExpr()
+		// parseUnaryExpr accepts a signed numeric literal (-1, +5) and falls
+		// through to primary expressions, including parenthesized expressions.
+		// It stops before NOT/NULL, so a following NOT NULL constraint is left
+		// for the enclosing constraint loop.
+		expr, err := p.parseUnaryExpr()
 		if err != nil {
 			return nil, false, err
 		}
@@ -1197,6 +1229,14 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 	case lexer.TokenAUTOINCREMENT:
 		constraint.Type = ConstraintAutoIncrement
 		p.nextToken()
+
+	case lexer.TokenNULL:
+		// Explicit NULL is a no-op: columns are nullable by default, so an
+		// explicit NULL declaration carries no constraint. Consume it so
+		// "col TYPE NULL" parses without inventing a fake nullable constraint.
+		// NOT NULL is applied whenever it appears, regardless of ordering.
+		p.nextToken()
+		return nil, true, nil
 
 	default:
 		return nil, false, nil

@@ -84,6 +84,7 @@ func TestTypeFromName(t *testing.T) {
 		{"BOOLEAN", TypeBoolean},
 		{"NUMERIC", TypeNumeric},
 		{"DECIMAL", TypeNumeric},
+		{"UUID", TypeText},
 		{"", TypeBlob}, // Empty type -> BLOB (SQLite rule)
 	}
 
@@ -234,6 +235,53 @@ func TestAnalyzeSelectJoin(t *testing.T) {
 			err := analyzer.Analyze(stmt)
 			if err != nil {
 				t.Errorf("Analyze(%q) error: %v", tt.sql, err)
+			}
+		})
+	}
+}
+
+func TestAnalyzeSelectQualifiedWildcard(t *testing.T) {
+	catalog := setupCatalog()
+	analyzer := New(catalog)
+
+	valid := []struct {
+		name string
+		sql  string
+	}{
+		{"alias wildcard", "SELECT u.* FROM users u"},
+		{"table name wildcard", "SELECT users.* FROM users"},
+		{"join alias wildcard", "SELECT u.* FROM users u JOIN orders o ON u.id = o.user_id"},
+		{"mixed wildcard and column", "SELECT u.*, o.amount FROM users u JOIN orders o ON u.id = o.user_id"},
+	}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			err := analyzer.Analyze(parse(t, tt.sql))
+			if err != nil {
+				t.Errorf("Analyze(%q) error: %v", tt.sql, err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name    string
+		sql     string
+		errType ErrorType
+	}{
+		{"unknown qualifier", "SELECT nope.* FROM users u", ErrTableNotFound},
+		{"aggregate without group by", "SELECT u.*, COUNT(*) FROM users u", ErrNonAggregateInSelect},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			err := analyzer.Analyze(parse(t, tt.sql))
+			if err == nil {
+				t.Fatalf("Analyze(%q) expected error, got nil", tt.sql)
+			}
+			analysisErr, ok := err.(*AnalysisError)
+			if !ok {
+				t.Fatalf("expected AnalysisError, got %T", err)
+			}
+			if analysisErr.Type != tt.errType {
+				t.Errorf("expected error type %v, got %v (%s)", tt.errType, analysisErr.Type, analysisErr.Message)
 			}
 		})
 	}

@@ -283,11 +283,10 @@ func applyTimeDiffMod(t time.Time, mod string) (time.Time, bool) {
 	}
 
 	t = t.AddDate(sign*years, sign*months, sign*days)
-	dur := time.Duration(sign) * (
-		time.Duration(hours)*time.Hour +
-			time.Duration(minutes)*time.Minute +
-			time.Duration(secs)*time.Second +
-			time.Duration(millis)*time.Millisecond)
+	dur := time.Duration(sign) * (time.Duration(hours)*time.Hour +
+		time.Duration(minutes)*time.Minute +
+		time.Duration(secs)*time.Second +
+		time.Duration(millis)*time.Millisecond)
 	return t.Add(dur), true
 }
 

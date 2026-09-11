@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,11 @@ import (
 
 	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 )
+
+// ErrIndexNotFound is returned by GetIndex when an index is absent. It is
+// distinct from a storage/IO error so callers like ListTableIndexes can skip a
+// concurrently-dropped index without swallowing real read failures.
+var ErrIndexNotFound = errors.New("index not found")
 
 // Schema represents a table schema.
 type Schema struct {
@@ -775,7 +781,10 @@ func (m *SchemaManager) GetIndex(name string) (*Index, error) {
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("index not found: %s", name)
+		if err == ErrKeyNotFound {
+			return nil, fmt.Errorf("%w: %s", ErrIndexNotFound, name)
+		}
+		return nil, err
 	}
 
 	var index Index
@@ -813,7 +822,7 @@ func (m *SchemaManager) ListIndexes() ([]string, error) {
 
 	var indexes []string
 	if err := json.Unmarshal([]byte(data), &indexes); err != nil {
-		return []string{}, nil
+		return nil, fmt.Errorf("failed to parse index list: %w", err)
 	}
 
 	m.indexListCache = append([]string(nil), indexes...)
@@ -832,7 +841,12 @@ func (m *SchemaManager) ListTableIndexes(table string) ([]*Index, error) {
 	for _, name := range indexes {
 		idx, err := m.GetIndex(name)
 		if err != nil {
-			continue
+			// An index dropped concurrently is simply absent; any other error
+			// (storage/IO or corrupt data) must not be silently swallowed.
+			if errors.Is(err, ErrIndexNotFound) {
+				continue
+			}
+			return nil, err
 		}
 		if strings.EqualFold(idx.Table, table) {
 			result = append(result, idx)

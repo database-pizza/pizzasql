@@ -293,9 +293,9 @@ func TestLexerLineTracking(t *testing.T) {
 
 func TestLexerErrors(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		errMsg  string
+		name   string
+		input  string
+		errMsg string
 	}{
 		{
 			name:   "unterminated string",

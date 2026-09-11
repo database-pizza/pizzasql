@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -805,5 +806,67 @@ func TestListTableIndexesCachesMetadata(t *testing.T) {
 	getsAfterCached, _ := kv.readStats()
 	if getsAfterCached != getsAfterFirst {
 		t.Fatalf("cached index metadata issued %d extra reads", getsAfterCached-getsAfterFirst)
+	}
+}
+
+func TestGetIndexDistinguishesNotFound(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+	pool := newTestKVPool(kv, 4, 5*time.Second)
+	defer pool.Close()
+	schemas := NewSchemaManager(pool, "testdb")
+
+	_, err := schemas.GetIndex("missing")
+	if err == nil {
+		t.Fatal("expected an error for a missing index")
+	}
+	if !errors.Is(err, ErrIndexNotFound) {
+		t.Fatalf("expected ErrIndexNotFound, got %v", err)
+	}
+}
+
+func TestListIndexesPropagatesCorruptJSON(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+	pool := newTestKVPool(kv, 4, 5*time.Second)
+	defer pool.Close()
+	schemas := NewSchemaManager(pool, "testdb")
+
+	if err := pool.WithClient(func(c *KVClient) error {
+		return c.Write("testdb:indexes", "{not json")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := schemas.ListIndexes(); err == nil {
+		t.Fatal("expected an error for corrupt index list JSON")
+	}
+}
+
+func TestListTableIndexesSkipsOnlyNotFound(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+	pool := newTestKVPool(kv, 4, 5*time.Second)
+	defer pool.Close()
+	schemas := NewSchemaManager(pool, "testdb")
+
+	// Create a table and one index on it, then a dangling name in the list that
+	// no longer has a definition (a concurrent drop), which must be skipped, not
+	// surfaced.
+	if err := schemas.CreateTable(&Schema{Name: "t", Columns: []Column{{Name: "id", Type: "INTEGER", PrimaryKey: true}, {Name: "v", Type: "TEXT"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := schemas.CreateIndex(&Index{Name: "uq_v", Table: "t", Unique: true, Columns: []IndexColumn{{Name: "v"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := schemas.addToIndexList("ghost_idx"); err != nil {
+		t.Fatal(err)
+	}
+
+	indexes, err := schemas.ListTableIndexes("t")
+	if err != nil {
+		t.Fatalf("ListTableIndexes should skip the dangling index, got: %v", err)
+	}
+	if len(indexes) != 1 || indexes[0].Name != "uq_v" {
+		t.Fatalf("expected only uq_v, got %v", indexes)
 	}
 }
