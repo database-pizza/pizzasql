@@ -3,5 +3,6 @@
 testdata
 .db
 *.log
+dist/
 /pizzasql_*
 # runtime state lives in /tmp/pizzasql/runtime.json — no local files to ignore

@@ -1,4 +1,4 @@
-.PHONY: build test test-v test-cover bench clean fmt lint sqllogictest sqllogictest-basic sqllogictest-download build-sqllogictest install uninstall
+.PHONY: build build-freebsd-amd64 build-freebsd-arm64 test test-v test-cover bench clean fmt lint version sqllogictest sqllogictest-basic sqllogictest-download build-sqllogictest install uninstall
 
 PREFIX ?= /usr/local
 
@@ -24,6 +24,16 @@ uninstall:
 
 build-linux-amd64:
 	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o ./bin/pizzasql-linux-amd64 ./main.go
+
+build-freebsd-amd64:
+	GOOS=freebsd GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o ./bin/pizzasql-freebsd-amd64 ./main.go
+
+build-freebsd-arm64:
+	GOOS=freebsd GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o ./bin/pizzasql-freebsd-arm64 ./main.go
+
+# Print the version that a tag build would embed (git describe, commit-hash fallback).
+version:
+	@echo "$(GIT_VERSION)"
 
 # Run all tests
 test:

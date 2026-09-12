@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOPROXY: https://proxy.golang.org
+
+jobs:
+  verify:
+    name: Build, test, and verify FreeBSD ARM64 artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.x'
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run tests
+        run: make test
+
+      - name: Build native binary
+        run: make build
+
+      - name: Verify version output
+        run: ./bin/pizzasql -version
+
+      - name: Cross-compile release targets
+        run: |
+          make build-linux-amd64
+          make build-freebsd-amd64
+          make build-freebsd-arm64
+
+      - name: Stage artifacts and checksums
+        run: |
+          version="$(make -s version)"
+          mkdir -p dist
+          cp bin/pizzasql                 "dist/pizzasql-${version}-linux-amd64"
+          cp bin/pizzasql-freebsd-amd64   "dist/pizzasql-${version}-freebsd-amd64"
+          cp bin/pizzasql-freebsd-arm64   "dist/pizzasql-${version}-freebsd-arm64"
+          (cd dist && sha256sum ./* > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Upload verification artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pizzasql-${{ github.sha }}
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error

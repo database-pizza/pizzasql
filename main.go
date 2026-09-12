@@ -62,6 +62,7 @@ var (
 	ignoreErrors = flag.Bool("ignore-errors", false, "Continue import on errors")
 	exportFormat = flag.String("format", "", "Export/import format: sql, csv (auto-detect from extension)")
 	createTable  = flag.Bool("create-table", false, "Create table if not exists (CSV import)")
+	showVersion  = flag.Bool("version", false, "Print version and exit")
 )
 
 var kvManager *kvmanager.Manager
@@ -69,6 +70,11 @@ var startPprofServerHook func() *http.Server
 
 func main() {
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	// Warn if other pizzasql instances are running; prompt to continue.
 	if err := pizzaruntime.CheckExistingInstances(*forceYes); err != nil {
