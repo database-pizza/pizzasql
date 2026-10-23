@@ -6021,6 +6021,62 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		}
 		return max, nil
 
+	case "TOTAL":
+		var sum float64
+		for _, row := range rows {
+			if len(fn.Args) > 0 {
+				val, _ := e.evalExpr(fn.Args[0], row)
+				if val != nil {
+					sum += toFloat(val)
+				}
+			}
+		}
+		return sum, nil
+
+	case "GROUP_CONCAT":
+		if len(fn.Args) == 0 {
+			return nil, fmt.Errorf("GROUP_CONCAT requires at least one argument")
+		}
+		var seen map[string]struct{}
+		if fn.Distinct {
+			seen = make(map[string]struct{})
+		}
+		var builder strings.Builder
+		count := 0
+		for _, row := range rows {
+			val, err := e.evalExpr(fn.Args[0], row)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				continue
+			}
+			text := toString(val)
+			if fn.Distinct {
+				if _, exists := seen[text]; exists {
+					continue
+				}
+				seen[text] = struct{}{}
+			}
+			if count > 0 {
+				separator := ","
+				if len(fn.Args) > 1 {
+					sep, err := e.evalExpr(fn.Args[1], row)
+					if err != nil {
+						return nil, err
+					}
+					separator = toString(sep)
+				}
+				builder.WriteString(separator)
+			}
+			builder.WriteString(text)
+			count++
+		}
+		if count == 0 {
+			return nil, nil
+		}
+		return builder.String(), nil
+
 	case "JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
 		arr := make([]interface{}, 0, len(rows))
 		var seen map[string]struct{}
@@ -6048,9 +6104,26 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		return jsonText(s), nil
 
 	default:
+		if isAggregateCallName(name) {
+			return nil, fmt.Errorf("unsupported aggregate function: %s", name)
+		}
 		// Non-aggregate scalar function: evaluate args through aggregate context
 		// (so COUNT/MIN/etc. inside NULLIF/COALESCE work correctly).
 		return e.evalExprWithAggregates(expr, rows)
+	}
+}
+
+// isAggregateCallName lists the aggregate functions handled by
+// evalAggregateExpr. Keeping dispatch and evaluation on the same list prevents
+// an unhandled aggregate from recursing between the aggregate and expression
+// evaluators.
+func isAggregateCallName(name string) bool {
+	switch strings.ToUpper(name) {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
+		"JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -6071,22 +6144,19 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		return e.applyBinaryOp(combined.Op, left, right)
 	case *parser.FunctionCall:
 		name := strings.ToUpper(ex.Name)
-		switch name {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
-			"JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
+		if isAggregateCallName(name) {
 			return e.evalAggregateExpr(expr, rows)
-		default:
-			// Non-aggregate: evaluate each arg with aggregate context, then apply scalar.
-			args := make([]interface{}, len(ex.Args))
-			for i, arg := range ex.Args {
-				v, err := e.evalExprWithAggregates(arg, rows)
-				if err != nil {
-					return nil, err
-				}
-				args[i] = v
-			}
-			return e.evalBuiltinFunction(name, args)
 		}
+		// Non-aggregate: evaluate each arg with aggregate context, then apply scalar.
+		args := make([]interface{}, len(ex.Args))
+		for i, arg := range ex.Args {
+			v, err := e.evalExprWithAggregates(arg, rows)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = v
+		}
+		return e.evalBuiltinFunction(name, args)
 	case *parser.ParenExpr:
 		return e.evalExprWithAggregates(ex.Expr, rows)
 	case *parser.UnaryExpr:
@@ -6377,9 +6447,7 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 	}
 	if fn, ok := expr.(*parser.FunctionCall); ok {
 		name := strings.ToUpper(fn.Name)
-		switch name {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
-			"JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
+		if isAggregateCallName(name) {
 			return true
 		}
 		// Non-aggregate function: check if any arg contains an aggregate.
