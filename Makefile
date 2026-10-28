@@ -44,7 +44,7 @@ test:
 compat:
 	PIZZASQL_COMPAT=1 \
 	PIZZASQL_COMPAT_STRICT=$${PIZZASQL_COMPAT_STRICT:-0} \
-	PIZZASQL_COMPAT_REPORT=$${PIZZASQL_COMPAT_REPORT:-compat-report.json} \
+	PIZZASQL_COMPAT_REPORT=$${PIZZASQL_COMPAT_REPORT:-$(CURDIR)/compat-report.json} \
 	go test ./pkg/pgserver -run TestCompatibilitySuite -v
 
 # Run tests with verbose output
