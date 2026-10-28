@@ -36,6 +36,7 @@ type Document struct {
 	GeneratedAt   string `json:"generated_at,omitempty"`
 
 	Protocol      Protocol          `json:"protocol"`
+	Notifications Notifications     `json:"notifications"`
 	Constraints   Constraints       `json:"constraints"`
 	DDL           DDL               `json:"ddl"`
 	Transactions  Transactions      `json:"transactions"`
@@ -52,6 +53,17 @@ type Protocol struct {
 	SimpleQuery    bool   `json:"simple_query"`
 	ExtendedQuery  bool   `json:"extended_query"`
 	TLS            string `json:"tls"`
+}
+
+type Notifications struct {
+	Listen         Feature `json:"listen"`
+	Unlisten       Feature `json:"unlisten"`
+	Notify         Feature `json:"notify"`
+	PayloadLimit   int     `json:"payload_limit_bytes"`
+	ChannelLimit   int     `json:"channel_limit_bytes"`
+	Transactional  bool    `json:"transactional"`
+	DurableReplay  bool    `json:"durable_replay"`
+	CommitLSNParam string  `json:"commit_lsn_parameter"`
 }
 
 type Constraints struct {
@@ -131,6 +143,17 @@ func Current() *Document {
 			SimpleQuery:    true,
 			ExtendedQuery:  true,
 			TLS:            "terminated by the managed pgproxy, not the engine listener",
+		},
+
+		Notifications: Notifications{
+			Listen:         Feature{Supported: true, Status: "enforced"},
+			Unlisten:       Feature{Supported: true, Status: "enforced", Notes: "UNLISTEN * removes every subscription"},
+			Notify:         Feature{Supported: true, Status: "enforced", Notes: "duplicate (channel,payload) pairs collapse within one transaction"},
+			PayloadLimit:   8000,
+			ChannelLimit:   63,
+			Transactional:  true,
+			DurableReplay:  false,
+			CommitLSNParam: "pizzasql.lsn",
 		},
 
 		Constraints: Constraints{

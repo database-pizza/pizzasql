@@ -442,6 +442,34 @@ type ReleaseStmt struct {
 func (s *ReleaseStmt) node()     {}
 func (s *ReleaseStmt) stmtNode() {}
 
+// Notification statements
+
+// ListenStmt represents LISTEN channel.
+type ListenStmt struct {
+	Channel string
+}
+
+func (s *ListenStmt) node()     {}
+func (s *ListenStmt) stmtNode() {}
+
+// UnlistenStmt represents UNLISTEN channel or UNLISTEN *.
+type UnlistenStmt struct {
+	Channel string
+	All     bool
+}
+
+func (s *UnlistenStmt) node()     {}
+func (s *UnlistenStmt) stmtNode() {}
+
+// NotifyStmt represents NOTIFY channel [, payload].
+type NotifyStmt struct {
+	Channel string
+	Payload string
+}
+
+func (s *NotifyStmt) node()     {}
+func (s *NotifyStmt) stmtNode() {}
+
 // Expression types
 
 // BinaryExpr represents a binary expression.

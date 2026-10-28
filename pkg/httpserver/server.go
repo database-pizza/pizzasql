@@ -114,6 +114,7 @@ func NewWithDatabaseManager(config *Config, dbManager *storage.DatabaseManager) 
 	var defaultSchema *storage.SchemaManager
 	if defaultDB != nil {
 		defaultExec = executor.New(defaultDB.Schema, defaultDB.Table)
+		defaultExec.SetNotificationHub(defaultDB.Hub)
 		defaultExec.SyncCatalog()
 		defaultSchema = defaultDB.Schema
 	}
@@ -220,6 +221,7 @@ func (s *Server) getExecutorForDatabase(dbName string) (*executor.Executor, *sto
 	}
 
 	exec := executor.New(dbInstance.Schema, dbInstance.Table)
+	exec.SetNotificationHub(dbInstance.Hub)
 	exec.SyncCatalog()
 	return exec, dbInstance.Schema, nil
 }

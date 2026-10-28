@@ -153,6 +153,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			Rows:               sanitizeRows(result.Rows),
 			RowsAffected:       result.RowsAffected,
 			LastInsertID:       result.LastInsertID,
+			LSN:                result.LSN,
 			ExecutionTimeMicro: duration.Microseconds(),
 			RowsReturned:       len(result.Rows),
 		}
@@ -266,6 +267,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		results = append(results, ExecuteResult{
 			RowsAffected: result.RowsAffected,
 			LastInsertID: result.LastInsertID,
+			LSN:          result.LSN,
 		})
 	}
 

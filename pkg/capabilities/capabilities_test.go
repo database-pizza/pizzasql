@@ -33,4 +33,10 @@ func TestCurrentDocumentIsVersionedAndMarshalable(t *testing.T) {
 	if round.ErrorCodes["0A000"] != "feature_not_supported" {
 		t.Fatalf("0A000 mapping = %q", round.ErrorCodes["0A000"])
 	}
+	if !round.Notifications.Listen.Supported || !round.Notifications.Notify.Supported {
+		t.Fatal("LISTEN/NOTIFY should be advertised as supported")
+	}
+	if round.Notifications.PayloadLimit != 8000 || round.Notifications.DurableReplay {
+		t.Fatalf("unexpected notification limits: %+v", round.Notifications)
+	}
 }

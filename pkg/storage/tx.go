@@ -148,16 +148,25 @@ func (s *Session) Rollback() error {
 }
 
 // Commit validates and durably applies the staged transaction in one atomic
-// compare-and-swap batch write.
+// compare-and-swap batch write. It discards the commit LSN; callers that need a
+// ordering cursor use CommitWithLSN.
 func (s *Session) Commit() error {
+	_, err := s.CommitWithLSN()
+	return err
+}
+
+// CommitWithLSN behaves like Commit and additionally returns the LSN assigned
+// to the durable batch. A read-only or empty transaction returns zero because
+// no new durable state was published.
+func (s *Session) CommitWithLSN() (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.inTx {
-		return fmt.Errorf("cannot commit: no transaction in progress")
+		return 0, fmt.Errorf("cannot commit: no transaction in progress")
 	}
 	if s.aborted {
 		s.resetLocked()
-		return fmt.Errorf("current transaction is aborted")
+		return 0, fmt.Errorf("current transaction is aborted")
 	}
 
 	// Acquire the per-table gates, escalating any table whose UNIQUE index
@@ -165,7 +174,7 @@ func (s *Session) Commit() error {
 	_, _, unlockAll, uniqueTables, err := s.acquireCommitLocks()
 	if err != nil {
 		s.resetLocked()
-		return err
+		return 0, err
 	}
 	defer unlockAll()
 
@@ -173,13 +182,13 @@ func (s *Session) Commit() error {
 	for t, gen := range s.scanGens {
 		if s.table.generation(t) != gen {
 			s.resetLocked()
-			return ErrSerialization
+			return 0, ErrSerialization
 		}
 	}
 	for key, predicate := range s.predicateGens {
 		if s.table.predicateGeneration(key) != predicate.gen {
 			s.resetLocked()
-			return ErrSerialization
+			return 0, ErrSerialization
 		}
 	}
 
@@ -203,7 +212,7 @@ func (s *Session) Commit() error {
 		}
 		if err := s.table.validateUniqueRows(t, pending, excluded); err != nil {
 			s.resetLocked()
-			return err
+			return 0, err
 		}
 	}
 
@@ -224,7 +233,7 @@ func (s *Session) Commit() error {
 				data, err := encodeRow(e.row)
 				if err != nil {
 					s.resetLocked()
-					return err
+					return 0, err
 				}
 				ops = append(ops, BatchOp{Op: batchPut, Key: []byte(key), Value: data})
 			}
@@ -235,22 +244,24 @@ func (s *Session) Commit() error {
 	// A read-only transaction has nothing to write; commit trivially.
 	if len(ops) == 0 {
 		s.resetLocked()
-		return nil
+		return 0, nil
 	}
 
 	var committed bool
+	var commitLSN uint64
 	err = s.table.pool.WithClient(func(c *KVClient) error {
-		_, ok, err := c.CompareBatchWrite(checks, ops, nil)
+		lsn, ok, err := c.CompareBatchWrite(checks, ops, nil)
+		commitLSN = lsn
 		committed = ok
 		return err
 	})
 	if err != nil {
 		s.resetLocked()
-		return err
+		return 0, err
 	}
 	if !committed {
 		s.resetLocked()
-		return ErrSerialization
+		return 0, ErrSerialization
 	}
 
 	// Advance generations and invalidate derived caches for written tables.
@@ -261,7 +272,7 @@ func (s *Session) Commit() error {
 	}
 
 	s.resetLocked()
-	return nil
+	return commitLSN, nil
 }
 
 // acquireCommitLocks acquires the per-table gates needed to commit the staged

@@ -10,10 +10,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
@@ -38,6 +40,20 @@ type Connection struct {
 	statements     map[string]*preparedStatement
 	portals        map[string]*portal
 	extendedFailed bool
+	backendPID     int32
+	// extendedCycle is true between Parse/Bind/Execute/Describe/Close and the
+	// next Sync. Notifications are not interleaved into an extended-protocol
+	// sequence; they are held until Sync.
+	extendedCycle bool
+}
+
+// backendPIDSeq gives each connection a distinct synthetic backend PID. It is
+// seeded with the process ID so NotificationResponse frames look plausible and
+// do not collide across server processes.
+var backendPIDSeq atomic.Int32
+
+func nextBackendPID() int32 {
+	return int32(os.Getpid()) + backendPIDSeq.Add(1)
 }
 
 type preparedStatement struct {
@@ -62,6 +78,7 @@ func NewConnection(conn net.Conn, dbManager *storage.DatabaseManager, quiet bool
 		portals:    make(map[string]*portal),
 		txStatus:   TxStatusIdle,
 		quiet:      quiet,
+		backendPID: nextBackendPID(),
 	}
 }
 
@@ -69,8 +86,8 @@ func NewConnection(conn net.Conn, dbManager *storage.DatabaseManager, quiet bool
 func (c *Connection) Handle() error {
 	defer func() {
 		if c.executor != nil {
-			if err := c.executor.RollbackActive(); err != nil && !c.quiet {
-				log.Printf("failed to roll back disconnected transaction: %v", err)
+			if err := c.executor.Close(); err != nil && !c.quiet {
+				log.Printf("failed to close session: %v", err)
 			}
 		}
 		c.conn.Close()
@@ -168,7 +185,7 @@ func (c *Connection) Handle() error {
 	}
 
 	// Send backend key data (for cancellation - we don't implement this yet)
-	if err := c.sendBackendKeyData(12345, 67890); err != nil {
+	if err := c.sendBackendKeyData(c.backendPID, 67890); err != nil {
 		return err
 	}
 
@@ -177,25 +194,73 @@ func (c *Connection) Handle() error {
 		return err
 	}
 
-	// Message loop
-	for {
-		msg, err := ReadMessage(c.reader)
-		if err != nil {
-			if err == io.EOF {
-				log.Printf("Connection closed by client")
-				return nil
+	// Read messages on a separate goroutine so an idle listener can receive
+	// asynchronous NotificationResponse frames while blocked waiting for input.
+	// Only this goroutine writes to c.writer, which keeps frame order intact.
+	type readResult struct {
+		msg *Message
+		err error
+	}
+	inbox := make(chan readResult, 16)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			msg, err := ReadMessage(c.reader)
+			select {
+			case inbox <- readResult{msg: msg, err: err}:
+			case <-done:
+				return
 			}
-			return fmt.Errorf("failed to read message: %w", err)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	notifications := c.executor.NotificationChannel()
+	overflow := c.executor.NotificationOverflow()
+
+	for {
+		// Do not interleave notifications into an extended-protocol cycle. The
+		// channel is disabled until Sync closes the cycle.
+		var notifyCh <-chan storage.Notification
+		if !c.extendedCycle {
+			notifyCh = notifications
 		}
 
-		if err := c.handleMessage(msg); err != nil {
-			if err == io.EOF {
-				// Normal termination
-				log.Printf("Connection closed normally")
-				return nil
+		select {
+		case res := <-inbox:
+			if res.err != nil {
+				if res.err == io.EOF {
+					log.Printf("Connection closed by client")
+					return nil
+				}
+				return fmt.Errorf("failed to read message: %w", res.err)
 			}
-			log.Printf("Error handling message: %v", err)
-			return err
+			switch res.msg.Type {
+			case MsgParse, MsgBind, MsgDescribe, MsgExecute, MsgClose:
+				c.extendedCycle = true
+			}
+			if err := c.handleMessage(res.msg); err != nil {
+				if err == io.EOF {
+					log.Printf("Connection closed normally")
+					return nil
+				}
+				log.Printf("Error handling message: %v", err)
+				return err
+			}
+
+		case n := <-notifyCh:
+			if err := c.sendNotification(n); err != nil {
+				return err
+			}
+			if err := c.writer.Flush(); err != nil {
+				return err
+			}
+
+		case <-overflow:
+			return fmt.Errorf("notification queue overflow: slow consumer disconnected")
 		}
 	}
 }
@@ -209,6 +274,8 @@ func (c *Connection) initDatabase(dbName string) error {
 
 	c.schema = db.Schema
 	c.executor = executor.New(db.Schema, db.Table)
+	c.executor.SetBackendPID(c.backendPID)
+	c.executor.SetNotificationHub(db.Hub)
 	c.executor.SyncCatalog()
 
 	return nil
@@ -238,7 +305,11 @@ func (c *Connection) handleMessage(msg *Message) error {
 		return c.writer.Flush()
 	case MsgSync:
 		c.extendedFailed = false
-		return c.sendReadyForQuery()
+		c.extendedCycle = false
+		if err := c.sendReadyForQuery(); err != nil {
+			return err
+		}
+		return c.drainNotifications()
 
 	default:
 		log.Printf("Unknown message type: %c (%d)", msg.Type, msg.Type)
@@ -368,6 +439,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 		}
 		if err := c.sendResult(result, stmt); err != nil {
 			return err
+		}
+		if result.LSN > 0 {
+			if err := c.sendLSN(result.LSN); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -559,7 +635,13 @@ func (c *Connection) handleExecute(msg *Message) error {
 		}
 		return c.failExtended(code, fmt.Errorf("execution error: %w", err))
 	}
-	return c.sendResult(result, stmt)
+	if err := c.sendResult(result, stmt); err != nil {
+		return err
+	}
+	if result.LSN > 0 {
+		return c.sendLSN(result.LSN)
+	}
+	return nil
 }
 
 var catalogFilterPattern = regexp.MustCompile(`(?i)\b(table_name|tablename|table_schema|schemaname|constraint_name|indexname)\s*=\s*'((?:''|[^'])*)'`)
@@ -1055,6 +1137,12 @@ func (c *Connection) getCommandTag(stmt parser.Statement, result *executor.Resul
 	case *parser.ReleaseStmt:
 		c.txStatus = TxStatusInBlock
 		return "RELEASE"
+	case *parser.ListenStmt:
+		return "LISTEN"
+	case *parser.UnlistenStmt:
+		return "UNLISTEN"
+	case *parser.NotifyStmt:
+		return "NOTIFY"
 	default:
 		return "OK"
 	}
@@ -1065,6 +1153,38 @@ func (c *Connection) sendAuthenticationOk() error {
 	mb := NewMessageBuilder()
 	mb.WriteInt32(0) // Auth OK
 	return c.writeMessage(MsgAuthenticationOk, mb.Bytes())
+}
+
+// drainNotifications writes every notification currently buffered for this
+// session. It is called at protocol-safe points (after Sync/ReadyForQuery).
+func (c *Connection) drainNotifications() error {
+	ch := c.executor.NotificationChannel()
+	for {
+		select {
+		case n := <-ch:
+			if err := c.sendNotification(n); err != nil {
+				return err
+			}
+		default:
+			return c.writer.Flush()
+		}
+	}
+}
+
+// sendNotification writes a NotificationResponse frame. The frame is only
+// written by the connection's main goroutine, never from a publisher.
+func (c *Connection) sendNotification(n storage.Notification) error {
+	mb := NewMessageBuilder()
+	mb.WriteInt32(n.PID)
+	mb.WriteString(n.Channel)
+	mb.WriteString(n.Payload)
+	return c.writeMessage(MsgNotificationResponse, mb.Bytes())
+}
+
+// sendLSN exposes the last commit LSN as a ParameterStatus. Drivers that do
+// not know the key ignore it; subscribers can use it as an ordering cursor.
+func (c *Connection) sendLSN(lsn uint64) error {
+	return c.sendParameterStatus("pizzasql.lsn", strconv.FormatUint(lsn, 10))
 }
 
 // sendParameterStatus sends a parameter status message

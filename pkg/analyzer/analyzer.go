@@ -95,6 +95,10 @@ func (a *Analyzer) Analyze(stmt parser.Statement) error {
 	case *parser.CreateIndexStmt, *parser.DropIndexStmt:
 		// Index statements don't need semantic analysis
 		return nil
+	case *parser.ListenStmt, *parser.UnlistenStmt, *parser.NotifyStmt:
+		// Channel names and payloads are validated by the parser; there is no
+		// schema or expression to analyze.
+		return nil
 	default:
 		return &AnalysisError{
 			Type:    ErrUnknown,
