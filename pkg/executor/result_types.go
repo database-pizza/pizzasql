@@ -50,6 +50,11 @@ func projectionColumnType(col parser.SelectColumn, schema *storage.Schema) strin
 			return c.Type
 		}
 	}
+	if storage.IsRowIDColumn(ref.Column) {
+		// The hidden rowid alias is a signed 64-bit integer, not an unknown
+		// expression, so report it as BIGINT (int8) on the wire.
+		return "BIGINT"
+	}
 	return "TEXT"
 }
 
@@ -102,6 +107,9 @@ func (e *Executor) joinedSelectColumnTypes(stmt *parser.SelectStmt, refs []parse
 			if found {
 				break
 			}
+		}
+		if !found && storage.IsRowIDColumn(ref.Column) {
+			columnType = "BIGINT"
 		}
 		types = append(types, columnType)
 	}
