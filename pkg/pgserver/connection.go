@@ -18,6 +18,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
@@ -306,7 +307,14 @@ func (c *Connection) handleQuery(msg *Message) error {
 	p := parser.New(l)
 	stmts, err := p.ParseMultiple()
 	if err != nil {
-		c.sendError("ERROR", ErrCodeSyntaxError, fmt.Sprintf("Syntax error: %v", err))
+		code := ErrCodeSyntaxError
+		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			code = ErrCodeFeatureNotSupported
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		}
+		c.sendError("ERROR", code, fmt.Sprintf("Syntax error: %v", err))
 		return c.sendReadyForQuery()
 	}
 
@@ -484,7 +492,14 @@ func (c *Connection) handleExecute(msg *Message) error {
 	l := lexer.New(portal.query)
 	stmt, err := parser.New(l).Parse()
 	if err != nil {
-		return c.failExtended(ErrCodeSyntaxError, fmt.Errorf("syntax error: %w", err))
+		code := ErrCodeSyntaxError
+		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			code = ErrCodeFeatureNotSupported
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		}
+		return c.failExtended(code, fmt.Errorf("syntax error: %w", err))
 	}
 	result, err := c.executor.Execute(stmt)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 )
 
 // Parser parses SQL statements into an AST.
@@ -2487,6 +2488,12 @@ func (p *Parser) parseUnaryExpr() (Expr, error) {
 
 func (p *Parser) parsePrimaryExpr() (Expr, error) {
 	switch p.curToken.Type {
+	case lexer.TokenALL:
+		if p.peekTokenIs(lexer.TokenLParen) {
+			return nil, pgerror.Unsupported("array parameters and ANY/ALL predicates are not supported (PizzaSQL has no array type); expand the list into IN (...) with individual parameters")
+		}
+		return nil, p.curError("unexpected token in expression: " + p.curToken.Type.String())
+
 	case lexer.TokenNumber:
 		expr := &LiteralExpr{Type: lexer.TokenNumber, Value: p.curToken.Literal}
 		p.nextToken()
@@ -2590,6 +2597,9 @@ func (p *Parser) parseIdentOrFunction() (Expr, error) {
 
 	// Check for function call
 	if p.curTokenIs(lexer.TokenLParen) {
+		if strings.EqualFold(name, "ANY") {
+			return nil, pgerror.Unsupported("array parameters and ANY/ALL predicates are not supported (PizzaSQL has no array type); expand the list into IN (...) with individual parameters")
+		}
 		return p.parseFunctionCall(name)
 	}
 
