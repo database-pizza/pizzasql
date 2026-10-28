@@ -20,6 +20,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
+	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
 // Connection represents a client connection
@@ -142,7 +143,15 @@ func (c *Connection) Handle() error {
 	}
 
 	// Send parameter status messages
-	if err := c.sendParameterStatus("server_version", "14.0 (PizzaSQL)"); err != nil {
+	if err := c.sendParameterStatus("server_version", version.PostgreSQLCompatVersion+" (PizzaSQL)"); err != nil {
+		return err
+	}
+	// Build identity is a separate, custom ParameterStatus so the PostgreSQL
+	// compatibility string above stays stable for version-sniffing drivers.
+	if err := c.sendParameterStatus("pizzasql.version", version.String()); err != nil {
+		return err
+	}
+	if err := c.sendParameterStatus("pizzasql.commit", version.Commit); err != nil {
 		return err
 	}
 	if err := c.sendParameterStatus("server_encoding", "UTF8"); err != nil {
@@ -1236,7 +1245,7 @@ func (c *Connection) handleVersionQuery() error {
 		return err
 	}
 
-	row := []interface{}{"PostgreSQL 14.0 (PizzaSQL)"}
+	row := []interface{}{"PostgreSQL " + version.PostgreSQLCompatVersion + " (PizzaSQL)"}
 	if err := c.sendDataRow(row, columns); err != nil {
 		return err
 	}
@@ -1281,7 +1290,7 @@ func (c *Connection) handleShowCommand(sqlUpper string) error {
 
 	if strings.Contains(sqlUpper, "SERVER_VERSION") {
 		name = "server_version"
-		value = "14.0"
+		value = version.PostgreSQLCompatVersion
 	} else if strings.Contains(sqlUpper, "SERVER_ENCODING") {
 		name = "server_encoding"
 		value = "UTF8"

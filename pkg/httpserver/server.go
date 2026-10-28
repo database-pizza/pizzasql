@@ -161,6 +161,7 @@ func (s *Server) init() *Server {
 	mux.HandleFunc("/schema/tables", s.handleSchemaTables)
 	mux.HandleFunc("/schema/tables/", s.handleSchemaTable)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/version", s.handleVersion)
 	mux.HandleFunc("/stats", s.handleStats)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/transaction/begin", s.handleTransactionBegin)
