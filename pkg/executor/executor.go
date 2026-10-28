@@ -13,9 +13,15 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
+
+// ErrUnsupportedFeature marks DDL that PizzaSQL intentionally rejects instead
+// of silently accepting with different semantics. Protocol layers map it to a
+// feature-not-supported SQLSTATE rather than a generic internal error.
+var ErrUnsupportedFeature = errors.New("unsupported feature")
 
 // Executor executes SQL statements.
 type Executor struct {
@@ -3551,27 +3557,56 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 				col.Nullable = false
 			case parser.ConstraintDefault:
 				if constraint.Default != nil {
-					val, _ := e.evalExpr(constraint.Default, nil)
+					val, err := constantDefaultValue(e, col.Name, constraint.Default)
+					if err != nil {
+						return nil, err
+					}
 					col.Default = val
 				}
 			case parser.ConstraintAutoIncrement:
 				schema.AutoIncrement = true
+			case parser.ConstraintCheck:
+				return nil, pgerror.Unsupported(
+					"CHECK constraints are not supported: column %q declares CHECK; enforce the rule in the application (the engine parsed but never evaluated CHECK, so accepting it would silently allow invalid rows)",
+					col.Name,
+				)
+			case parser.ConstraintForeignKey:
+				return nil, pgerror.Unsupported(
+					"FOREIGN KEY constraints are not supported: column %q declares REFERENCES %s; enforce referential integrity in the application (the engine never validated foreign keys)",
+					col.Name, constraint.RefTable,
+				)
 			}
 		}
 
 		schema.Columns = append(schema.Columns, col)
 	}
 
-	// Handle table-level constraints
+	// Handle table-level constraints. CHECK and FOREIGN KEY are rejected: they
+	// were previously parsed and discarded, which let applications believe a
+	// constraint existed when nothing enforced it.
 	for _, constraint := range stmt.Constraints {
-		if constraint.Type == parser.ConstraintPrimaryKey && len(constraint.Columns) > 0 {
-			schema.PrimaryKey = constraint.Columns[0]
-			for i := range schema.Columns {
-				if strings.EqualFold(schema.Columns[i].Name, schema.PrimaryKey) {
-					schema.Columns[i].PrimaryKey = true
-					schema.Columns[i].Nullable = false
+		switch constraint.Type {
+		case parser.ConstraintPrimaryKey:
+			if len(constraint.Columns) > 0 {
+				if len(constraint.Columns) > 1 {
+					return nil, fmt.Errorf("%w: composite primary keys are not supported; declare a single-column PRIMARY KEY", ErrUnsupportedFeature)
+				}
+				schema.PrimaryKey = constraint.Columns[0]
+				for i := range schema.Columns {
+					if strings.EqualFold(schema.Columns[i].Name, schema.PrimaryKey) {
+						schema.Columns[i].PrimaryKey = true
+						schema.Columns[i].Nullable = false
+					}
 				}
 			}
+		case parser.ConstraintCheck:
+			return nil, pgerror.Unsupported(
+				"CHECK constraints are not supported: enforce the rule in the application instead (the engine parsed but never evaluated CHECK)",
+			)
+		case parser.ConstraintForeignKey:
+			return nil, pgerror.Unsupported(
+				"FOREIGN KEY constraints are not supported: enforce referential integrity in the application instead (the engine never validated foreign keys)",
+			)
 		}
 	}
 
@@ -3960,9 +3995,22 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 			col.Nullable = false
 		case parser.ConstraintDefault:
 			if constraint.Default != nil {
-				val, _ := e.evalExpr(constraint.Default, nil)
+				val, err := constantDefaultValue(e, col.Name, constraint.Default)
+				if err != nil {
+					return nil, err
+				}
 				col.Default = val
 			}
+		case parser.ConstraintCheck:
+			return nil, pgerror.Unsupported(
+				"CHECK constraints are not supported: column %q declares CHECK; enforce the rule in the application instead",
+				col.Name,
+			)
+		case parser.ConstraintForeignKey:
+			return nil, pgerror.Unsupported(
+				"FOREIGN KEY constraints are not supported: column %q declares REFERENCES %s; enforce referential integrity in the application instead",
+				col.Name, constraint.RefTable,
+			)
 		}
 	}
 

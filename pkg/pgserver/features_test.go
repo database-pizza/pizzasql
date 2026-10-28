@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
@@ -154,5 +155,118 @@ func TestGetCommandTagSelectUsesRowCount(t *testing.T) {
 	res.AddRow(2)
 	if tag := c.getCommandTag(parseStmt(t, "SELECT 1"), res); tag != "SELECT 2" {
 		t.Fatalf("tag = %q, want SELECT 2", tag)
+	}
+}
+
+// errorMessage extracts the human-readable message from an ErrorResponse.
+func errorMessage(msg *Message) string {
+	if msg == nil || msg.Type != MsgErrorResponse {
+		return ""
+	}
+	data := msg.Data
+	for i := 0; i < len(data); {
+		if data[i] == 0 {
+			break
+		}
+		field := data[i]
+		i++
+		end := bytes.IndexByte(data[i:], 0)
+		if end < 0 {
+			break
+		}
+		value := string(data[i : i+end])
+		if field == ErrorFieldMessage {
+			return value
+		}
+		i += end + 1
+	}
+	return ""
+}
+
+func TestSimpleQueryUniqueViolationErrorCode(t *testing.T) {
+	c, client := newDataConnection(t)
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"), 0)})
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("INSERT INTO t VALUES (1, 'a@x')"), 0)})
+
+	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("INSERT INTO t VALUES (2, 'a@x')"), 0)})
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want ErrorResponse+ReadyForQuery", len(msgs))
+	}
+	if code := errorCode(msgs[0]); code != ErrCodeUniqueViolation {
+		t.Fatalf("error code = %q, want %q", code, ErrCodeUniqueViolation)
+	}
+	if message := errorMessage(msgs[0]); !strings.Contains(message, "uniq_t_email") {
+		t.Fatalf("error message = %q, want constraint uniq_t_email", message)
+	}
+}
+
+func TestExtendedQueryUniqueViolationErrorCode(t *testing.T) {
+	c, client := newDataConnection(t)
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)"), 0)})
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("INSERT INTO t VALUES (1, 'a@x')"), 0)})
+
+	parse := NewMessageBuilder()
+	parse.WriteString("")
+	parse.WriteString("INSERT INTO t VALUES (2, 'a@x')")
+	parse.WriteInt16(0)
+
+	bind := NewMessageBuilder()
+	bind.WriteString("")
+	bind.WriteString("")
+	bind.WriteInt16(0) // parameter format codes
+	bind.WriteInt16(0) // parameter values
+	bind.WriteInt16(0) // result format codes
+
+	execute := NewMessageBuilder()
+	execute.WriteString("")
+	execute.WriteInt32(0)
+
+	done := make(chan error, 1)
+	go func() {
+		if err := c.handleParse(&Message{Type: MsgParse, Data: parse.Bytes()}); err != nil {
+			done <- err
+			return
+		}
+		if err := c.handleBind(&Message{Type: MsgBind, Data: bind.Bytes()}); err != nil {
+			done <- err
+			return
+		}
+		done <- c.handleExecute(&Message{Type: MsgExecute, Data: execute.Bytes()})
+	}()
+
+	reader := bufio.NewReader(client)
+	var errMsg *Message
+	for errMsg == nil {
+		msg, err := ReadMessage(reader)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		if msg.Type == MsgErrorResponse {
+			errMsg = msg
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("extended query: %v", err)
+	}
+	if code := errorCode(errMsg); code != ErrCodeUniqueViolation {
+		t.Fatalf("error code = %q, want %q", code, ErrCodeUniqueViolation)
+	}
+	if message := errorMessage(errMsg); !strings.Contains(message, "uniq_t_email") {
+		t.Fatalf("error message = %q, want constraint uniq_t_email", message)
+	}
+}
+
+func TestCompositePrimaryKeyDDLErrorCode(t *testing.T) {
+	c, client := newDataConnection(t)
+
+	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (a TEXT, b TEXT, PRIMARY KEY (a,b))"), 0)})
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want ErrorResponse+ReadyForQuery", len(msgs))
+	}
+	if code := errorCode(msgs[0]); code != ErrCodeFeatureNotSupported {
+		t.Fatalf("error code = %q, want %q", code, ErrCodeFeatureNotSupported)
+	}
+	if message := errorMessage(msgs[0]); !strings.Contains(message, "composite primary key") {
+		t.Fatalf("error message = %q, want a composite primary key error", message)
 	}
 }
