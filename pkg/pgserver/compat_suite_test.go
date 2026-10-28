@@ -127,13 +127,10 @@ func TestCompatibilitySuite(t *testing.T) {
 	expectCode("locking.for_update_0A000", `SELECT * FROM accounts FOR UPDATE`, "0A000")
 	expectCode("arrays.any_0A000", `SELECT * FROM accounts WHERE id = ANY('{1,2}')`, "0A000")
 
-	// Documented current limitation: CHECK and FOREIGN KEY are parsed but not
-	// enforced. A release that starts rejecting them will report "missing"
-	// here and the capability document must be updated.
-	expectOK("limitations.check_not_enforced", `CREATE TABLE checked (n INTEGER CHECK (n > 0))`)
-	expectOK("limitations.check_insert_violation", `INSERT INTO checked (n) VALUES (-1)`)
-	expectOK("limitations.foreign_key_not_enforced", `CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES accounts(id))`)
-	expectOK("limitations.orphan_insert", `INSERT INTO child (id, parent_id) VALUES (1, 999)`)
+	// CHECK and FOREIGN KEY are rejected at DDL instead of being silently
+	// discarded; enforce these rules in the application.
+	expectCode("ddl.check_0A000", `CREATE TABLE checked (n INTEGER CHECK (n > 0))`, "0A000")
+	expectCode("ddl.foreign_key_0A000", `CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES accounts(id))`, "0A000")
 
 	expectCode("errors.syntax_42601", `SELEC 1`, "42601")
 
