@@ -323,6 +323,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
+			} else if _, commit := stmt.(*parser.CommitStmt); commit {
+				// A failed COMMIT has already rolled the transaction back in
+				// storage; leaving the session in the failed state would make
+				// every following statement (including ROLLBACK) fail.
+				c.txStatus = TxStatusIdle
 			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
@@ -491,6 +496,8 @@ func (c *Connection) handleExecute(msg *Message) error {
 		code := ErrCodeInternalError
 		if errors.Is(err, storage.ErrSerialization) {
 			code = ErrCodeSerializationFailure
+			c.txStatus = TxStatusIdle
+		} else if _, commit := stmt.(*parser.CommitStmt); commit {
 			c.txStatus = TxStatusIdle
 		} else if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
