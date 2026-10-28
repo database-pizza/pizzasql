@@ -18,6 +18,11 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
+// ErrUnsupportedFeature marks DDL that PizzaSQL intentionally rejects instead
+// of silently accepting with different semantics. Protocol layers map it to a
+// feature-not-supported SQLSTATE rather than a generic internal error.
+var ErrUnsupportedFeature = errors.New("unsupported feature")
+
 // Executor executes SQL statements.
 type Executor struct {
 	schema   *storage.SchemaManager
@@ -3583,6 +3588,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		switch constraint.Type {
 		case parser.ConstraintPrimaryKey:
 			if len(constraint.Columns) > 0 {
+				if len(constraint.Columns) > 1 {
+					return nil, fmt.Errorf("%w: composite primary keys are not supported; declare a single-column PRIMARY KEY", ErrUnsupportedFeature)
+				}
 				schema.PrimaryKey = constraint.Columns[0]
 				for i := range schema.Columns {
 					if strings.EqualFold(schema.Columns[i].Name, schema.PrimaryKey) {
