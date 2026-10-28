@@ -11,6 +11,7 @@ import (
 
 	"github.com/goccy/go-json"
 
+	"github.com/danfragoso/pizzasql-next/pkg/capabilities"
 	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
 	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
@@ -393,6 +394,13 @@ func (s *Server) handleSchemaTable(w http.ResponseWriter, r *http.Request) {
 
 	pretty := r.URL.Query().Get("pretty") == "true"
 	writeJSON(w, http.StatusOK, resp, pretty)
+}
+
+// handleCapabilities serves the machine-readable capability document so clients
+// can discover supported SQL surface for this engine build.
+func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	pretty := r.URL.Query().Get("pretty") == "true"
+	writeJSON(w, http.StatusOK, capabilities.Current(), pretty)
 }
 
 // handleVersion reports the build identity and the protocol compatibility
