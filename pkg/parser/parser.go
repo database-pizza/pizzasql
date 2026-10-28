@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 )
 
 // Parser parses SQL statements into an AST.
@@ -286,6 +287,10 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.Offset = offset
 	}
 
+	if err := p.rejectLockingClause(); err != nil {
+		return nil, err
+	}
+
 	return stmt, nil
 }
 
@@ -420,6 +425,9 @@ func (p *Parser) parseCompoundChain(first *SelectStmt) (*CompoundSelect, error) 
 			return nil, err
 		}
 		compound.Offset = offset
+	}
+	if err := p.rejectLockingClause(); err != nil {
+		return nil, err
 	}
 
 	return compound, nil
@@ -606,7 +614,7 @@ func (p *Parser) parseTableRef() (*TableRef, error) {
 		}
 		ref.Alias = p.curToken.Literal
 		p.nextToken()
-	} else if p.curTokenIs(lexer.TokenIdent) && !p.isClauseKeyword() {
+	} else if p.curTokenIs(lexer.TokenIdent) && !p.isClauseKeyword() && !p.isLockingClauseStart() {
 		ref.Alias = p.curToken.Literal
 		p.nextToken()
 	}
@@ -633,6 +641,33 @@ func (p *Parser) isClauseKeyword() bool {
 		return true
 	}
 	return false
+}
+
+// isLockingClauseStart reports whether the current identifier starts a
+// PostgreSQL row-locking clause. FOR is not a reserved keyword in this lexer,
+// so without this guard "FROM t FOR UPDATE" would treat FOR as a table alias.
+func (p *Parser) isLockingClauseStart() bool {
+	return p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "FOR")
+}
+
+// rejectLockingClause rejects SELECT ... FOR UPDATE/SHARE and its NOWAIT / SKIP
+// LOCKED variants. The engine has no row locks; claiming support by parsing the
+// clause would silently provide weaker isolation than PostgreSQL.
+func (p *Parser) rejectLockingClause() error {
+	if !p.isLockingClauseStart() {
+		return nil
+	}
+	locking := p.peekTokenIs(lexer.TokenUPDATE) ||
+		(p.peekTokenIs(lexer.TokenIdent) &&
+			(strings.EqualFold(p.peekToken.Literal, "SHARE") ||
+				strings.EqualFold(p.peekToken.Literal, "NO") ||
+				strings.EqualFold(p.peekToken.Literal, "KEY")))
+	if !locking {
+		return nil
+	}
+	return pgerror.Unsupported(
+		"SELECT ... FOR UPDATE/SHARE row locking (including NOWAIT and SKIP LOCKED) is not supported; use the documented optimistic transaction model with SQLSTATE 40001 retries instead",
+	)
 }
 
 func (p *Parser) parseJoin() (*JoinClause, error) {
