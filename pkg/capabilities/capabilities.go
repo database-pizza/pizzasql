@@ -138,8 +138,8 @@ func Current() *Document {
 			Unique:        Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "unique indexes, INLINE UNIQUE, and ON CONFLICT are enforced atomically"},
 			PrimaryKey:    Feature{Supported: true, Status: "enforced", Notes: "single-column only"},
 			CompositePK:   Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "declare a single-column primary key"},
-			ForeignKey:    Feature{Supported: false, Status: "not_enforced", Notes: "parsed and stored for SQLite import, but not validated on writes; do not rely on referential integrity"},
-			Check:         Feature{Supported: false, Status: "not_enforced", Notes: "parsed but not validated on writes; enforce in the application"},
+			ForeignKey:    Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level FOREIGN KEY are rejected; enforce referential integrity in the application, cascades are not implemented"},
+			Check:         Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level CHECK are rejected; enforce the rule in the application"},
 			DefaultValues: Feature{Supported: true, Status: "constant_only", SQLState: "0A000", Notes: "non-constant defaults (CURRENT_TIMESTAMP, function calls) are rejected instead of being frozen at DDL time"},
 		},
 
