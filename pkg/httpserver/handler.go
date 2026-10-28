@@ -398,6 +398,22 @@ func (s *Server) handleSchemaTable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp, pretty)
 }
 
+// handleVersion reports the build identity and the protocol compatibility
+// floor separately, so clients can pin behavior to a specific engine build.
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	resp := map[string]interface{}{
+		"name":            "pizzasql",
+		"version":         version.String(),
+		"commit":          version.Commit,
+		"date":            version.Date,
+		"dirty":           version.Dirty != "",
+		"postgres_compat": version.PostgreSQLCompatVersion,
+		"sqlite_compat":   executor.SQLiteCompatVersion,
+	}
+	pretty := r.URL.Query().Get("pretty") == "true"
+	writeJSON(w, http.StatusOK, resp, pretty)
+}
+
 // handleHealth handles GET /health
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{

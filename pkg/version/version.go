@@ -6,6 +6,11 @@ import (
 	"strings"
 )
 
+// PostgreSQLCompatVersion is the PostgreSQL server version reported to clients
+// for driver compatibility. It is intentionally independent of the PizzaSQL
+// build version returned by String() and pizzasql_version().
+const PostgreSQLCompatVersion = "14.0"
+
 var (
 	Version = "dev"
 	Commit  = "unknown"
