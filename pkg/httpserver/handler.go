@@ -140,11 +140,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		// Execute using the database-specific executor
 		result, err := exec.Execute(stmt)
 		if err != nil {
-			errorChan <- &HTTPError{
-				Code:    "EXECUTION_ERROR",
-				Message: err.Error(),
-				Status:  http.StatusInternalServerError,
-			}
+			errorChan <- sqlStateHTTPError(err)
 			return
 		}
 
@@ -301,7 +297,8 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else if executeErr != nil {
-		writeError(w, http.StatusBadRequest, "EXECUTION_ERROR", executeErr.Error(), nil)
+		httpErr := sqlStateHTTPError(executeErr)
+		writeError(w, httpErr.Status, httpErr.Code, httpErr.Message, httpErr.Details)
 		return
 	}
 
@@ -412,6 +409,45 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	pretty := r.URL.Query().Get("pretty") == "true"
 	writeJSON(w, http.StatusOK, resp, pretty)
+}
+
+// sqlStateHTTPError maps engine errors onto the same SQLSTATE codes the
+// PostgreSQL endpoint reports. The executor returns plain errors on released
+// builds, so the unique-violation and unsupported-feature markers are matched
+// on their stable message prefixes.
+func sqlStateHTTPError(err error) *HTTPError {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	if strings.HasPrefix(message, "UNIQUE constraint failed: ") {
+		constraint := strings.TrimPrefix(message, "UNIQUE constraint failed: ")
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    "23505",
+			Message: message,
+			Details: map[string]interface{}{"constraint": constraint},
+		}
+	}
+	if errors.Is(err, storage.ErrSerialization) {
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    "40001",
+			Message: message,
+		}
+	}
+	if strings.Contains(message, "feature not supported:") {
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    "0A000",
+			Message: message,
+		}
+	}
+	return &HTTPError{
+		Status:  http.StatusInternalServerError,
+		Code:    "EXECUTION_ERROR",
+		Message: message,
+	}
 }
 
 // handleHealth handles GET /health
