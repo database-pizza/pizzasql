@@ -14,6 +14,17 @@ import (
 // Row represents a database row.
 type Row map[string]interface{}
 
+// UniqueViolationError reports a duplicate value on a UNIQUE index. The
+// constraint name identifies the violated index so protocol layers can surface a
+// machine-detectable error.
+type UniqueViolationError struct {
+	Constraint string
+}
+
+func (e *UniqueViolationError) Error() string {
+	return fmt.Sprintf("UNIQUE constraint failed: %s", e.Constraint)
+}
+
 // TableManager manages table data operations.
 type TableManager struct {
 	pool     *KVPool
@@ -1804,7 +1815,7 @@ func (m *TableManager) validateUniqueRows(table string, pending []Row, excludedK
 				seen[idx.Name] = perIndex
 			}
 			if perIndex[encoded] {
-				return fmt.Errorf("UNIQUE constraint failed: %s", idx.Name)
+				return &UniqueViolationError{Constraint: idx.Name}
 			}
 			perIndex[encoded] = true
 		}
@@ -1842,7 +1853,7 @@ func (m *TableManager) validateUniqueRows(table string, pending []Row, excludedK
 						continue
 					}
 					if perIndex := seen[idx.Name]; perIndex != nil && perIndex[encoded] {
-						return fmt.Errorf("UNIQUE constraint failed: %s", idx.Name)
+						return &UniqueViolationError{Constraint: idx.Name}
 					}
 				}
 			}
@@ -1915,7 +1926,7 @@ func (m *TableManager) ValidateUniqueIndex(index *Index) error {
 			return false, nil
 		}
 		if seen[encoded] {
-			return true, fmt.Errorf("UNIQUE constraint failed: %s", index.Name)
+			return true, &UniqueViolationError{Constraint: index.Name}
 		}
 		seen[encoded] = true
 		return false, nil

@@ -320,13 +320,26 @@ func (c *Connection) handleQuery(msg *Message) error {
 		result, err := c.executor.Execute(stmt)
 		if err != nil {
 			code := ErrCodeInternalError
+			message := fmt.Sprintf("Execution error: %v", err)
+			var uniqueErr *storage.UniqueViolationError
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
+			} else if errors.As(err, &uniqueErr) {
+				code = ErrCodeUniqueViolation
+				message = fmt.Sprintf("Execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint)
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if errors.Is(err, executor.ErrUnsupportedFeature) {
+				code = ErrCodeFeatureNotSupported
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
-			c.sendError("ERROR", code, fmt.Sprintf("Execution error: %v", err))
+			c.sendError("ERROR", code, message)
 			return c.sendReadyForQuery()
 		}
 		if err := c.sendResult(result, stmt); err != nil {
@@ -489,11 +502,25 @@ func (c *Connection) handleExecute(msg *Message) error {
 	result, err := c.executor.Execute(stmt)
 	if err != nil {
 		code := ErrCodeInternalError
+		var uniqueErr *storage.UniqueViolationError
 		if errors.Is(err, storage.ErrSerialization) {
 			code = ErrCodeSerializationFailure
 			c.txStatus = TxStatusIdle
+		} else if errors.As(err, &uniqueErr) {
+			code = ErrCodeUniqueViolation
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.Is(err, executor.ErrUnsupportedFeature) {
+			code = ErrCodeFeatureNotSupported
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
 		} else if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
+		}
+		if uniqueErr != nil {
+			return c.failExtended(code, fmt.Errorf("execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint))
 		}
 		return c.failExtended(code, fmt.Errorf("execution error: %w", err))
 	}
