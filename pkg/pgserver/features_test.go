@@ -255,3 +255,18 @@ func TestExtendedQueryUniqueViolationErrorCode(t *testing.T) {
 		t.Fatalf("error message = %q, want constraint uniq_t_email", message)
 	}
 }
+
+func TestCompositePrimaryKeyDDLErrorCode(t *testing.T) {
+	c, client := newDataConnection(t)
+
+	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (a TEXT, b TEXT, PRIMARY KEY (a,b))"), 0)})
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want ErrorResponse+ReadyForQuery", len(msgs))
+	}
+	if code := errorCode(msgs[0]); code != ErrCodeFeatureNotSupported {
+		t.Fatalf("error code = %q, want %q", code, ErrCodeFeatureNotSupported)
+	}
+	if message := errorMessage(msgs[0]); !strings.Contains(message, "composite primary key") {
+		t.Fatalf("error message = %q, want a composite primary key error", message)
+	}
+}

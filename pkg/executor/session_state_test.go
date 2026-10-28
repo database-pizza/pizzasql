@@ -248,7 +248,7 @@ func TestPrimaryKeyMultiRowInsertAtomic(t *testing.T) {
 func TestUpdateWithScalarSubqueryInTransaction(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
-	execMust(t, e, "CREATE TABLE watch (user_id INTEGER, repo_id INTEGER, PRIMARY KEY(user_id, repo_id))")
+	execMust(t, e, "CREATE TABLE watch (user_id INTEGER, repo_id INTEGER, PRIMARY KEY(user_id))")
 	execMust(t, e, "CREATE TABLE repository (id INTEGER PRIMARY KEY, num_watches INTEGER)")
 	execMust(t, e, "INSERT INTO repository VALUES (1, 0)")
 	execMust(t, e, "BEGIN")

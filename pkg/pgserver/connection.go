@@ -331,6 +331,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
+			} else if errors.Is(err, executor.ErrUnsupportedFeature) {
+				code = ErrCodeFeatureNotSupported
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
@@ -503,6 +508,11 @@ func (c *Connection) handleExecute(msg *Message) error {
 			c.txStatus = TxStatusIdle
 		} else if errors.As(err, &uniqueErr) {
 			code = ErrCodeUniqueViolation
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.Is(err, executor.ErrUnsupportedFeature) {
+			code = ErrCodeFeatureNotSupported
 			if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
