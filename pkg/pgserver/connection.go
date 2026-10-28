@@ -345,7 +345,9 @@ func (c *Connection) handleQuery(msg *Message) error {
 			} else if errors.As(err, &uniqueErr) {
 				code = ErrCodeUniqueViolation
 				message = fmt.Sprintf("Execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint)
-				if c.txStatus == TxStatusInBlock {
+				if _, commit := stmt.(*parser.CommitStmt); commit {
+					c.txStatus = TxStatusIdle
+				} else if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
 			} else if errors.Is(err, pgerror.ErrFeatureNotSupported) || errors.Is(err, executor.ErrUnsupportedFeature) {
@@ -353,6 +355,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
+			} else if _, commit := stmt.(*parser.CommitStmt); commit {
+				// A failed COMMIT has already rolled the transaction back in
+				// storage; leaving the session in the failed state would make
+				// every following statement (including ROLLBACK) fail.
+				c.txStatus = TxStatusIdle
 			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
@@ -532,7 +539,9 @@ func (c *Connection) handleExecute(msg *Message) error {
 			c.txStatus = TxStatusIdle
 		} else if errors.As(err, &uniqueErr) {
 			code = ErrCodeUniqueViolation
-			if c.txStatus == TxStatusInBlock {
+			if _, commit := stmt.(*parser.CommitStmt); commit {
+				c.txStatus = TxStatusIdle
+			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
 		} else if errors.Is(err, pgerror.ErrFeatureNotSupported) || errors.Is(err, executor.ErrUnsupportedFeature) {
@@ -540,6 +549,8 @@ func (c *Connection) handleExecute(msg *Message) error {
 			if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
+		} else if _, commit := stmt.(*parser.CommitStmt); commit {
+			c.txStatus = TxStatusIdle
 		} else if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
 		}
