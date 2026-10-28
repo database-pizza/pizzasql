@@ -397,6 +397,8 @@ graph TD
 | GET | `/schema/tables` | List all tables |
 | GET | `/schema/tables/{name}` | Table schema |
 | GET | `/health` | Health check |
+| GET | `/version` | Build identity and compatibility strings |
+| GET | `/capabilities` | Machine-readable capability document |
 | GET | `/stats` | Runtime statistics |
 | GET | `/metrics` | Prometheus metrics |
 | POST | `/transaction/begin` | Begin transaction |
@@ -538,6 +540,7 @@ PRAGMA database_list;
 
 ```bash
 make test           # all tests
+make compat         # pChat-style compatibility suite (PIZZASQL_COMPAT=1)
 make test-v         # verbose
 make test-cover     # coverage report → coverage.html
 make test-race      # race detector
