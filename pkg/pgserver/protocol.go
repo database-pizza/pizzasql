@@ -92,6 +92,7 @@ const (
 	ErrCodeFeatureNotSupported  = "0A000"
 	ErrCodeTransactionAborted   = "25P02"
 	ErrCodeSerializationFailure = "40001"
+	ErrCodeUniqueViolation      = "23505"
 )
 
 // Message represents a PostgreSQL protocol message
