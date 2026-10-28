@@ -18,6 +18,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
@@ -315,7 +316,14 @@ func (c *Connection) handleQuery(msg *Message) error {
 	p := parser.New(l)
 	stmts, err := p.ParseMultiple()
 	if err != nil {
-		c.sendError("ERROR", ErrCodeSyntaxError, fmt.Sprintf("Syntax error: %v", err))
+		code := ErrCodeSyntaxError
+		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			code = ErrCodeFeatureNotSupported
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		}
+		c.sendError("ERROR", code, fmt.Sprintf("Syntax error: %v", err))
 		return c.sendReadyForQuery()
 	}
 
@@ -329,13 +337,26 @@ func (c *Connection) handleQuery(msg *Message) error {
 		result, err := c.executor.Execute(stmt)
 		if err != nil {
 			code := ErrCodeInternalError
+			message := fmt.Sprintf("Execution error: %v", err)
+			var uniqueErr *storage.UniqueViolationError
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
+			} else if errors.As(err, &uniqueErr) {
+				code = ErrCodeUniqueViolation
+				message = fmt.Sprintf("Execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint)
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if errors.Is(err, pgerror.ErrFeatureNotSupported) || errors.Is(err, executor.ErrUnsupportedFeature) {
+				code = ErrCodeFeatureNotSupported
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
-			c.sendError("ERROR", code, fmt.Sprintf("Execution error: %v", err))
+			c.sendError("ERROR", code, message)
 			return c.sendReadyForQuery()
 		}
 		if err := c.sendResult(result, stmt); err != nil {
@@ -493,16 +514,37 @@ func (c *Connection) handleExecute(msg *Message) error {
 	l := lexer.New(portal.query)
 	stmt, err := parser.New(l).Parse()
 	if err != nil {
-		return c.failExtended(ErrCodeSyntaxError, fmt.Errorf("syntax error: %w", err))
+		code := ErrCodeSyntaxError
+		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			code = ErrCodeFeatureNotSupported
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		}
+		return c.failExtended(code, fmt.Errorf("syntax error: %w", err))
 	}
 	result, err := c.executor.Execute(stmt)
 	if err != nil {
 		code := ErrCodeInternalError
+		var uniqueErr *storage.UniqueViolationError
 		if errors.Is(err, storage.ErrSerialization) {
 			code = ErrCodeSerializationFailure
 			c.txStatus = TxStatusIdle
+		} else if errors.As(err, &uniqueErr) {
+			code = ErrCodeUniqueViolation
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.Is(err, pgerror.ErrFeatureNotSupported) || errors.Is(err, executor.ErrUnsupportedFeature) {
+			code = ErrCodeFeatureNotSupported
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
 		} else if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
+		}
+		if uniqueErr != nil {
+			return c.failExtended(code, fmt.Errorf("execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint))
 		}
 		return c.failExtended(code, fmt.Errorf("execution error: %w", err))
 	}
