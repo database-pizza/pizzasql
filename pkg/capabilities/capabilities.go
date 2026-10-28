@@ -195,9 +195,9 @@ func Current() *Document {
 			"40001": "serialization_failure",
 			"0A000": "feature_not_supported",
 			"42601": "syntax_error",
-			"42P01": "undefined_table",
-			"42703": "undefined_column",
 			"25P02": "in_failed_sql_transaction",
+			"08P01": "protocol_violation (managed proxy: TLS required)",
+			"53300": "too_many_connections (managed proxy: organization quota)",
 			"XX000": "internal_error",
 		},
 
