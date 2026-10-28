@@ -3551,7 +3551,10 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 				col.Nullable = false
 			case parser.ConstraintDefault:
 				if constraint.Default != nil {
-					val, _ := e.evalExpr(constraint.Default, nil)
+					val, err := constantDefaultValue(e, col.Name, constraint.Default)
+					if err != nil {
+						return nil, err
+					}
 					col.Default = val
 				}
 			case parser.ConstraintAutoIncrement:
@@ -3960,7 +3963,10 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 			col.Nullable = false
 		case parser.ConstraintDefault:
 			if constraint.Default != nil {
-				val, _ := e.evalExpr(constraint.Default, nil)
+				val, err := constantDefaultValue(e, col.Name, constraint.Default)
+				if err != nil {
+					return nil, err
+				}
 				col.Default = val
 			}
 		}
