@@ -35,6 +35,7 @@ type QueryResponse struct {
 	Rows         [][]interface{} `json:"rows"`
 	RowsAffected int64           `json:"rowsAffected"`
 	LastInsertID int64           `json:"lastInsertId"`
+	LSN          uint64          `json:"lsn,omitempty"` // commit LSN for COMMIT
 	QueryPlan    []string        `json:"queryPlan,omitempty"`
 	// Metrics for usage tracking and billing
 	BytesRead          int64 `json:"bytesRead"`          // Total bytes in the result set
@@ -44,8 +45,9 @@ type QueryResponse struct {
 
 // ExecuteResult represents a single execution result.
 type ExecuteResult struct {
-	RowsAffected int64 `json:"rowsAffected"`
-	LastInsertID int64 `json:"lastInsertId"`
+	RowsAffected int64  `json:"rowsAffected"`
+	LastInsertID int64  `json:"lastInsertId"`
+	LSN          uint64 `json:"lsn,omitempty"`
 }
 
 // ExecuteResponse represents a batch execution response.

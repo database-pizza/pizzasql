@@ -42,6 +42,17 @@ type Executor struct {
 	savepoints         []string // stack of savepoint names
 	savepointPositions []int    // session mutation-log positions for each savepoint
 
+	// LISTEN/NOTIFY state. The hub and subscriber are per database instance;
+	// listenOps and notifyQueue are staged until COMMIT so LISTEN and NOTIFY
+	// observe transactional visibility.
+	hub               *storage.Hub
+	subscriber        *storage.Subscriber
+	backendPID        int32
+	listens           map[string]bool
+	listenOps         []listenOp
+	notifyQueue       []storage.Notification
+	notificationSaves []notificationSnapshot
+
 	// Subquery context for correlated subqueries
 	outerRow storage.Row
 
@@ -99,6 +110,7 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 		attachedDatabases: make(map[string]*DatabaseConnection),
 		currentDatabase:   "main",
 		views:             make(map[string]*parser.SelectStmt),
+		listens:           make(map[string]bool),
 	}
 
 	// Expression indexes persist only SQL text, so the storage layer needs a
@@ -213,6 +225,12 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeDetach(s)
 	case *parser.AnalyzeStmt:
 		return e.executeAnalyze(s)
+	case *parser.ListenStmt:
+		return e.executeListen(s)
+	case *parser.UnlistenStmt:
+		return e.executeUnlisten(s)
+	case *parser.NotifyStmt:
+		return e.executeNotify(s)
 	}
 
 	// SQLite catalog/metadata dispatch. SELECTs against sqlite_master /
@@ -4083,6 +4101,7 @@ func (e *Executor) executeBegin(stmt *parser.BeginStmt) (*Result, error) {
 	e.inTransaction = true
 	e.savepoints = nil
 	e.savepointPositions = nil
+	e.clearNotificationState()
 
 	result := NewResult("BEGIN")
 	return result, nil
@@ -4094,18 +4113,22 @@ func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 		return nil, fmt.Errorf("cannot commit: no transaction in progress")
 	}
 
-	if err := e.session.Commit(); err != nil {
+	lsn, err := e.session.CommitWithLSN()
+	if err != nil {
 		e.inTransaction = false
 		e.savepoints = nil
 		e.savepointPositions = nil
+		e.finishRollback()
 		return nil, err
 	}
 
 	e.inTransaction = false
 	e.savepoints = nil
 	e.savepointPositions = nil
+	e.finishCommit(lsn)
 
 	result := NewResult("COMMIT")
+	result.LSN = lsn
 	return result, nil
 }
 
@@ -4126,6 +4149,7 @@ func (e *Executor) executeRollback(stmt *parser.RollbackStmt) (*Result, error) {
 	e.inTransaction = false
 	e.savepoints = nil
 	e.savepointPositions = nil
+	e.finishRollback()
 	// total_changes() is monotonic (SQLite semantics): it is NOT decremented on
 	// rollback. last_insert_rowid() and changes() also intentionally hold.
 
@@ -4143,11 +4167,13 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 		e.inTransaction = true
 		e.savepoints = nil
 		e.savepointPositions = nil
+		e.clearNotificationState()
 	}
 
 	// Add savepoint marker
 	e.savepoints = append(e.savepoints, stmt.Name)
 	e.savepointPositions = append(e.savepointPositions, e.session.Snapshot())
+	e.notificationSaves = append(e.notificationSaves, e.notificationSnapshot())
 
 	result := NewResult("SAVEPOINT")
 	return result, nil
@@ -4165,6 +4191,9 @@ func (e *Executor) executeRelease(stmt *parser.ReleaseStmt) (*Result, error) {
 		if e.savepoints[i] == stmt.Name {
 			e.savepoints = e.savepoints[:i]
 			e.savepointPositions = e.savepointPositions[:i]
+			if i <= len(e.notificationSaves) {
+				e.notificationSaves = e.notificationSaves[:i]
+			}
 			found = true
 			break
 		}
@@ -4262,6 +4291,10 @@ func (e *Executor) rollbackToSavepoint(name string) (*Result, error) {
 
 	logPosition := e.savepointPositions[savepointIdx]
 	e.session.RollbackTo(logPosition)
+	if savepointIdx < len(e.notificationSaves) {
+		e.rollbackNotificationsTo(e.notificationSaves[savepointIdx])
+		e.notificationSaves = e.notificationSaves[:savepointIdx+1]
+	}
 
 	// Remove savepoints after the target
 	e.savepoints = e.savepoints[:savepointIdx+1]

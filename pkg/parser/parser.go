@@ -133,6 +133,19 @@ func (p *Parser) parseStatement() (Statement, error) {
 	if p.isWithStart() {
 		return p.parseWithStatement()
 	}
+	// LISTEN, UNLISTEN, and NOTIFY are contextual keywords: they remain valid
+	// identifiers in expressions and only denote a statement at the start of a
+	// statement. That keeps existing columns named "notify" working.
+	if p.curTokenIs(lexer.TokenIdent) {
+		switch strings.ToUpper(p.curToken.Literal) {
+		case "LISTEN":
+			return p.parseListen()
+		case "UNLISTEN":
+			return p.parseUnlisten()
+		case "NOTIFY":
+			return p.parseNotify()
+		}
+	}
 	switch p.curToken.Type {
 	case lexer.TokenSELECT:
 		return p.parseSelect()
@@ -2093,6 +2106,67 @@ func (p *Parser) parseExplain() (*ExplainStmt, error) {
 }
 
 // Transaction statement parsing
+
+// parseChannelName consumes a channel identifier. PostgreSQL channel names are
+// identifiers (quoted or unquoted) and are limited to 63 bytes, matching
+// NAMEDATALEN - 1.
+func (p *Parser) parseChannelName() (string, error) {
+	if !p.curTokenIs(lexer.TokenIdent) {
+		return "", p.curError("expected channel name")
+	}
+	channel := p.curToken.Literal
+	if channel == "" {
+		return "", p.curError("channel name cannot be empty")
+	}
+	if len(channel) > 63 {
+		return "", p.curError("channel name is longer than 63 bytes")
+	}
+	p.nextToken()
+	return channel, nil
+}
+
+func (p *Parser) parseListen() (*ListenStmt, error) {
+	p.nextToken() // consume LISTEN
+	channel, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	return &ListenStmt{Channel: channel}, nil
+}
+
+func (p *Parser) parseUnlisten() (*UnlistenStmt, error) {
+	p.nextToken() // consume UNLISTEN
+	if p.curTokenIs(lexer.TokenStar) {
+		p.nextToken()
+		return &UnlistenStmt{All: true}, nil
+	}
+	channel, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	return &UnlistenStmt{Channel: channel}, nil
+}
+
+func (p *Parser) parseNotify() (*NotifyStmt, error) {
+	p.nextToken() // consume NOTIFY
+	channel, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &NotifyStmt{Channel: channel}
+	if p.curTokenIs(lexer.TokenComma) {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenString) {
+			return nil, p.curError("expected notification payload string")
+		}
+		if len(p.curToken.Literal) > 8000 {
+			return nil, p.curError("notification payload is longer than 8000 bytes")
+		}
+		stmt.Payload = p.curToken.Literal
+		p.nextToken()
+	}
+	return stmt, nil
+}
 
 func (p *Parser) parseBegin() (*BeginStmt, error) {
 	stmt := &BeginStmt{}

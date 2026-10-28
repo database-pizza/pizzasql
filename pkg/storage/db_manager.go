@@ -10,6 +10,10 @@ type DatabaseInstance struct {
 	Name   string
 	Schema *SchemaManager
 	Table  *TableManager
+	// Hub is the shared LISTEN/NOTIFY channel registry for this database. All
+	// connections to the same database instance publish and subscribe through
+	// the same hub; separate instances (tenants) are fully isolated.
+	Hub *Hub
 }
 
 // DatabaseManager manages multiple database instances.
@@ -89,6 +93,7 @@ func (dm *DatabaseManager) getOrCreateDatabase(name string) *DatabaseInstance {
 		Name:   name,
 		Schema: schema,
 		Table:  table,
+		Hub:    NewHub(),
 	}
 
 	dm.databases[name] = db

@@ -14,6 +14,7 @@ type Result struct {
 	RowsAffected int64           // Number of rows affected (for INSERT/UPDATE/DELETE)
 	LastInsertID int64           // Last insert ID (for INSERT with AUTOINCREMENT)
 	CommandTag   string          // Command type (SELECT, INSERT, UPDATE, DELETE, etc.)
+	LSN          uint64          // Commit LSN for a committed transaction (0 when none)
 }
 
 // NewResult creates a new empty result.
