@@ -1,7 +1,10 @@
 package executor
 
 import (
+	"errors"
 	"testing"
+
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 )
 
 // TestGoatCounterSQLiteMigrations runs the shapes of GoatCounter's SQLite
@@ -82,8 +85,12 @@ func TestGoatCounterMigrationRebuildShape(t *testing.T) {
 		user_id INTEGER PRIMARY KEY AUTOINCREMENT,
 		site_id INTEGER NOT NULL,
 		email VARCHAR NOT NULL,
-		last_report_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+		last_report_at TIMESTAMP NOT NULL DEFAULT ''
 	)`)
+	// GoatCounter's real migration declares DEFAULT current_timestamp. That is
+	// rejected (see TestGoatCounterMigrationRejectsFrozenTimestampDefault), so
+	// this rebuild-shape test uses a constant default to keep exercising the
+	// copy/drop/rename/index steps.
 	execMust(t, e, `INSERT INTO users2 (user_id, site_id, email)
 		SELECT user_id, site_id, email FROM users`)
 	execMust(t, e, "DROP TABLE users")
@@ -98,6 +105,25 @@ func TestGoatCounterMigrationRebuildShape(t *testing.T) {
 	// Case-insensitive uniqueness across the composite expression index.
 	if _, err := execSQL(e, "INSERT INTO users (site_id, email) VALUES (1, 'a@x.com')"); err == nil {
 		t.Fatal("expected composite expression unique index to reject a duplicate")
+	}
+}
+
+// TestGoatCounterMigrationRejectsFrozenTimestampDefault records the deliberate
+// break: the GoatCounter schema uses a non-constant timestamp default, which the
+// engine now rejects instead of freezing at DDL time. A fresh GoatCounter tenant
+// cannot be bootstrapped until that schema is changed or a legacy import mode is
+// designed.
+func TestGoatCounterMigrationRejectsFrozenTimestampDefault(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	_, err := execSQL(e, `CREATE TABLE users2 (
+		user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		site_id INTEGER NOT NULL,
+		email VARCHAR NOT NULL,
+		last_report_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+	)`)
+	if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+		t.Fatalf("error = %v, want ErrFeatureNotSupported", err)
 	}
 }
 

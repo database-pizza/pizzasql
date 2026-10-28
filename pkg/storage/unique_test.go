@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -74,6 +75,30 @@ func TestUniqueIndexEnforcesOnInsert(t *testing.T) {
 	// A distinct value still works.
 	if err := tables.Insert("t", Row{"id": int64(2), "email": "b@x"}); err != nil {
 		t.Fatalf("distinct email should succeed: %v", err)
+	}
+}
+
+func TestUniqueViolationErrorCarriesConstraint(t *testing.T) {
+	schemas, tables := uniqueTable(t,
+		Column{Name: "id", Type: "INTEGER", PrimaryKey: true},
+		Column{Name: "email", Type: "TEXT"},
+	)
+	if err := schemas.CreateIndex(&Index{Name: "uq_email", Table: "t", Unique: true, Columns: []IndexColumn{{Name: "email"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tables.Insert("t", Row{"id": int64(1), "email": "a@x"}); err != nil {
+		t.Fatal(err)
+	}
+	err := tables.Insert("t", Row{"id": int64(2), "email": "a@x"})
+	var violation *UniqueViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("error %v is not a *UniqueViolationError", err)
+	}
+	if violation.Constraint != "uq_email" {
+		t.Fatalf("constraint = %q, want uq_email", violation.Constraint)
+	}
+	if err.Error() != "UNIQUE constraint failed: uq_email" {
+		t.Fatalf("message = %q, want UNIQUE constraint failed: uq_email", err.Error())
 	}
 }
 
