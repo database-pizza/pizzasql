@@ -67,7 +67,8 @@ func TestAlterTableAddColumnIfNotExistsConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := execSQL(e, "ALTER TABLE t ADD COLUMN IF NOT EXISTS c TEXT"); err != nil {
+			session := newExec(schema, table)
+			if _, err := execSQL(session, "ALTER TABLE t ADD COLUMN IF NOT EXISTS c TEXT"); err != nil {
 				t.Errorf("add column: %v", err)
 			}
 		}()

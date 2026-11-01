@@ -143,13 +143,14 @@ func TestRowIDUniqueAndMonotonicUnderConcurrentInsert(t *testing.T) {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
+			session := newExec(schema, table)
 			for i := 0; i < perWorker; i++ {
 				id := strconv.Itoa(worker*perWorker + i + 1)
-				if _, err := execSQL(e, "INSERT INTO t (id, v) VALUES ("+id+", 'x')"); err != nil {
+				if _, err := execSQL(session, "INSERT INTO t (id, v) VALUES ("+id+", 'x')"); err != nil {
 					t.Errorf("insert %s: %v", id, err)
 					return
 				}
-				res, err := execSQL(e, "SELECT _rowid_ FROM t WHERE id = "+id)
+				res, err := execSQL(session, "SELECT _rowid_ FROM t WHERE id = "+id)
 				if err != nil {
 					t.Errorf("select %s: %v", id, err)
 					return

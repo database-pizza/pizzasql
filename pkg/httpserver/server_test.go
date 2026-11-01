@@ -519,7 +519,11 @@ func TestTransactionEndpoints(t *testing.T) {
 	}
 
 	// Test COMMIT transaction
-	r = httptest.NewRequest(http.MethodPost, "/transaction/commit", nil)
+	body, err := json.Marshal(TransactionRequest{TransactionID: beginResp["transactionId"].(string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = httptest.NewRequest(http.MethodPost, "/transaction/commit", bytes.NewReader(body))
 	w = httptest.NewRecorder()
 	server.handleTransactionCommit(w, r)
 
@@ -537,9 +541,16 @@ func TestTransactionEndpoints(t *testing.T) {
 	r = httptest.NewRequest(http.MethodPost, "/transaction/begin", nil)
 	w = httptest.NewRecorder()
 	server.handleTransactionBegin(w, r)
+	if err := json.NewDecoder(w.Body).Decode(&beginResp); err != nil {
+		t.Fatal(err)
+	}
+	body, err = json.Marshal(TransactionRequest{TransactionID: beginResp["transactionId"].(string)})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Test ROLLBACK transaction
-	r = httptest.NewRequest(http.MethodPost, "/transaction/rollback", nil)
+	r = httptest.NewRequest(http.MethodPost, "/transaction/rollback", bytes.NewReader(body))
 	w = httptest.NewRecorder()
 	server.handleTransactionRollback(w, r)
 
