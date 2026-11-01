@@ -53,11 +53,12 @@ type scan struct {
 
 // Server is an in-memory KV server.
 type Server struct {
-	mu       sync.Mutex
-	data     map[string][]byte
-	lsns     map[string]uint64
-	nextLSN  uint64
-	requests map[uint16]int
+	mu               sync.Mutex
+	data             map[string][]byte
+	lsns             map[string]uint64
+	nextLSN          uint64
+	requests         map[uint16]int
+	dropCompareReply bool
 
 	ln       net.Listener
 	wg       sync.WaitGroup
@@ -134,10 +135,27 @@ func (s *Server) handle(conn net.Conn) {
 			return
 		}
 		body := s.execute(opcode, payload)
+		s.mu.Lock()
+		drop := opcode == opCompareBatch && s.dropCompareReply
+		if drop {
+			s.dropCompareReply = false
+		}
+		s.mu.Unlock()
+		if drop {
+			return
+		}
 		if _, err := conn.Write(encodeResponse(opcode, requestID, body)); err != nil {
 			return
 		}
 	}
+}
+
+// DropNextCompareReply commits the next compare request but closes its connection
+// before replying, simulating an ambiguous durable write outcome.
+func (s *Server) DropNextCompareReply() {
+	s.mu.Lock()
+	s.dropCompareReply = true
+	s.mu.Unlock()
 }
 
 // RequestCount reports observed PKBFI requests for bounded-work assertions.

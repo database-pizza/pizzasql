@@ -196,24 +196,14 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 	// durable rows. This runs under the exclusive gate acquired above, so it
 	// cannot race a concurrent writer. Duplicate unique values fail the commit
 	// with a "UNIQUE constraint failed" error rather than ErrSerialization.
+	uniquePlans := make(map[string]uniqueCachePlan, len(uniqueTables))
 	for t := range uniqueTables {
-		entries := s.overlay[t]
-		pending := make([]Row, 0, len(entries))
-		// Exclude every overlay data key: rows being written, updated, or deleted
-		// are all replaced by this transaction, so their durable unique values
-		// must not self-conflict with the staged state (e.g. delete a row and
-		// re-insert the same primary key with a different rowid).
-		excluded := make(map[string]bool, len(entries))
-		for key, e := range entries {
-			excluded[key] = true
-			if !e.absent {
-				pending = append(pending, e.row)
-			}
-		}
-		if err := s.table.validateUniqueRows(t, pending, excluded); err != nil {
+		plan, err := s.table.prepareUniqueRows(t, s.overlay[t])
+		if err != nil {
 			s.resetLocked()
 			return 0, err
 		}
+		uniquePlans[t] = plan
 	}
 
 	// Build the compare set from every observed key.
@@ -255,6 +245,13 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		committed = ok
 		return err
 	})
+	if err != nil || !committed {
+		// A transport error can hide a durable commit; a compare conflict can
+		// also expose an out-of-band writer. Rebuild derived state next time.
+		for table := range s.overlay {
+			s.table.invalidateWriteFailure(table)
+		}
+	}
 	if err != nil {
 		s.resetLocked()
 		return 0, err
@@ -266,7 +263,8 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 
 	// Advance generations and invalidate derived caches for written tables.
 	for t := range s.overlay {
-		s.table.InvalidateCache(t)
+		s.table.invalidateCache(t)
+		s.table.applyUniquePlan(uniquePlans[t], nil)
 		s.table.bumpIndexPredicateWildcard(t)
 		s.table.bumpGeneration(t)
 	}

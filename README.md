@@ -539,6 +539,14 @@ CREATE UNIQUE INDEX idx_users_email ON users(email);
 DROP INDEX idx_users_email;
 ```
 
+Column-based UNIQUE constraints build a derived ownership cache once from durable
+rows, then validate and update it under the table's exclusive publication gate.
+Changes are prepared before commit and published only after durable success.
+Rollback, compare failure, DDL, restart, and ambiguous transport errors never
+leave speculative ownership entries. NULL-bearing keys remain exempt; composite
+keys use the constraint encoder, not the SELECT candidate encoder. Expression
+UNIQUE constraints retain scan validation until evaluator determinism is proven.
+
 **PRAGMA:**
 ```sql
 PRAGMA table_info(users);

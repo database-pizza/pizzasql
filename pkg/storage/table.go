@@ -32,6 +32,7 @@ type TableManager struct {
 	database string
 
 	cacheMu     sync.RWMutex
+	uniqueCache map[string]*uniqueIndexCache
 	indexCache  map[string]map[string][]int64 // index name → indexed value → rowids
 	indexTable  map[string]string             // index name → table name
 	rowKeyCache map[string]map[int64]string   // table name → rowid → primary key
@@ -90,6 +91,7 @@ func NewTableManager(pool *KVPool, schema *SchemaManager, database string) *Tabl
 		pool:                 pool,
 		schema:               schema,
 		database:             database,
+		uniqueCache:          make(map[string]*uniqueIndexCache),
 		indexCache:           make(map[string]map[string][]int64),
 		indexTable:           make(map[string]string),
 		rowKeyCache:          make(map[string]map[int64]string),
@@ -219,6 +221,13 @@ func (m *TableManager) invalidateCache(table string) {
 // InvalidateCache is the exported version for use by the executor.
 func (m *TableManager) InvalidateCache(table string) {
 	m.invalidateCache(table)
+	m.cacheMu.Lock()
+	for name, cache := range m.uniqueCache {
+		if cache.table == strings.ToLower(table) {
+			delete(m.uniqueCache, name)
+		}
+	}
+	m.cacheMu.Unlock()
 }
 
 // rowVisitFunc is invoked for each decoded row in a streaming scan. Return
@@ -575,8 +584,10 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	defer unlock()
+	var uniquePlan uniqueCachePlan
 	if uniq {
-		if err := m.validateUniqueRows(table, []Row{nr}, nil); err != nil {
+		uniquePlan, err = m.prepareUniqueRows(table, map[string]*overlayEntry{key: {row: nr}})
+		if err != nil {
 			return 0, err
 		}
 	}
@@ -588,12 +599,14 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		[]BatchOp{{Op: batchPut, Key: []byte(key), Value: data}},
 	)
 	if err != nil {
+		m.invalidateWriteFailure(table)
 		return 0, err
 	}
 	if !committed {
 		return 0, fmt.Errorf("duplicate primary key: %v", row[schemaPrimaryKey(m.schema, table)])
 	}
 
+	m.applyUniquePlan(uniquePlan, nil)
 	if err := m.updateIndexesForRow(table, nr, true); err != nil {
 		return 0, err
 	}
@@ -800,8 +813,20 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 		}
 	}
 
-	if err := m.validateUniqueRows(table, encoded, nil); err != nil {
+	var uniquePlan uniqueCachePlan
+	unique, err := m.hasUniqueIndex(table)
+	if err != nil {
 		return 0, 0, err
+	}
+	if unique {
+		uniqueEntries := make(map[string]*overlayEntry, len(encoded))
+		for i, row := range encoded {
+			uniqueEntries[string(ops[i].Key)] = &overlayEntry{row: row}
+		}
+		uniquePlan, err = m.prepareUniqueRows(table, uniqueEntries)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 
 	// Write rows in atomic BATCH_WRITE chunks. Maintain in-memory indexes only
@@ -823,6 +848,13 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 		numOK += len(chunk)
 	}
 	// Maintain indexes for the rows that persisted (the first numOK ops).
+	if len(uniquePlan) != 0 {
+		accepted := make(map[string]bool, numOK)
+		for i := 0; i < numOK; i++ {
+			accepted[string(ops[i].Key)] = true
+		}
+		m.applyUniquePlan(uniquePlan, accepted)
+	}
 	for i := 0; i < numOK; i++ {
 		if err := m.updateIndexesForRow(table, encoded[i], true); err != nil {
 			return numOK, 0, err
@@ -835,6 +867,9 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 		}
 	}
 	m.incrCount(table, schema.CreatedAt, numOK, wasInit)
+	if firstErr != nil {
+		m.invalidateWriteFailure(table)
+	}
 
 	var lastRowID int64
 	if numOK > 0 {
@@ -1057,8 +1092,10 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 	if err != nil {
 		return nil, false, err
 	}
+	var uniquePlan uniqueCachePlan
 	if uniq {
-		if err := m.validateUniqueRows(table, []Row{row}, excludedKey(key)); err != nil {
+		uniquePlan, err = m.prepareUniqueRows(table, map[string]*overlayEntry{key: {row: row}})
+		if err != nil {
 			return nil, false, err
 		}
 	}
@@ -1067,12 +1104,14 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 		[]BatchOp{{Op: batchPut, Key: []byte(key), Value: data}},
 	)
 	if err != nil {
+		m.invalidateWriteFailure(table)
 		return nil, false, err
 	}
 	if !committed {
 		return nil, false, ErrSerialization
 	}
 
+	m.applyUniquePlan(uniquePlan, nil)
 	if err := m.updateIndexesForRow(table, oldRow, false); err != nil {
 		return nil, false, err
 	}
@@ -1133,12 +1172,14 @@ func (m *TableManager) DeleteByPK(table, pk string) (Row, bool, error) {
 		[]BatchOp{{Op: batchDelete, Key: []byte(key)}},
 	)
 	if err != nil {
+		m.invalidateWriteFailure(table)
 		return nil, false, err
 	}
 	if !committed {
 		return nil, false, ErrSerialization
 	}
 
+	m.removeUniqueKey(table, key)
 	if err := m.updateIndexesForRow(table, row, false); err != nil {
 		return nil, false, err
 	}
@@ -1449,6 +1490,7 @@ func (m *TableManager) ClearIndex(indexName, tableName string, columns []string)
 	m.cacheMu.Lock()
 	delete(m.indexCache, indexKey)
 	delete(m.indexTable, indexKey)
+	delete(m.uniqueCache, indexKey)
 	m.disabledIndexes[indexKey] = true
 	rowKeysNeeded := false
 	for _, indexedTable := range m.indexTable {
@@ -1681,98 +1723,6 @@ func encodeIntegralFloat(v float64) (string, bool) {
 		return "", false
 	}
 	return "i" + strconv.FormatInt(int64(v), 10), true
-}
-
-// validateUniqueRows checks that pending rows do not conflict with one another or
-// with durable rows on any UNIQUE index. excludedKeys lists the actual durable
-// data keys whose rows are being replaced in this operation (delete, or an update
-// of a non-indexed column), so those rows' own unique values do not self-conflict
-// and swapping two unique values remains possible. Matching is done against the
-// raw scanned KV key rather than a re-stringified primary key, so numeric and
-// composite keys are unambiguous. The caller must hold the table's exclusive gate.
-func (m *TableManager) validateUniqueRows(table string, pending []Row, excludedKeys map[string]bool) error {
-	indexes, err := m.uniqueIndexes(table)
-	if err != nil {
-		return err
-	}
-	if len(indexes) == 0 {
-		return nil
-	}
-
-	// seen tracks, per unique index, the encoded values already claimed by the
-	// pending rows. Keying by index name (not just the encoded value) is essential:
-	// a single row can legitimately carry the same value in two different unique
-	// indexes (e.g. name and lower_name both "alice"), which must not collide with
-	// itself. Two rows only conflict when they share a value within the SAME index.
-	seen := make(map[string]map[string]bool, len(indexes))
-	for _, row := range pending {
-		for _, idx := range indexes {
-			encoded, isNull, err := m.encodeUniqueValue(row, idx.Columns)
-			if err != nil {
-				return err
-			}
-			if isNull {
-				continue
-			}
-			perIndex := seen[idx.Name]
-			if perIndex == nil {
-				perIndex = make(map[string]bool)
-				seen[idx.Name] = perIndex
-			}
-			if perIndex[encoded] {
-				return &UniqueViolationError{Constraint: idx.Name}
-			}
-			perIndex[encoded] = true
-		}
-	}
-
-	return m.pool.WithClient(func(client *KVClient) (retErr error) {
-		cursor, err := client.ScanWithLimit([]byte(m.dataPrefix(table)), scanPageSize)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := cursor.Close(); retErr == nil {
-				retErr = err
-			}
-		}()
-		for {
-			entries, done, err := cursor.Next()
-			if err != nil {
-				return err
-			}
-			for _, e := range entries {
-				if excludedKeys != nil && excludedKeys[string(e.Key)] {
-					continue
-				}
-				row, err := decodeRow(e.Value)
-				if err != nil {
-					return err
-				}
-				for _, idx := range indexes {
-					encoded, isNull, encErr := m.encodeUniqueValue(row, idx.Columns)
-					if encErr != nil {
-						return encErr
-					}
-					if isNull {
-						continue
-					}
-					if perIndex := seen[idx.Name]; perIndex != nil && perIndex[encoded] {
-						return &UniqueViolationError{Constraint: idx.Name}
-					}
-				}
-			}
-			if done {
-				return nil
-			}
-		}
-	})
-}
-
-// excludedKey returns the exclusion set that exempts a single row's durable value
-// from the uniqueness scan, keyed by its actual durable data key.
-func excludedKey(dataKey string) map[string]bool {
-	return map[string]bool{dataKey: true}
 }
 
 // lockForWrite acquires the table gate appropriate for a point write: exclusive
