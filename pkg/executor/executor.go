@@ -5578,6 +5578,20 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 			result.WriteString(toString(arg))
 		}
 		return result.String(), nil
+	case "CONCAT_WS":
+		// PostgreSQL semantics: a NULL separator yields NULL; NULL arguments are
+		// skipped rather than converted to empty strings.
+		if len(args) == 0 || args[0] == nil {
+			return nil, nil
+		}
+		separator := toString(args[0])
+		parts := make([]string, 0, len(args)-1)
+		for _, arg := range args[1:] {
+			if arg != nil {
+				parts = append(parts, toString(arg))
+			}
+		}
+		return strings.Join(parts, separator), nil
 
 	// Date/Time functions
 	case "DATE":
@@ -5602,6 +5616,8 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		return SQLiteCompatVersion, nil
 	case "LAST_INSERT_ROWID":
 		return e.lastInsertRowID, nil
+	case "PG_BACKEND_PID":
+		return int64(e.backendPID), nil
 	case "CHANGES":
 		return e.changes, nil
 	case "TOTAL_CHANGES":
@@ -6238,6 +6254,48 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		}
 		return sum, nil
 
+	case "STRING_AGG":
+		if len(fn.Args) == 0 {
+			return nil, fmt.Errorf("STRING_AGG requires at least one argument")
+		}
+		separator := ""
+		if len(fn.Args) > 1 && len(rows) > 0 {
+			sep, err := e.evalExpr(fn.Args[1], rows[0])
+			if err != nil {
+				return nil, err
+			}
+			if sep == nil {
+				return nil, nil
+			}
+			separator = toString(sep)
+		}
+		var seen map[string]struct{}
+		if fn.Distinct {
+			seen = make(map[string]struct{})
+		}
+		var parts []string
+		for _, row := range rows {
+			val, err := e.evalExpr(fn.Args[0], row)
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				continue
+			}
+			text := toString(val)
+			if fn.Distinct {
+				if _, exists := seen[text]; exists {
+					continue
+				}
+				seen[text] = struct{}{}
+			}
+			parts = append(parts, text)
+		}
+		if len(parts) == 0 {
+			return nil, nil
+		}
+		return strings.Join(parts, separator), nil
+
 	case "GROUP_CONCAT":
 		if len(fn.Args) == 0 {
 			return nil, fmt.Errorf("GROUP_CONCAT requires at least one argument")
@@ -6324,7 +6382,7 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 // evaluators.
 func isAggregateCallName(name string) bool {
 	switch strings.ToUpper(name) {
-	case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
+	case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT", "STRING_AGG",
 		"JSON_GROUP_ARRAY", "JSONB_GROUP_ARRAY":
 		return true
 	default:

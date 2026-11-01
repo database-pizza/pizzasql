@@ -518,6 +518,38 @@ func evalJSONFunction(name string, args []interface{}) (interface{}, bool, error
 		}
 		return jsonText(s), true, nil
 
+	case "JSON_ARRAY_LENGTH":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, true, fmt.Errorf("wrong number of arguments to json_array_length()")
+		}
+		if args[0] == nil {
+			return nil, true, nil
+		}
+		node, err := jsonInput(args[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if len(args) == 2 {
+			path, ok := jsonPathArg(args[1])
+			if !ok {
+				return nil, true, fmt.Errorf("JSON path error")
+			}
+			segs, err := parseJSONPath(path)
+			if err != nil {
+				return nil, true, err
+			}
+			found, ok := jsonLookup(node, segs)
+			if !ok {
+				return nil, true, nil
+			}
+			node = found
+		}
+		if array, ok := node.([]interface{}); ok {
+			return int64(len(array)), true, nil
+		}
+		// SQLite's JSON1 reports zero for a valid non-array document.
+		return int64(0), true, nil
+
 	case "JSON_ARRAY", "JSONB_ARRAY":
 		arr := make([]interface{}, len(args))
 		for i, a := range args {
