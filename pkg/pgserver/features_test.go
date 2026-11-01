@@ -74,6 +74,18 @@ func dataRowValues(t *testing.T, msg *Message) []string {
 	return values
 }
 
+// A durable implicit commit may report its LSN between result completion and
+// ReadyForQuery. Keep result-shape assertions independent of status updates.
+func resultMessages(messages []*Message) []*Message {
+	var result []*Message
+	for _, message := range messages {
+		if message.Type != MsgParameterStatus {
+			result = append(result, message)
+		}
+	}
+	return result
+}
+
 // commandTag extracts the NUL-terminated tag from a CommandComplete message.
 func commandTag(t *testing.T, msg *Message) string {
 	t.Helper()
@@ -87,7 +99,7 @@ func TestSimpleQueryInsertReturning(t *testing.T) {
 	c, client := newDataConnection(t)
 	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)"), 0)})
 
-	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("INSERT INTO t (name) VALUES ('alice') RETURNING id, name"), 0)})
+	msgs := resultMessages(runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("INSERT INTO t (name) VALUES ('alice') RETURNING id, name"), 0)}))
 	if len(msgs) != 4 {
 		t.Fatalf("got %d messages, want RowDescription+DataRow+CommandComplete+ReadyForQuery: %v", len(msgs), msgs)
 	}
@@ -139,7 +151,7 @@ func TestCommandTagSelectAndUpdate(t *testing.T) {
 		t.Fatalf("select tag = %q", tag)
 	}
 
-	msgs = runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("UPDATE t SET v='b' RETURNING id"), 0)})
+	msgs = resultMessages(runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("UPDATE t SET v='b' RETURNING id"), 0)}))
 	if msgs[0].Type != MsgRowDescription {
 		t.Fatalf("update returning first message = %c", msgs[0].Type)
 	}

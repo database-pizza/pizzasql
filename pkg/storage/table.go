@@ -1002,94 +1002,21 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 	return m.updateLocked(table, updateFn, filter)
 }
 
-// updateLocked is the shared scan-based update implementation. It applies
-// per-row updates, revalidates unique indexes, and moves a row when its primary
-// key changes (deleting the old key and refusing to overwrite an occupied new
-// key) so an UPDATE of the primary key does not orphan or clobber rows.
+// updateLocked stages the complete update before one compare-batch publication.
+// Evaluation, encoding, validation or I/O errors must never leave earlier rows
+// committed, including when a primary key moves to a different durable key.
 func (m *TableManager) updateLocked(table string, updateFn func(Row) (Row, error), filter func(Row) bool) (int, error) {
-	tl := m.tableLock(strings.ToLower(table))
-	tl.Lock()
-	defer tl.Unlock()
-	rows, err := m.selectRows(table, filter)
+	session := NewSession(m.schema, m)
+	if err := session.Begin(); err != nil {
+		return 0, err
+	}
+	defer session.Rollback()
+	count, err := session.UpdateFunc(table, updateFn, filter)
 	if err != nil {
 		return 0, err
 	}
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
+	if err := session.Commit(); err != nil {
 		return 0, err
-	}
-
-	count := 0
-	for _, row := range rows {
-		oldRow := cloneRow(row)
-		oldKey := m.dataKey(table, fmt.Sprintf("%v", oldRow[schema.PrimaryKey]))
-		if err := m.updateIndexesForRow(table, row, false); err != nil {
-			return count, err
-		}
-
-		updates, err := updateFn(row)
-		if err != nil {
-			_ = m.updateIndexesForRow(table, oldRow, true)
-			return count, err
-		}
-		for k, v := range updates {
-			for _, col := range schema.Columns {
-				if strings.EqualFold(k, col.Name) {
-					row[col.Name] = v
-					break
-				}
-			}
-		}
-
-		newKey := m.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
-		data, err := encodeRow(row)
-		if err != nil {
-			_ = m.updateIndexesForRow(table, oldRow, true)
-			continue
-		}
-
-		excluded := map[string]bool{oldKey: true}
-		if err := m.validateUniqueRows(table, []Row{row}, excluded); err != nil {
-			_ = m.updateIndexesForRow(table, oldRow, true)
-			return count, err
-		}
-
-		if newKey != oldKey {
-			// Refuse to move onto an existing primary key.
-			if _, _, gerr := m.getByPKWithLSN(table, fmt.Sprintf("%v", row[schema.PrimaryKey])); gerr == nil {
-				_ = m.updateIndexesForRow(table, oldRow, true)
-				return count, fmt.Errorf("duplicate primary key: %v", row[schema.PrimaryKey])
-			} else if gerr != ErrKeyNotFound {
-				_ = m.updateIndexesForRow(table, oldRow, true)
-				return count, gerr
-			}
-			if err := m.pool.WithClient(func(c *KVClient) error {
-				_, derr := c.Del([]byte(oldKey))
-				return derr
-			}); err != nil {
-				_ = m.updateIndexesForRow(table, oldRow, true)
-				continue
-			}
-		}
-
-		if err := m.pool.WithClient(func(c *KVClient) error {
-			_, perr := c.Put([]byte(newKey), data)
-			return perr
-		}); err != nil {
-			_ = m.updateIndexesForRow(table, oldRow, true)
-			continue
-		}
-		if err := m.updateIndexesForRow(table, row, true); err != nil {
-			return count, err
-		}
-		if err := m.bumpIndexPredicates(table, oldRow, row); err != nil {
-			return count, err
-		}
-		count++
-	}
-
-	if count > 0 {
-		m.bumpGeneration(table)
 	}
 	return count, nil
 }
@@ -1170,49 +1097,18 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 
 // Delete deletes rows matching the filter.
 func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) {
-	tl := m.tableLock(strings.ToLower(table))
-	tl.Lock()
-	defer tl.Unlock()
-	rows, err := m.selectRows(table, filter)
+	session := NewSession(m.schema, m)
+	if err := session.Begin(); err != nil {
+		return 0, err
+	}
+	defer session.Rollback()
+	count, err := session.Delete(table, filter)
 	if err != nil {
 		return 0, err
 	}
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
+	if err := session.Commit(); err != nil {
 		return 0, err
 	}
-	wasInit := m.countInitialized(table)
-
-	count := 0
-	for _, row := range rows {
-		// Remove index entries before deleting row
-		if err := m.updateIndexesForRow(table, row, false); err != nil {
-			return count, err
-		}
-
-		pkValue := row[schema.PrimaryKey]
-		pk := fmt.Sprintf("%v", pkValue)
-		key := m.dataKey(table, pk)
-
-		err = m.pool.WithClient(func(c *KVClient) error {
-			_, err := c.Del([]byte(key))
-			return err
-		})
-		if err == nil {
-			if err := m.bumpIndexPredicates(table, row); err != nil {
-				return count, err
-			}
-			count++
-		} else {
-			// Restore the index entries removed above.
-			_ = m.updateIndexesForRow(table, row, true)
-		}
-	}
-
-	if count > 0 {
-		m.bumpGeneration(table)
-	}
-	m.incrCount(table, schema.CreatedAt, -count, wasInit)
 	return count, nil
 }
 

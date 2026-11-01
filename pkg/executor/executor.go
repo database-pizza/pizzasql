@@ -255,11 +255,20 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	case *parser.SelectStmt:
 		return e.executeSelect(s)
 	case *parser.InsertStmt:
-		return e.executeInsert(s)
+		if len(s.Returning) == 0 {
+			return e.executeInsert(s)
+		}
+		return e.executeAtomicMutation(func() (*Result, error) { return e.executeInsert(s) })
 	case *parser.UpdateStmt:
-		return e.executeUpdate(s)
+		if len(s.Returning) == 0 && e.isPointMutation(s.Table.Name, s.Where, s.Set) {
+			return e.executeUpdate(s)
+		}
+		return e.executeAtomicMutation(func() (*Result, error) { return e.executeUpdate(s) })
 	case *parser.DeleteStmt:
-		return e.executeDelete(s)
+		if len(s.Returning) == 0 && e.isPointMutation(s.Table.Name, s.Where, nil) {
+			return e.executeDelete(s)
+		}
+		return e.executeAtomicMutation(func() (*Result, error) { return e.executeDelete(s) })
 	case *parser.CreateTableStmt:
 		return e.executeCreateTable(s)
 	case *parser.DropTableStmt:
@@ -2968,8 +2977,13 @@ func (e *Executor) runDMLAtomic(tableName string, apply func() error) error {
 // transaction even when the table has no UNIQUE index. INSERT OR REPLACE needs
 // it because a primary-key replacement must delete and insert atomically.
 func (e *Executor) runDMLAtomicForce(tableName string, force bool, apply func() error) error {
-	if e.inTransaction {
-		return apply()
+	if e.session.InTx() {
+		pos := e.session.Snapshot()
+		if err := apply(); err != nil {
+			e.session.RollbackTo(pos)
+			return err
+		}
+		return nil
 	}
 	uniq, err := e.table.HasUniqueIndex(tableName)
 	if err != nil {
@@ -2986,6 +3000,54 @@ func (e *Executor) runDMLAtomicForce(tableName string, force bool, apply func() 
 		return err
 	}
 	return e.session.Commit()
+}
+
+// executeAtomicMutation includes evaluation and RETURNING in the statement's
+// atomic boundary. Nested calls use mutation-log savepoints, not nested commits.
+func (e *Executor) executeAtomicMutation(apply func() (*Result, error)) (*Result, error) {
+	owned := !e.session.InTx()
+	if owned {
+		if err := e.session.Begin(); err != nil {
+			return nil, err
+		}
+	}
+	pos := e.session.Snapshot()
+	changes, total, last := e.changes, e.totalChanges, e.lastInsertRowID
+	result, err := apply()
+	if err == nil && owned {
+		var lsn uint64
+		lsn, err = e.session.CommitWithLSN()
+		if err == nil {
+			result.LSN = lsn
+		}
+	}
+	if err != nil {
+		if owned {
+			_ = e.session.Rollback()
+		} else {
+			e.session.RollbackTo(pos)
+		}
+		e.changes, e.totalChanges, e.lastInsertRowID = changes, total, last
+		return nil, err
+	}
+	return result, nil
+}
+
+func (e *Executor) isPointMutation(table string, where parser.Expr, assignments []parser.Assignment) bool {
+	column, value, equality := e.extractIndexableCondition(where)
+	if !equality || !safePrimaryKeyLiteral(value) {
+		return false
+	}
+	schema, err := e.schema.GetSchema(table)
+	if err != nil || !strings.EqualFold(column, schema.PrimaryKey) {
+		return false
+	}
+	for _, assignment := range assignments {
+		if strings.EqualFold(assignment.Column, schema.PrimaryKey) {
+			return false
+		}
+	}
+	return true
 }
 
 func containsFold(values []string, target string) bool {
@@ -3096,12 +3158,14 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return e.executeUpdateFrom(stmt, schema)
 	}
 
-	// Build filter
+	// Keep predicate errors inside the statement rollback boundary.
+	var filterErr error
 	var filter func(storage.Row) bool
 	if stmt.Where != nil {
 		filter = func(row storage.Row) bool {
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
+				filterErr = err
 				return false
 			}
 			return toBool(val)
@@ -3153,7 +3217,7 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 				break
 			}
 		}
-		if equality && strings.EqualFold(column, schema.PrimaryKey) && !updatesPrimaryKey {
+		if equality && safePrimaryKeyLiteral(value) && strings.EqualFold(column, schema.PrimaryKey) && !updatesPrimaryKey {
 			pk := fmt.Sprintf("%v", value)
 			_, updated, err := e.session.UpdateByPK(tableName, pk, updateFn)
 			if err != nil {
@@ -3198,6 +3262,9 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		n, err := e.session.UpdateFunc(tableName, updateFn, filter)
 		if err != nil {
 			return err
+		}
+		if filterErr != nil {
+			return filterErr
 		}
 		count = n
 		return nil
@@ -3481,12 +3548,13 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		return nil, err
 	}
 
-	// Build filter
+	var filterErr error
 	var filter func(storage.Row) bool
 	if stmt.Where != nil {
 		filter = func(row storage.Row) bool {
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
+				filterErr = err
 				return false
 			}
 			return toBool(val)
@@ -3499,7 +3567,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 
 	if stmt.Where != nil {
 		column, value, equality := e.extractIndexableCondition(stmt.Where)
-		if equality && strings.EqualFold(column, schema.PrimaryKey) {
+		if equality && safePrimaryKeyLiteral(value) && strings.EqualFold(column, schema.PrimaryKey) {
 			deletedRow, deleted, err := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", value))
 			if err != nil {
 				return nil, err
@@ -3530,6 +3598,9 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	count, err := e.session.Delete(tableName, filter)
 	if err != nil {
 		return nil, err
+	}
+	if filterErr != nil {
+		return nil, filterErr
 	}
 
 	return e.finishDML("DELETE", count, 0, false, affected, stmt.Returning, schema)
