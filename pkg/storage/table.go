@@ -512,24 +512,6 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 
 	pk := fmt.Sprintf("%v", pkValue)
 
-	for _, col := range schema.Columns {
-		if !col.Nullable && col.Default == nil {
-			val, hasVal := row[col.Name]
-			if !hasVal {
-				for k, v := range row {
-					if strings.EqualFold(k, col.Name) {
-						val = v
-						hasVal = true
-						break
-					}
-				}
-			}
-			if !hasVal || val == nil {
-				return nil, "", fmt.Errorf("missing required column: %s", col.Name)
-			}
-		}
-	}
-
 	normalizedRow := make(Row)
 	for _, col := range schema.Columns {
 		for k, v := range row {
@@ -555,6 +537,9 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 		normalizedRow["_rowid_"] = newRowID
 	}
 
+	if err := validateNotNull(schema, normalizedRow); err != nil {
+		return nil, "", err
+	}
 	return normalizedRow, m.dataKey(table, pk), nil
 }
 
@@ -756,6 +741,9 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 			}
 		}
 		nr["_rowid_"] = rowid
+		if err := validateNotNull(schema, nr); err != nil {
+			return 0, 0, err
+		}
 		if rowid > maxRowID {
 			maxRowID = rowid
 		}
@@ -1062,6 +1050,9 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 		}
 	}
 
+	if err := validateNotNull(schema, row); err != nil {
+		return nil, false, err
+	}
 	data, err := encodeRow(row)
 	if err != nil {
 		return nil, false, err
