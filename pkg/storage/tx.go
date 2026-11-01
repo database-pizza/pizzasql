@@ -206,6 +206,28 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		uniquePlans[t] = plan
 	}
 
+	exclusiveTables := make(map[string]bool)
+	for table := range uniqueTables {
+		exclusiveTables[table] = true
+	}
+	for table := range s.scanGens {
+		exclusiveTables[table] = true
+	}
+	for _, predicate := range s.predicateGens {
+		exclusiveTables[predicate.table] = true
+	}
+	cachePlans := make(map[string]*tableCachePlan)
+	for table, entries := range s.overlay {
+		if exclusiveTables[table] {
+			plan, err := s.table.prepareTableCache(table, entries, s.reads)
+			if err != nil {
+				s.resetLocked()
+				return 0, err
+			}
+			cachePlans[table] = plan
+		}
+	}
+
 	// Build the compare set from every observed key.
 	checks := make([]CompareCheck, 0, len(s.reads))
 	for key, lsn := range s.reads {
@@ -261,9 +283,13 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		return 0, ErrSerialization
 	}
 
-	// Advance generations and invalidate derived caches for written tables.
+	// Publish derived state before generations while retaining the table gates.
 	for t := range s.overlay {
-		s.table.invalidateCache(t)
+		if plan := cachePlans[t]; plan != nil {
+			s.table.applyTableCache(plan)
+		} else {
+			s.table.invalidateCache(t)
+		}
 		s.table.applyUniquePlan(uniquePlans[t], nil)
 		s.table.bumpIndexPredicateWildcard(t)
 		s.table.bumpGeneration(t)
