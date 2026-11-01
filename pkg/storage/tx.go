@@ -451,6 +451,22 @@ func (s *Session) Select(table string, filter func(Row) bool) ([]Row, error) {
 	return s.selectLocked(table, filter)
 }
 
+// SelectLimited bounds an autocommit scan. Explicit transactions retain the
+// complete overlay/read-set behavior until bounded transactional scans have a
+// separate phantom/overlay contract; their caller still applies LIMIT later.
+func (s *Session) SelectLimited(table string, filter func(Row) bool, maxRows int) ([]Row, error) {
+	s.mu.Lock()
+	if s.inTx {
+		defer s.mu.Unlock()
+		return s.selectLocked(table, filter)
+	}
+	s.mu.Unlock()
+	if maxRows == 0 {
+		return []Row{}, nil
+	}
+	return s.table.SelectWithLimit(table, filter, maxRows, 0)
+}
+
 func (s *Session) selectLocked(table string, filter func(Row) bool) ([]Row, error) {
 	schema, err := s.schema.GetSchema(table)
 	if err != nil {

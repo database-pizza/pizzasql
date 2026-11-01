@@ -53,10 +53,11 @@ type scan struct {
 
 // Server is an in-memory KV server.
 type Server struct {
-	mu      sync.Mutex
-	data    map[string][]byte
-	lsns    map[string]uint64
-	nextLSN uint64
+	mu       sync.Mutex
+	data     map[string][]byte
+	lsns     map[string]uint64
+	nextLSN  uint64
+	requests map[uint16]int
 
 	ln       net.Listener
 	wg       sync.WaitGroup
@@ -139,7 +140,20 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
+// RequestCount reports observed PKBFI requests for bounded-work assertions.
+func (s *Server) RequestCount(opcode uint16) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requests[opcode]
+}
+
 func (s *Server) execute(opcode uint16, payload []byte) []byte {
+	s.mu.Lock()
+	if s.requests == nil {
+		s.requests = make(map[uint16]int)
+	}
+	s.requests[opcode]++
+	s.mu.Unlock()
 	switch opcode {
 	case opPing:
 		return statusOKBody(nil)
