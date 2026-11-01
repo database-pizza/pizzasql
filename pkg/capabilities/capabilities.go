@@ -146,7 +146,7 @@ func Current() *Document {
 			SQLiteCompat:   "3.35.0",
 			SimpleQuery:    true,
 			ExtendedQuery:  true,
-			Describe:       Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "use simple query or Parse/Bind/Execute without Describe; no speculative execution for metadata"},
+			Describe:       Feature{Supported: true, Status: "compatibility_no_data", Notes: "statement Describe returns ParameterDescription then NoData; portal Describe returns NoData; Execute still emits the real RowDescription"},
 			BinaryResults:  Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "all-text result formats only; per-column format lists are also rejected"},
 			BoundedExecute: Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "Execute maxRows must be zero; portals are one-shot, not resumable"},
 			ProxyErrors:    true,

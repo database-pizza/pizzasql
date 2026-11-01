@@ -578,8 +578,17 @@ func (c *Connection) handleDescribe(msg *Message) error {
 	}
 	switch msg.Data[0] {
 	case 'S':
-		if _, ok := c.statements[name]; !ok {
+		statement, ok := c.statements[name]
+		if !ok {
 			return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("prepared statement %q does not exist", name))
+		}
+		mb := NewMessageBuilder()
+		mb.WriteInt16(int16(len(statement.paramOIDs)))
+		for _, oid := range statement.paramOIDs {
+			mb.WriteInt32(oid)
+		}
+		if err := c.writeMessage(MsgParameterDescription, mb.Bytes()); err != nil {
+			return err
 		}
 	case 'P':
 		if _, ok := c.portals[name]; !ok {
@@ -588,10 +597,10 @@ func (c *Connection) handleDescribe(msg *Message) error {
 	default:
 		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Describe target"))
 	}
-	// Do not claim NoData for row-producing statements or execute queries to
-	// discover metadata. Clients must avoid Describe until side-effect-free
-	// parameter/row description is implemented.
-	return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("Describe metadata is not supported; use simple query or Parse/Bind/Execute without Describe"))
+	// Row metadata requires analysis without side effects. Return NoData for
+	// compatibility; Execute still emits the real RowDescription. This is the
+	// pre-0.4.0 behavior used by common extended-protocol clients.
+	return c.writeMessage(MsgNoData, nil)
 }
 
 func (c *Connection) handleExecute(msg *Message) error {

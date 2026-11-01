@@ -321,7 +321,7 @@ pgcli postgresql://localhost:5432/pizzasql
    - Use `INTEGER PRIMARY KEY AUTOINCREMENT`, not `SERIAL`
    - Use `TEXT`, not `VARCHAR` with enforced length
 2. **Parameter placeholders**: use `$1, $2...` (PostgreSQL style) or `?` (SQLite style). PG Bind rewrites `$n` only outside quoted regions and line/block comments. Initialization probes such as `SELECT version()` and `SHOW server_version` match complete token sequences, never substrings inside SQL literals or unrelated projections.
-3. **Extended protocol scope**: Parse accepts one command; Bind requests must use text parameters/all-text results. Describe, binary results, and nonzero Execute row limits fail with SQLSTATE `0A000` before executing side effects. Portals are one-shot, not resumable. Unsupported binary parameter OIDs also report `0A000`.
+3. **Extended protocol scope**: Parse accepts one command; Bind requests must use text parameters/all-text results. `Describe` returns `ParameterDescription` then `NoData` without executing anything; `Execute` still sends the real `RowDescription`. Binary results and nonzero Execute row limits fail with SQLSTATE `0A000` before side effects. Portals are one-shot, not resumable. Unsupported binary parameter OIDs also report `0A000`.
 4. **No PostgreSQL-specific features**: no schemas, roles, `ARRAY`, `JSONB`, etc.
 
 ---

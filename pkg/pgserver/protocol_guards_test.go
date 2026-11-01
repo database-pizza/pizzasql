@@ -44,8 +44,6 @@ func TestUnsupportedExtendedRequestsFailBeforeSideEffects(t *testing.T) {
 		{"invalid_result_format", &Message{Type: MsgBind, Data: guardBind(nil, []int16{2})}, ErrCodeProtocolViolation},
 		{"invalid_parameter_format", &Message{Type: MsgBind, Data: guardBind([]int16{2}, nil)}, ErrCodeProtocolViolation},
 		{"parameter_format_count", &Message{Type: MsgBind, Data: guardBind([]int16{0, 0}, nil)}, ErrCodeProtocolViolation},
-		{"describe_statement", &Message{Type: MsgDescribe, Data: []byte{'S', 'q', 0}}, ErrCodeFeatureNotSupported},
-		{"describe_portal", &Message{Type: MsgDescribe, Data: []byte{'P', 'p', 0}}, ErrCodeFeatureNotSupported},
 		{"bounded_execute", &Message{Type: MsgExecute, Data: []byte{'p', 0, 0, 0, 0, 1}}, ErrCodeFeatureNotSupported},
 		{"negative_execute", &Message{Type: MsgExecute, Data: []byte{'p', 0, 255, 255, 255, 255}}, ErrCodeProtocolViolation},
 	} {
@@ -75,12 +73,16 @@ func TestUnsupportedExtendedRequestsFailBeforeSideEffects(t *testing.T) {
 	}
 }
 
-func TestDescribeFailurePreservesFailedTransactionState(t *testing.T) {
+func TestDescribeDoesNotExecuteOrFailTransaction(t *testing.T) {
 	c, conn := guardConnection(t)
 	if err := c.handleMessage(&Message{Type: MsgQuery, Data: []byte("BEGIN\x00")}); err != nil {
 		t.Fatal(err)
 	}
+	c.statements["q"] = &preparedStatement{query: "INSERT INTO t VALUES (1) RETURNING id", paramOIDs: []int32{20}}
 	c.portals["p"] = &portal{query: "INSERT INTO t VALUES (1) RETURNING id"}
+	if err := c.handleMessage(&Message{Type: MsgDescribe, Data: []byte{'S', 'q', 0}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.handleMessage(&Message{Type: MsgDescribe, Data: []byte{'P', 'p', 0}}); err != nil {
 		t.Fatal(err)
 	}
@@ -88,15 +90,28 @@ func TestDescribeFailurePreservesFailedTransactionState(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages := readAllMessages(t, conn.bytes())
-	last := messages[len(messages)-1]
-	if last.Type != MsgReadyForQuery || len(last.Data) != 1 || last.Data[0] != TxStatusFailed {
-		t.Fatalf("Describe did not fail transaction: %v", last)
+	seenParam, seenNoData := false, 0
+	for _, message := range messages {
+		switch message.Type {
+		case MsgParameterDescription:
+			seenParam = true
+		case MsgNoData:
+			seenNoData++
+		case MsgErrorResponse:
+			t.Fatalf("Describe failed: %s", errorCode(message))
+		}
+	}
+	if !seenParam || seenNoData != 2 {
+		t.Fatalf("Describe messages = %v", messages)
+	}
+	if c.txStatus != TxStatusInBlock || c.extendedFailed {
+		t.Fatalf("Describe changed transaction state: %c failed=%v", c.txStatus, c.extendedFailed)
+	}
+	if result, err := c.executor.Execute(parseStmt(t, "SELECT COUNT(*) FROM t")); err != nil || result.Rows[0][0] != int64(0) {
+		t.Fatalf("Describe executed a side effect: %v %v", result, err)
 	}
 	if err := c.handleMessage(&Message{Type: MsgQuery, Data: []byte("ROLLBACK\x00")}); err != nil {
 		t.Fatal(err)
-	}
-	if c.txStatus != TxStatusIdle {
-		t.Fatal("rollback did not recover")
 	}
 }
 
@@ -115,5 +130,57 @@ func TestParseRejectsMultipleCommands(t *testing.T) {
 	messages := readAllMessages(t, conn.bytes())
 	if len(messages) != 1 || errorCode(messages[0]) != ErrCodeSyntaxError {
 		t.Fatal(messages)
+	}
+}
+
+func TestTypicalExtendedSequenceWithDescribeSucceeds(t *testing.T) {
+	c, conn := guardConnection(t)
+	if _, err := c.executor.Execute(parseStmt(t, "INSERT INTO t VALUES (7)")); err != nil {
+		t.Fatal(err)
+	}
+	parse := NewMessageBuilder()
+	parse.WriteString("")
+	parse.WriteString("SELECT id FROM t WHERE id = $1")
+	parse.WriteInt16(1)
+	parse.WriteInt32(20)
+	bind := NewMessageBuilder()
+	bind.WriteString("")
+	bind.WriteString("")
+	bind.WriteInt16(0)
+	bind.WriteInt16(1)
+	bind.WriteInt32(1)
+	bind.WriteBytes([]byte("7"))
+	bind.WriteInt16(0)
+	execute := NewMessageBuilder()
+	execute.WriteString("")
+	execute.WriteInt32(0)
+	for _, msg := range []*Message{
+		{Type: MsgParse, Data: parse.Bytes()},
+		{Type: MsgBind, Data: bind.Bytes()},
+		{Type: MsgDescribe, Data: []byte{'P', 0}},
+		{Type: MsgExecute, Data: execute.Bytes()},
+		{Type: MsgSync},
+	} {
+		if err := c.handleMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages := readAllMessages(t, conn.bytes())
+	var types []byte
+	var row []string
+	for _, message := range messages {
+		types = append(types, message.Type)
+		if message.Type == MsgErrorResponse {
+			t.Fatalf("extended SELECT failed: %s", errorCode(message))
+		}
+		if message.Type == MsgDataRow {
+			row = dataRowValues(t, message)
+		}
+	}
+	if string(types) != "12nTDCZ" {
+		t.Fatalf("message sequence = %q", types)
+	}
+	if len(row) != 1 || row[0] != "7" {
+		t.Fatalf("row = %v", row)
 	}
 }
