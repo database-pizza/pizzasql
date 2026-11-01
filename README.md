@@ -320,7 +320,7 @@ pgcli postgresql://localhost:5432/pizzasql
 1. **SQL Dialect**: PizzaSQL uses **SQLite syntax**, not PostgreSQL syntax
    - Use `INTEGER PRIMARY KEY AUTOINCREMENT`, not `SERIAL`
    - Use `TEXT`, not `VARCHAR` with enforced length
-2. **Parameter placeholders**: use `$1, $2...` (PostgreSQL style) or `?` (SQLite style)
+2. **Parameter placeholders**: use `$1, $2...` (PostgreSQL style) or `?` (SQLite style). PG Bind rewrites `$n` only outside quoted regions and line/block comments. Initialization probes such as `SELECT version()` and `SHOW server_version` match complete token sequences, never substrings inside SQL literals or unrelated projections.
 3. **No PostgreSQL-specific features**: no schemas, roles, `ARRAY`, `JSONB`, etc.
 
 ---

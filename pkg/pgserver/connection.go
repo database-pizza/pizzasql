@@ -349,7 +349,6 @@ func (c *Connection) handleQuery(msg *Message) error {
 	}
 
 	// Handle special PostgreSQL system queries that drivers send
-	sqlUpper := strings.ToUpper(strings.TrimSpace(sql))
 	singleStatement := isSingleStatementSQL(sql)
 
 	// In a failed transaction only ROLLBACK (or ROLLBACK TO SAVEPOINT) is
@@ -361,22 +360,16 @@ func (c *Connection) handleQuery(msg *Message) error {
 		return c.sendReadyForQuery()
 	}
 
-	// lib/pq and other drivers query these for connection validation
-	if singleStatement && strings.Contains(sqlUpper, "SELECT VERSION()") {
-		// Return a fake PostgreSQL version
-		return c.handleVersionQuery()
-	}
-
-	if singleStatement && strings.Contains(sqlUpper, "SELECT CURRENT_USER") {
-		// Return the current user
-		return c.handleCurrentUserQuery()
-	}
-
-	if singleStatement && strings.Contains(sqlUpper, "SHOW") && (strings.Contains(sqlUpper, "SERVER_VERSION") ||
-		strings.Contains(sqlUpper, "SERVER_ENCODING") ||
-		strings.Contains(sqlUpper, "CLIENT_ENCODING")) {
-		// Handle SHOW commands
-		return c.handleShowCommand(sqlUpper)
+	// Recognize only complete initialization-query token sequences.
+	if singleStatement {
+		switch kind := systemQueryKind(sql); kind {
+		case "version":
+			return c.handleVersionQuery()
+		case "current_user":
+			return c.handleCurrentUserQuery()
+		case "server_version", "server_encoding", "client_encoding":
+			return c.handleShowCommand(strings.ToUpper(kind))
+		}
 	}
 	if result, handled, err := c.catalogResult(sql); handled {
 		if err != nil {
@@ -670,18 +663,7 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 	if !isSingleStatementSQL(sql) {
 		return nil, false, nil
 	}
-	upper := strings.ToUpper(sql)
-	var source string
-	for _, candidate := range []string{
-		"INFORMATION_SCHEMA.TABLES", "INFORMATION_SCHEMA.COLUMNS",
-		"INFORMATION_SCHEMA.TABLE_CONSTRAINTS", "INFORMATION_SCHEMA.KEY_COLUMN_USAGE",
-		"PG_TABLES", "PG_INDEXES",
-	} {
-		if strings.Contains(upper, "FROM "+candidate) {
-			source = candidate
-			break
-		}
-	}
+	source := catalogSource(sql)
 	if source == "" {
 		return nil, false, nil
 	}
@@ -799,35 +781,6 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 		result.AddRow(values...)
 	}
 	return result, true, nil
-}
-
-func isSingleStatementSQL(sql string) bool {
-	trimmed := strings.TrimSpace(sql)
-	if strings.HasSuffix(trimmed, ";") {
-		trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ";"))
-	}
-	inString, inIdent := false, false
-	for i := 0; i < len(trimmed); i++ {
-		switch trimmed[i] {
-		case '\'':
-			if !inIdent {
-				if inString && i+1 < len(trimmed) && trimmed[i+1] == '\'' {
-					i++
-					continue
-				}
-				inString = !inString
-			}
-		case '"':
-			if !inString {
-				inIdent = !inIdent
-			}
-		case ';':
-			if !inString && !inIdent {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // isRollbackStatement reports whether sql parses as a single ROLLBACK
@@ -996,34 +949,59 @@ func parameterFormat(formats []int16, index int) int16 {
 
 func bindQuery(query string, params []boundParameter) (string, error) {
 	var result strings.Builder
-	inString, inIdent := false, false
+	var quote byte
 	for i := 0; i < len(query); {
 		ch := query[i]
-		if ch == '\'' && !inIdent {
+		if quote != 0 {
 			result.WriteByte(ch)
-			if inString && i+1 < len(query) && query[i+1] == '\'' {
-				result.WriteByte(query[i+1])
-				i += 2
-				continue
+			i++
+			if ch == quote {
+				if i < len(query) && query[i] == quote {
+					result.WriteByte(query[i])
+					i++
+				} else {
+					quote = 0
+				}
 			}
-			inString = !inString
-			i++
 			continue
 		}
-		if ch == '"' && !inString {
-			inIdent = !inIdent
+		if i+1 < len(query) && ch == '-' && query[i+1] == '-' {
+			end := strings.IndexByte(query[i:], '\n')
+			if end < 0 {
+				result.WriteString(query[i:])
+				break
+			}
+			result.WriteString(query[i : i+end+1])
+			i += end + 1
+			continue
+		}
+		if i+1 < len(query) && ch == '/' && query[i+1] == '*' {
+			end := strings.Index(query[i+2:], "*/")
+			if end < 0 {
+				result.WriteString(query[i:])
+				break
+			}
+			result.WriteString(query[i : i+end+4])
+			i += end + 4
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' || ch == '[' {
+			quote = ch
+			if ch == '[' {
+				quote = ']'
+			}
 			result.WriteByte(ch)
 			i++
 			continue
 		}
-		if ch == '$' && !inString && !inIdent && i+1 < len(query) && query[i+1] >= '0' && query[i+1] <= '9' {
+		if ch == '$' && i+1 < len(query) && query[i+1] >= '0' && query[i+1] <= '9' {
 			end := i + 1
 			for end < len(query) && query[end] >= '0' && query[end] <= '9' {
 				end++
 			}
-			n, _ := strconv.Atoi(query[i+1 : end])
-			if n < 1 || n > len(params) {
-				return "", fmt.Errorf("parameter $%d was not provided", n)
+			n, err := strconv.Atoi(query[i+1 : end])
+			if err != nil || n < 1 || n > len(params) {
+				return "", fmt.Errorf("parameter %s was not provided", query[i:end])
 			}
 			literal, err := parameterLiteral(params[n-1])
 			if err != nil {
@@ -1467,13 +1445,13 @@ func (c *Connection) handleShowCommand(sqlUpper string) error {
 	var value string
 	var name string
 
-	if strings.Contains(sqlUpper, "SERVER_VERSION") {
+	if sqlUpper == "SERVER_VERSION" {
 		name = "server_version"
 		value = version.PostgreSQLCompatVersion
-	} else if strings.Contains(sqlUpper, "SERVER_ENCODING") {
+	} else if sqlUpper == "SERVER_ENCODING" {
 		name = "server_encoding"
 		value = "UTF8"
-	} else if strings.Contains(sqlUpper, "CLIENT_ENCODING") {
+	} else if sqlUpper == "CLIENT_ENCODING" {
 		name = "client_encoding"
 		value = "UTF8"
 	} else {
