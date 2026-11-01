@@ -1466,18 +1466,25 @@ func (m *TableManager) LookupIndex(indexName string, colValue interface{}) ([]in
 	if err != nil {
 		return nil, err
 	}
-	if err := m.ensureIndex(index); err != nil {
-		return nil, err
-	}
-
 	indexKey := strings.ToLower(indexName)
 	valueKey := formatIndexValue(colValue)
-
-	m.cacheMu.RLock()
-	rowids := append([]int64(nil), m.indexCache[indexKey][valueKey]...)
-	m.cacheMu.RUnlock()
-
-	return rowids, nil
+	for {
+		if err := m.ensureIndex(index); err != nil {
+			return nil, err
+		}
+		m.cacheMu.RLock()
+		values, initialized := m.indexCache[indexKey]
+		disabled := m.disabledIndexes[indexKey]
+		rowids := append([]int64(nil), values[valueKey]...)
+		m.cacheMu.RUnlock()
+		if disabled {
+			return nil, fmt.Errorf("%w: %s is disabled", ErrIndexNotFound, indexName)
+		}
+		if initialized {
+			return rowids, nil
+		}
+		// A shared-gate commit invalidated the cache after ensureIndex.
+	}
 }
 
 // ClearIndex removes an index's in-memory entries and marks it disabled so a
@@ -1848,25 +1855,38 @@ func (m *TableManager) selectByIndexKeyWithLSN(table, indexName, valueKey string
 	if err != nil {
 		return nil, indexPredicateSnapshot{}, err
 	}
-	if err := m.ensureIndex(index); err != nil {
-		return nil, indexPredicateSnapshot{}, err
-	}
-
 	tableKey := strings.ToLower(table)
 	tl := m.tableLock(tableKey)
-	tl.RLock()
-	defer tl.RUnlock()
-	if !m.schema.TableExists(table) {
-		return nil, indexPredicateSnapshot{}, fmt.Errorf("table not found: %s", table)
-	}
-
 	indexKey := strings.ToLower(indexName)
+	for {
+		if err := m.ensureIndex(index); err != nil {
+			return nil, indexPredicateSnapshot{}, err
+		}
+		tl.RLock()
+		if !m.schema.TableExists(table) {
+			tl.RUnlock()
+			return nil, indexPredicateSnapshot{}, fmt.Errorf("table not found: %s", table)
+		}
+		m.cacheMu.RLock()
+		if m.disabledIndexes[indexKey] {
+			m.cacheMu.RUnlock()
+			tl.RUnlock()
+			return nil, indexPredicateSnapshot{}, fmt.Errorf("%w: %s is disabled", ErrIndexNotFound, indexName)
+		}
+		if _, initialized := m.indexCache[indexKey]; initialized {
+			break // Keep cacheMu through the complete candidate/key snapshot.
+		}
+		m.cacheMu.RUnlock()
+		tl.RUnlock()
+		// Commits can invalidate under a shared table gate. Retry the build,
+		// never interpret a missing cache as a legitimately empty index.
+	}
+	defer tl.RUnlock()
 	predicateKey, predicateGen, wildcardKey, wildcardGen := m.predicateSnapshot(table, indexName, valueKey)
 	snapshot := indexPredicateSnapshot{
 		valueKey: predicateKey, valueGen: predicateGen,
 		wildcardKey: wildcardKey, wildcardGen: wildcardGen,
 	}
-	m.cacheMu.RLock()
 	rowids := append([]int64(nil), m.indexCache[indexKey][valueKey]...)
 	primaryKeys := make([]string, 0, len(rowids))
 	missingRowID := int64(0)

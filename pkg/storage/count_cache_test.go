@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -259,8 +260,8 @@ func TestClearIndexDropsInMemoryEntries(t *testing.T) {
 	if cached || mapped {
 		t.Fatalf("cleared index remains cached: cache=%v table=%v", cached, mapped)
 	}
-	if rows, err := tables.SelectByIndex("users", "idx_status", "old"); err != nil || len(rows) != 0 {
-		t.Fatalf("cleared index rebuilt during drop: len=%d err=%v", len(rows), err)
+	if rows, err := tables.SelectByIndex("users", "idx_status", "old"); !errors.Is(err, ErrIndexNotFound) || len(rows) != 0 {
+		t.Fatalf("cleared index must report unavailable so SQL falls back: len=%d err=%v", len(rows), err)
 	}
 
 	if err := tables.BuildIndex("idx_status", "users", []string{"status"}); err != nil {
