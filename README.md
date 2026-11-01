@@ -526,6 +526,12 @@ no partial statement effects; in an explicit transaction, earlier successful
 statements remain staged. Mutations exceeding a single storage transaction's
 limits fail rather than being split into independently committed chunks.
 
+Simple autocommit scans with a literal non-negative `LIMIT`/`OFFSET` can stop
+after enough matching rows. Queries requiring sorting, grouping, DISTINCT,
+windows, subquery projections, or explicit-transaction overlay validation keep
+the full execution path. Equality predicates inside `AND` can use a primary or
+single-column index lookup; the original predicate is still checked on candidates.
+
 **Indexes:**
 ```sql
 CREATE INDEX idx_users_email ON users(email);

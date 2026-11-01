@@ -529,35 +529,40 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	// A lookup may only restrict a correctly bound, preserved table. The
 	// original predicate is still evaluated after the lookup/join.
 	if effectiveWhere != nil && !isMultiTable {
-		colName, colValue, isEquality := e.extractSelectLookupCondition(stmt.Where, stmt.From[0])
-		if isEquality {
-			if strings.EqualFold(schema.PrimaryKey, colName) && safePrimaryKeyLiteral(colValue) {
-				row, getErr := e.session.GetByPK(tableName, fmt.Sprintf("%v", colValue))
-				if getErr == nil {
-					normalizeRowBySchema(row, schema)
-					rows = []storage.Row{row}
-					usedIndex = true
-				} else if getErr == storage.ErrKeyNotFound {
-					rows = []storage.Row{}
-					usedIndex = true
+		for _, condition := range splitANDClauses(effectiveWhere) {
+			colName, colValue, isEquality := e.extractSelectLookupCondition(condition, stmt.From[0])
+			if isEquality {
+				if strings.EqualFold(schema.PrimaryKey, colName) && safePrimaryKeyLiteral(colValue) {
+					row, getErr := e.session.GetByPK(tableName, fmt.Sprintf("%v", colValue))
+					if getErr == nil {
+						normalizeRowBySchema(row, schema)
+						rows = []storage.Row{row}
+						usedIndex = true
+					} else if getErr == storage.ErrKeyNotFound {
+						rows = []storage.Row{}
+						usedIndex = true
+					} else {
+						return nil, getErr
+					}
 				} else {
-					return nil, getErr
-				}
-			} else {
-				// Look for an index on this column
-				indexes, _ := e.schema.ListTableIndexes(tableName)
-				for _, idx := range indexes {
-					if len(idx.Columns) == 1 && strings.EqualFold(idx.Columns[0].Name, colName) {
-						rows, err = e.session.SelectByIndex(tableName, idx.Name, colValue)
-						if err == nil {
-							usedIndex = true
-							for i := range rows {
-								normalizeRowBySchema(rows[i], schema)
+					// Look for an index on this column
+					indexes, _ := e.schema.ListTableIndexes(tableName)
+					for _, idx := range indexes {
+						if len(idx.Columns) == 1 && strings.EqualFold(idx.Columns[0].Name, colName) {
+							rows, err = e.session.SelectByIndex(tableName, idx.Name, colValue)
+							if err == nil {
+								usedIndex = true
+								for i := range rows {
+									normalizeRowBySchema(rows[i], schema)
+								}
 							}
+							break
 						}
-						break
 					}
 				}
+			}
+			if usedIndex {
+				break
 			}
 		}
 	}
@@ -577,7 +582,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				return toBool(val)
 			}
 		}
-		rows, err = e.session.Select(tableName, filter)
+		if limit, bounded := scanLimit(stmt); bounded && (effectiveWhere == nil || canFilterInScan) {
+			rows, err = e.session.SelectLimited(tableName, filter, limit)
+		} else {
+			rows, err = e.session.Select(tableName, filter)
+		}
 		if filterErr != nil {
 			return nil, filterErr
 		}
@@ -4422,6 +4431,48 @@ func (e *Executor) extractIndexableCondition(expr parser.Expr) (string, interfac
 	}
 
 	return "", nil, false
+}
+
+// Bound only simple scans. Final OFFSET/LIMIT is still applied once by the
+// normal result path; transactions conservatively retain their full read set.
+func scanLimit(stmt *parser.SelectStmt) (int, bool) {
+	if stmt.Limit == nil || len(stmt.From) != 1 || stmt.From[0].Join != nil ||
+		stmt.From[0].Alias != "" || stmt.Distinct || len(stmt.GroupBy) != 0 ||
+		stmt.Having != nil || len(stmt.OrderBy) != 0 || stmt.Compound != nil || len(stmt.With) != 0 {
+		return 0, false
+	}
+	for _, column := range stmt.Columns {
+		switch column.Expr.(type) {
+		case *parser.ColumnRef, *parser.LiteralExpr:
+		default:
+			if !column.Star {
+				return 0, false
+			}
+		}
+	}
+	literalInt := func(expr parser.Expr) (int, bool) {
+		literal, ok := expr.(*parser.LiteralExpr)
+		if !ok || literal.Type != lexer.TokenNumber {
+			return 0, false
+		}
+		n, err := strconv.Atoi(literal.Value)
+		return n, err == nil && n >= 0
+	}
+	limit, ok := literalInt(stmt.Limit)
+	if !ok {
+		return 0, false
+	}
+	if limit == 0 {
+		return 0, true
+	}
+	if stmt.Offset != nil {
+		offset, valid := literalInt(stmt.Offset)
+		if !valid || offset > int(^uint(0)>>1)-limit {
+			return 0, false
+		}
+		limit += offset
+	}
+	return limit, true
 }
 
 func (e *Executor) extractSelectLookupCondition(expr parser.Expr, table parser.TableRef) (string, interface{}, bool) {
