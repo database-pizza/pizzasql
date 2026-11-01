@@ -171,6 +171,9 @@ func (c *Connection) Handle() error {
 	if err := c.sendParameterStatus("pizzasql.commit", version.Commit); err != nil {
 		return err
 	}
+	if err := c.sendParameterStatus("pizzasql.proxy_errors", "1"); err != nil {
+		return err
+	}
 	if err := c.sendParameterStatus("server_encoding", "UTF8"); err != nil {
 		return err
 	}
@@ -283,7 +286,12 @@ func (c *Connection) initDatabase(dbName string) error {
 
 // handleMessage processes a client message
 func (c *Connection) handleMessage(msg *Message) error {
+	if c.extendedFailed && msg.Type != MsgSync && msg.Type != MsgFlush && msg.Type != MsgTerminate {
+		return nil
+	}
 	switch msg.Type {
+	case MsgProxyError:
+		return c.handleProxyError(msg)
 	case MsgQuery:
 		return c.handleQuery(msg)
 
@@ -390,9 +398,9 @@ func (c *Connection) handleQuery(msg *Message) error {
 		code := ErrCodeSyntaxError
 		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
 			code = ErrCodeFeatureNotSupported
-			if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
+		}
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
 		}
 		c.sendError("ERROR", code, fmt.Sprintf("Syntax error: %v", err))
 		return c.sendReadyForQuery()
@@ -906,7 +914,32 @@ func (c *Connection) handleClose(msg *Message) error {
 
 func (c *Connection) failExtended(code string, err error) error {
 	c.extendedFailed = true
+	if c.txStatus == TxStatusInBlock {
+		c.txStatus = TxStatusFailed
+	}
 	return c.sendError("ERROR", code, err.Error())
+}
+
+func (c *Connection) handleProxyError(msg *Message) error {
+	if len(msg.Data) != 1 || (msg.Data[0] != MsgQuery && msg.Data[0] != MsgParse) {
+		_ = c.sendError("FATAL", ErrCodeProtocolViolation, "invalid proxy error relay")
+		return io.EOF
+	}
+	code, message := "42501", "permission denied by API key scopes"
+	if c.txStatus == TxStatusFailed {
+		code, message = ErrCodeTransactionAborted, "current transaction is aborted, commands ignored until end of transaction block"
+	}
+	if msg.Data[0] == MsgParse {
+		c.extendedCycle = true
+		return c.failExtended(code, errors.New(message))
+	}
+	if c.txStatus == TxStatusInBlock {
+		c.txStatus = TxStatusFailed
+	}
+	if err := c.sendError("ERROR", code, message); err != nil {
+		return err
+	}
+	return c.sendReadyForQuery()
 }
 
 type boundParameter struct {
@@ -1284,6 +1317,9 @@ func (c *Connection) sendCommandComplete(tag string) error {
 
 // sendError sends an error response
 func (c *Connection) sendError(severity, code, message string) error {
+	if severity == "ERROR" && c.txStatus == TxStatusInBlock {
+		c.txStatus = TxStatusFailed
+	}
 	mb := NewMessageBuilder()
 	mb.AppendByte(ErrorFieldSeverity)
 	mb.WriteString(severity)

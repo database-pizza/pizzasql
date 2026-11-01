@@ -52,6 +52,7 @@ type Protocol struct {
 	SQLiteCompat   string `json:"sqlite_compat"`
 	SimpleQuery    bool   `json:"simple_query"`
 	ExtendedQuery  bool   `json:"extended_query"`
+	ProxyErrors    bool   `json:"proxy_error_relay"`
 	TLS            string `json:"tls"`
 }
 
@@ -142,6 +143,7 @@ func Current() *Document {
 			SQLiteCompat:   "3.35.0",
 			SimpleQuery:    true,
 			ExtendedQuery:  true,
+			ProxyErrors:    true,
 			TLS:            "terminated by the managed pgproxy, not the engine listener",
 		},
 
@@ -218,6 +220,7 @@ func Current() *Document {
 			"23505": "unique_violation",
 			"40001": "serialization_failure",
 			"0A000": "feature_not_supported",
+			"42501": "insufficient_privilege (managed proxy)",
 			"42601": "syntax_error",
 			"25P02": "in_failed_sql_transaction",
 			"08P01": "protocol_violation (managed proxy: TLS required)",
