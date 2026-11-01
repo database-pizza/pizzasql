@@ -719,6 +719,9 @@ func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) 
 		}
 	}
 
+	if err := validateNotNull(schema, row); err != nil {
+		return nil, false, err
+	}
 	s.stagePut(table, key, row)
 	return oldRow, true, nil
 }
@@ -808,6 +811,9 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 					break
 				}
 			}
+		}
+		if err := validateNotNull(schema, row); err != nil {
+			return count, err
 		}
 		newKey := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
 		if newKey != oldKey {

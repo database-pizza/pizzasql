@@ -157,7 +157,7 @@ func Current() *Document {
 		},
 
 		Constraints: Constraints{
-			NotNull:       Feature{Supported: true, Status: "enforced"},
+			NotNull:       Feature{Supported: true, Status: "enforced", SQLState: "23502", Notes: "validated after defaults and assignments; explicit NULL does not select a default"},
 			Unique:        Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "unique indexes, INLINE UNIQUE, and ON CONFLICT are enforced atomically"},
 			PrimaryKey:    Feature{Supported: true, Status: "enforced", Notes: "single-column only"},
 			CompositePK:   Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "declare a single-column primary key"},
@@ -214,6 +214,7 @@ func Current() *Document {
 		},
 
 		ErrorCodes: map[string]string{
+			"23502": "not_null_violation",
 			"23505": "unique_violation",
 			"40001": "serialization_failure",
 			"0A000": "feature_not_supported",
