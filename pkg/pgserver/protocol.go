@@ -18,17 +18,20 @@ const (
 // Message type constants (first byte of message)
 const (
 	// Frontend (client) messages
-	MsgStartup   = 0   // Startup message (no type byte)
-	MsgQuery     = 'Q' // Simple query
-	MsgTerminate = 'X' // Terminate
-	MsgPassword  = 'p' // Password message
-	MsgParse     = 'P' // Parse (prepared statement)
-	MsgBind      = 'B' // Bind
-	MsgDescribe  = 'D' // Describe
-	MsgExecute   = 'E' // Execute
-	MsgSync      = 'S' // Sync
-	MsgFlush     = 'H' // Flush
-	MsgClose     = 'C' // Close
+	MsgStartup = 0   // Startup message (no type byte)
+	MsgQuery   = 'Q' // Simple query
+	// MsgProxyError is a negotiated managed-proxy extension. Its one-byte
+	// payload is Q or P, replacing a denied Query or Parse in stream order.
+	MsgProxyError = 'y'
+	MsgTerminate  = 'X' // Terminate
+	MsgPassword   = 'p' // Password message
+	MsgParse      = 'P' // Parse (prepared statement)
+	MsgBind       = 'B' // Bind
+	MsgDescribe   = 'D' // Describe
+	MsgExecute    = 'E' // Execute
+	MsgSync       = 'S' // Sync
+	MsgFlush      = 'H' // Flush
+	MsgClose      = 'C' // Close
 
 	// Backend (server) messages
 	MsgAuthenticationOk     = 'R' // Authentication request
