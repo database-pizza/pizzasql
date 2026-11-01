@@ -2,6 +2,17 @@ package storage
 
 import "fmt"
 
+// PrimaryKeyViolationError preserves duplicate-key identity through wrapped
+// executor errors so wire adapters can report integrity SQLSTATE 23505.
+type PrimaryKeyViolationError struct {
+	Table string
+	Key   string
+}
+
+func (e *PrimaryKeyViolationError) Error() string {
+	return fmt.Sprintf("duplicate primary key: %s", e.Key)
+}
+
 // NotNullViolationError identifies the final row that violates a required column.
 type NotNullViolationError struct {
 	Table  string

@@ -161,7 +161,7 @@ func Current() *Document {
 		Constraints: Constraints{
 			NotNull:       Feature{Supported: true, Status: "enforced", SQLState: "23502", Notes: "validated after defaults and assignments; explicit NULL does not select a default"},
 			Unique:        Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "unique indexes, INLINE UNIQUE, and ON CONFLICT are enforced atomically"},
-			PrimaryKey:    Feature{Supported: true, Status: "enforced", Notes: "single-column only"},
+			PrimaryKey:    Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "single-column only"},
 			CompositePK:   Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "declare a single-column primary key"},
 			ForeignKey:    Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level FOREIGN KEY are rejected; enforce referential integrity in the application, cascades are not implemented"},
 			Check:         Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level CHECK are rejected; enforce the rule in the application"},

@@ -704,13 +704,13 @@ func (s *Session) insertLocked(table string, row Row) (int64, error) {
 
 	if e, ok := s.overlay[tl][key]; ok {
 		if !e.absent {
-			return 0, fmt.Errorf("duplicate primary key: %s", pk)
+			return 0, &PrimaryKeyViolationError{Table: table, Key: pk}
 		}
 	} else {
 		_, lsn, err := s.table.getByPKWithLSN(table, pk)
 		if err == nil {
 			s.reads[key] = lsn
-			return 0, fmt.Errorf("duplicate primary key: %s", pk)
+			return 0, &PrimaryKeyViolationError{Table: table, Key: pk}
 		}
 		if err != ErrKeyNotFound {
 			return 0, err
@@ -860,7 +860,7 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 			// The primary key changed: move the staged row instead of leaving a
 			// stale copy under the old key, and refuse to overwrite another row.
 			if _, gerr := s.getByPKLocked(table, fmt.Sprintf("%v", row[schema.PrimaryKey])); gerr == nil {
-				return count, fmt.Errorf("duplicate primary key: %v", row[schema.PrimaryKey])
+				return count, &PrimaryKeyViolationError{Table: table, Key: fmt.Sprint(row[schema.PrimaryKey])}
 			} else if gerr != ErrKeyNotFound {
 				return count, gerr
 			}
