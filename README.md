@@ -520,6 +520,12 @@ UPDATE accounts SET balance = balance + 100 WHERE name = 'Bob';
 COMMIT;
 ```
 
+Multi-row `UPDATE` and `DELETE`, primary-key moves, and DML with `RETURNING`
+are staged before one atomic commit. An evaluation or validation failure leaves
+no partial statement effects; in an explicit transaction, earlier successful
+statements remain staged. Mutations exceeding a single storage transaction's
+limits fail rather than being split into independently committed chunks.
+
 **Indexes:**
 ```sql
 CREATE INDEX idx_users_email ON users(email);
