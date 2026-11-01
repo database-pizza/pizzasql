@@ -130,6 +130,8 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 	return executor
 }
 
+// An Executor owns mutable session state and must not be used concurrently.
+// Use one executor per PostgreSQL connection or HTTP transaction/request.
 // NewSessionExecutor returns a new executor sharing the same schema and table
 // managers but with fresh per-executor state (transaction, subquery caches,
 // views). It is used to isolate concurrent requests that must not share mutable
