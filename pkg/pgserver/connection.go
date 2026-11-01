@@ -410,6 +410,7 @@ func (c *Connection) handleQuery(msg *Message) error {
 		if err != nil {
 			code := ErrCodeInternalError
 			message := fmt.Sprintf("Execution error: %v", err)
+			var primaryKeyErr *storage.PrimaryKeyViolationError
 			var uniqueErr *storage.UniqueViolationError
 			var notNullErr *storage.NotNullViolationError
 			if errors.Is(err, storage.ErrSerialization) {
@@ -420,9 +421,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
-			} else if errors.As(err, &uniqueErr) {
+			} else if errors.As(err, &uniqueErr) || errors.As(err, &primaryKeyErr) {
 				code = ErrCodeUniqueViolation
-				message = fmt.Sprintf("Execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint)
+				if uniqueErr != nil {
+					message = fmt.Sprintf("Execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint)
+				}
 				if _, commit := stmt.(*parser.CommitStmt); commit {
 					c.txStatus = TxStatusIdle
 				} else if c.txStatus == TxStatusInBlock {
@@ -616,6 +619,7 @@ func (c *Connection) handleExecute(msg *Message) error {
 	result, err := c.executor.Execute(stmt)
 	if err != nil {
 		code := ErrCodeInternalError
+		var primaryKeyErr *storage.PrimaryKeyViolationError
 		var uniqueErr *storage.UniqueViolationError
 		var notNullErr *storage.NotNullViolationError
 		if errors.Is(err, storage.ErrSerialization) {
@@ -626,7 +630,7 @@ func (c *Connection) handleExecute(msg *Message) error {
 			if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
-		} else if errors.As(err, &uniqueErr) {
+		} else if errors.As(err, &uniqueErr) || errors.As(err, &primaryKeyErr) {
 			code = ErrCodeUniqueViolation
 			if _, commit := stmt.(*parser.CommitStmt); commit {
 				c.txStatus = TxStatusIdle

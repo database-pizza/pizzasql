@@ -609,7 +609,7 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	if !committed {
-		return 0, fmt.Errorf("duplicate primary key: %v", row[schemaPrimaryKey(m.schema, table)])
+		return 0, &PrimaryKeyViolationError{Table: table, Key: strings.TrimPrefix(key, m.dataPrefix(table))}
 	}
 
 	m.applyUniquePlan(uniquePlan, nil)
@@ -627,14 +627,6 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		m.incrCount(table, schema.CreatedAt, 1, wasInit)
 	}
 	return rowid, nil
-}
-
-func schemaPrimaryKey(s *SchemaManager, table string) string {
-	schema, err := s.GetSchema(table)
-	if err != nil {
-		return "_rowid_"
-	}
-	return schema.PrimaryKey
 }
 
 // bulkBatchByteBudget bounds a single atomic BATCH_WRITE payload below the
@@ -791,7 +783,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 	for i, op := range ops {
 		key := string(op.Key)
 		if _, duplicate := seen[key]; duplicate {
-			return 0, 0, fmt.Errorf("duplicate primary key: %s", key)
+			return 0, 0, &PrimaryKeyViolationError{Table: table, Key: key}
 		}
 		seen[key] = struct{}{}
 		keys[i] = op.Key
@@ -815,7 +807,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 	}
 	for i, found := range existing {
 		if found {
-			return 0, 0, fmt.Errorf("duplicate primary key: %s", ops[i].Key)
+			return 0, 0, &PrimaryKeyViolationError{Table: table, Key: string(ops[i].Key)}
 		}
 	}
 

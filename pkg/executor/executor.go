@@ -3398,7 +3398,7 @@ func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Sc
 			newPK := fmt.Sprintf("%v", newPKVal)
 			if newPK != plan.oldPK {
 				if _, gerr := e.session.GetByPK(tableName, newPK); gerr == nil {
-					return fmt.Errorf("duplicate primary key: %v", newPK)
+					return &storage.PrimaryKeyViolationError{Table: tableName, Key: newPK}
 				} else if gerr != storage.ErrKeyNotFound {
 					return gerr
 				}
