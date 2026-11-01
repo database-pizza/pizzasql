@@ -70,7 +70,7 @@ func (m *TableManager) ensureUniqueCaches(table string, indexes []*Index) (map[s
 	var missing []*Index
 	m.cacheMu.RLock()
 	for _, idx := range indexes {
-		if cache := m.uniqueCache[strings.ToLower(idx.Name)]; cache != nil && cacheableUniqueIndex(idx) {
+		if cache := m.uniqueCache[strings.ToLower(idx.Name)]; cache != nil && cacheableColumnIndex(idx) {
 			caches[idx.Name] = cache
 		} else {
 			missing = append(missing, idx)
@@ -123,7 +123,7 @@ func (m *TableManager) ensureUniqueCaches(table string, indexes []*Index) (map[s
 	}
 	m.cacheMu.Lock()
 	for _, idx := range missing {
-		if cacheableUniqueIndex(idx) {
+		if cacheableColumnIndex(idx) {
 			m.uniqueCache[strings.ToLower(idx.Name)] = caches[idx.Name]
 		}
 	}
@@ -133,7 +133,7 @@ func (m *TableManager) ensureUniqueCaches(table string, indexes []*Index) (map[s
 
 // Expression evaluators have no determinism contract. Rebuild these constraints
 // for each validation rather than freezing time/random/function-dependent values.
-func cacheableUniqueIndex(index *Index) bool {
+func cacheableColumnIndex(index *Index) bool {
 	for _, column := range index.Columns {
 		if column.Expression != "" {
 			return false

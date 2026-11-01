@@ -31,11 +31,13 @@ type TableManager struct {
 	schema   *SchemaManager
 	database string
 
-	cacheMu     sync.RWMutex
-	uniqueCache map[string]*uniqueIndexCache
-	indexCache  map[string]map[string][]int64 // index name → indexed value → rowids
-	indexTable  map[string]string             // index name → table name
-	rowKeyCache map[string]map[int64]string   // table name → rowid → primary key
+	cacheMu        sync.RWMutex
+	uniqueCache    map[string]*uniqueIndexCache
+	indexRowValues map[string]map[int64]string   // index name → rowid → candidate key
+	keyRowCache    map[string]map[string]int64   // table name → primary key → rowid
+	indexCache     map[string]map[string][]int64 // index name → indexed value → rowids
+	indexTable     map[string]string             // index name → table name
+	rowKeyCache    map[string]map[int64]string   // table name → rowid → primary key
 	// disabledIndexes prevents a concurrent lookup from rebuilding an index
 	// after DROP has cleared it but before the schema entry is removed.
 	disabledIndexes map[string]bool
@@ -92,6 +94,8 @@ func NewTableManager(pool *KVPool, schema *SchemaManager, database string) *Tabl
 		schema:               schema,
 		database:             database,
 		uniqueCache:          make(map[string]*uniqueIndexCache),
+		indexRowValues:       make(map[string]map[int64]string),
+		keyRowCache:          make(map[string]map[string]int64),
 		indexCache:           make(map[string]map[string][]int64),
 		indexTable:           make(map[string]string),
 		rowKeyCache:          make(map[string]map[int64]string),
@@ -206,12 +210,14 @@ func (m *TableManager) invalidateCache(table string) {
 	m.cacheMu.Lock()
 	key := strings.ToLower(table)
 	delete(m.rowKeyCache, key)
+	delete(m.keyRowCache, key)
 	delete(m.counts, key)
 	delete(m.countsInit, key)
 	delete(m.countGeneration, key)
 	for indexName, tableName := range m.indexTable {
 		if tableName == key {
 			delete(m.indexCache, indexName)
+			delete(m.indexRowValues, indexName)
 			delete(m.indexTable, indexName)
 		}
 	}
@@ -607,7 +613,7 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 	}
 
 	m.applyUniquePlan(uniquePlan, nil)
-	if err := m.updateIndexesForRow(table, nr, true); err != nil {
+	if err := m.updateIndexesForRow(table, nr, true, key); err != nil {
 		return 0, err
 	}
 	// Publish derived index state before its generations. A reader that races
@@ -856,7 +862,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 		m.applyUniquePlan(uniquePlan, accepted)
 	}
 	for i := 0; i < numOK; i++ {
-		if err := m.updateIndexesForRow(table, encoded[i], true); err != nil {
+		if err := m.updateIndexesForRow(table, encoded[i], true, string(ops[i].Key)); err != nil {
 			return numOK, 0, err
 		}
 	}
@@ -881,7 +887,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 // updateIndexesForRow adds or removes entries from already-built in-memory
 // indexes. Index entries are rebuildable from durable row data, so this method
 // intentionally does not write idx:* keys to KV.
-func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) error {
+func (m *TableManager) updateIndexesForRow(table string, row Row, add bool, actualKey string) error {
 	indexes, err := m.schema.ListTableIndexes(table)
 	if err != nil || len(indexes) == 0 {
 		return err
@@ -892,18 +898,19 @@ func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) erro
 		return nil
 	}
 	tableKey := strings.ToLower(table)
-	tableSchema, schemaErr := m.schema.GetSchema(table)
-	if schemaErr == nil {
-		m.cacheMu.Lock()
-		if keys, initialized := m.rowKeyCache[tableKey]; initialized {
-			if add {
-				keys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
-			} else {
-				delete(keys, rowid)
-			}
+	m.cacheMu.Lock()
+	if keys, initialized := m.rowKeyCache[tableKey]; initialized {
+		pk := strings.TrimPrefix(actualKey, m.dataPrefix(table))
+		reverse := m.keyRowCache[tableKey]
+		if add {
+			keys[rowid] = pk
+			reverse[pk] = rowid
+		} else {
+			delete(keys, rowid)
+			delete(reverse, pk)
 		}
-		m.cacheMu.Unlock()
 	}
+	m.cacheMu.Unlock()
 
 	for _, idx := range indexes {
 		indexName := strings.ToLower(idx.Name)
@@ -1112,10 +1119,10 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 	}
 
 	m.applyUniquePlan(uniquePlan, nil)
-	if err := m.updateIndexesForRow(table, oldRow, false); err != nil {
+	if err := m.updateIndexesForRow(table, oldRow, false, key); err != nil {
 		return nil, false, err
 	}
-	if err := m.updateIndexesForRow(table, row, true); err != nil {
+	if err := m.updateIndexesForRow(table, row, true, key); err != nil {
 		return nil, false, err
 	}
 	if err := m.bumpIndexPredicates(table, oldRow, row); err != nil {
@@ -1180,7 +1187,7 @@ func (m *TableManager) DeleteByPK(table, pk string) (Row, bool, error) {
 	}
 
 	m.removeUniqueKey(table, key)
-	if err := m.updateIndexesForRow(table, row, false); err != nil {
+	if err := m.updateIndexesForRow(table, row, false, key); err != nil {
 		return nil, false, err
 	}
 	if err := m.bumpIndexPredicates(table, row); err != nil {
@@ -1400,9 +1407,7 @@ func (m *TableManager) ensureIndex(index *Index) error {
 
 	m.cacheMu.Lock()
 	if _, initialized := m.indexCache[indexKey]; !initialized {
-		m.indexCache[indexKey] = values
-		m.indexTable[indexKey] = key
-		m.rowKeyCache[key] = rowKeys
+		m.installIndexCacheLocked(indexKey, key, values, rowKeys)
 	}
 	m.cacheMu.Unlock()
 
@@ -1428,6 +1433,10 @@ func (m *TableManager) AddIndexEntry(indexName string, colValue interface{}, row
 		}
 	}
 	values[valueKey] = append(rowids, rowid)
+	if m.indexRowValues[indexKey] == nil {
+		m.indexRowValues[indexKey] = make(map[int64]string)
+	}
+	m.indexRowValues[indexKey][rowid] = valueKey
 	return nil
 }
 
@@ -1439,24 +1448,7 @@ func (m *TableManager) RemoveIndexEntry(indexName string, colValue interface{}, 
 	m.cacheMu.Lock()
 	defer m.cacheMu.Unlock()
 
-	values, ok := m.indexCache[indexKey]
-	if !ok {
-		return nil
-	}
-	rowids := values[valueKey]
-	newRowids := make([]int64, 0, len(rowids))
-	for _, r := range rowids {
-		if r != rowid {
-			newRowids = append(newRowids, r)
-		}
-	}
-
-	if len(newRowids) == 0 {
-		delete(values, valueKey)
-		return nil
-	}
-
-	values[valueKey] = newRowids
+	m.removeIndexEntryLocked(indexKey, valueKey, rowid)
 	return nil
 }
 
@@ -1496,6 +1488,7 @@ func (m *TableManager) ClearIndex(indexName, tableName string, columns []string)
 	tableKey := strings.ToLower(tableName)
 	m.cacheMu.Lock()
 	delete(m.indexCache, indexKey)
+	delete(m.indexRowValues, indexKey)
 	delete(m.indexTable, indexKey)
 	delete(m.uniqueCache, indexKey)
 	m.disabledIndexes[indexKey] = true
@@ -1508,6 +1501,7 @@ func (m *TableManager) ClearIndex(indexName, tableName string, columns []string)
 	}
 	if !rowKeysNeeded {
 		delete(m.rowKeyCache, tableKey)
+		delete(m.keyRowCache, tableKey)
 	}
 	m.cacheMu.Unlock()
 	return nil
@@ -1519,6 +1513,7 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 	m.cacheMu.Lock()
 	delete(m.disabledIndexes, indexKey)
 	delete(m.indexCache, indexKey)
+	delete(m.indexRowValues, indexKey)
 	delete(m.indexTable, indexKey)
 	m.cacheMu.Unlock()
 
@@ -1557,9 +1552,7 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 	}
 
 	m.cacheMu.Lock()
-	m.indexCache[indexKey] = values
-	m.indexTable[indexKey] = strings.ToLower(tableName)
-	m.rowKeyCache[strings.ToLower(tableName)] = rowKeys
+	m.installIndexCacheLocked(indexKey, strings.ToLower(tableName), values, rowKeys)
 	m.cacheMu.Unlock()
 
 	return nil

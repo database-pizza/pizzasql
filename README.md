@@ -546,6 +546,10 @@ Rollback, compare failure, DDL, restart, and ambiguous transport errors never
 leave speculative ownership entries. NULL-bearing keys remain exempt; composite
 keys use the constraint encoder, not the SELECT candidate encoder. Expression
 UNIQUE constraints retain scan validation until evaluator determinism is proven.
+Exclusive-gate commits also maintain warm column-based SELECT indexes and exact
+counts incrementally. Shared-gate optimistic commits still invalidate those read
+caches to avoid publishing them out of durable CAS order. Expression read indexes
+are rebuilt after such commits instead of assuming evaluator determinism.
 
 **PRAGMA:**
 ```sql
