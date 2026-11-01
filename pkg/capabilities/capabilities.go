@@ -48,12 +48,15 @@ type Document struct {
 }
 
 type Protocol struct {
-	PostgresCompat string `json:"postgres_compat"`
-	SQLiteCompat   string `json:"sqlite_compat"`
-	SimpleQuery    bool   `json:"simple_query"`
-	ExtendedQuery  bool   `json:"extended_query"`
-	ProxyErrors    bool   `json:"proxy_error_relay"`
-	TLS            string `json:"tls"`
+	PostgresCompat string  `json:"postgres_compat"`
+	SQLiteCompat   string  `json:"sqlite_compat"`
+	SimpleQuery    bool    `json:"simple_query"`
+	ExtendedQuery  bool    `json:"extended_query"`
+	Describe       Feature `json:"describe"`
+	BinaryResults  Feature `json:"binary_results"`
+	BoundedExecute Feature `json:"bounded_execute"`
+	ProxyErrors    bool    `json:"proxy_error_relay"`
+	TLS            string  `json:"tls"`
 }
 
 type Notifications struct {
@@ -143,6 +146,9 @@ func Current() *Document {
 			SQLiteCompat:   "3.35.0",
 			SimpleQuery:    true,
 			ExtendedQuery:  true,
+			Describe:       Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "use simple query or Parse/Bind/Execute without Describe; no speculative execution for metadata"},
+			BinaryResults:  Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "all-text result formats only; per-column format lists are also rejected"},
+			BoundedExecute: Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "Execute maxRows must be zero; portals are one-shot, not resumable"},
 			ProxyErrors:    true,
 			TLS:            "terminated by the managed pgproxy, not the engine listener",
 		},

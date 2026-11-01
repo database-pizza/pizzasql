@@ -482,6 +482,9 @@ func (c *Connection) handleParse(msg *Message) error {
 		oids[i] = int32(binary.BigEndian.Uint32(msg.Data[pos : pos+4]))
 		pos += 4
 	}
+	if !isSingleStatementSQL(query) {
+		return c.failExtended(ErrCodeSyntaxError, fmt.Errorf("prepared statements must contain one command"))
+	}
 	c.statements[name] = &preparedStatement{query: query, paramOIDs: oids}
 	return c.writeMessage(MsgParseComplete, nil)
 }
@@ -508,6 +511,14 @@ func (c *Connection) handleBind(msg *Message) error {
 	}
 	paramCount := int(binary.BigEndian.Uint16(msg.Data[pos : pos+2]))
 	pos += 2
+	if len(formats) > 1 && len(formats) != paramCount {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("Bind parameter format count does not match parameters"))
+	}
+	for _, format := range formats {
+		if format != 0 && format != 1 {
+			return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind parameter format code"))
+		}
+	}
 	params := make([]boundParameter, paramCount)
 	for i := range params {
 		if pos+4 > len(msg.Data) {
@@ -527,13 +538,28 @@ func (c *Connection) handleBind(msg *Message) error {
 		params[i].value = append([]byte(nil), msg.Data[pos:pos+int(length)]...)
 		pos += int(length)
 	}
-	_, pos, err = readInt16List(msg.Data, pos) // result formats; text output is currently used
+	resultFormats, pos, err := readInt16List(msg.Data, pos)
 	if err != nil || pos != len(msg.Data) {
 		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind result format list"))
 	}
+	for _, format := range resultFormats {
+		if format != 0 && format != 1 {
+			return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind result format code"))
+		}
+		if format == 1 {
+			return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("binary result format is not supported; request text results"))
+		}
+	}
+	if len(resultFormats) > 1 {
+		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("per-column result format lists are not supported; request all-text results"))
+	}
 	query, err := bindQuery(statement.query, params)
 	if err != nil {
-		return c.failExtended(ErrCodeInvalidParameter, err)
+		code := ErrCodeInvalidParameter
+		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			code = ErrCodeFeatureNotSupported
+		}
+		return c.failExtended(code, err)
 	}
 	c.portals[portalName] = &portal{query: query}
 	return c.writeMessage(MsgBindComplete, nil)
@@ -552,17 +578,8 @@ func (c *Connection) handleDescribe(msg *Message) error {
 	}
 	switch msg.Data[0] {
 	case 'S':
-		statement, ok := c.statements[name]
-		if !ok {
+		if _, ok := c.statements[name]; !ok {
 			return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("prepared statement %q does not exist", name))
-		}
-		mb := NewMessageBuilder()
-		mb.WriteInt16(int16(len(statement.paramOIDs)))
-		for _, oid := range statement.paramOIDs {
-			mb.WriteInt32(oid)
-		}
-		if err := c.writeMessage(MsgParameterDescription, mb.Bytes()); err != nil {
-			return err
 		}
 	case 'P':
 		if _, ok := c.portals[name]; !ok {
@@ -571,9 +588,10 @@ func (c *Connection) handleDescribe(msg *Message) error {
 	default:
 		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Describe target"))
 	}
-	// Execute sends the row description once the bound statement has been
-	// analyzed, avoiding side effects during Describe.
-	return c.writeMessage(MsgNoData, nil)
+	// Do not claim NoData for row-producing statements or execute queries to
+	// discover metadata. Clients must avoid Describe until side-effect-free
+	// parameter/row description is implemented.
+	return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("Describe metadata is not supported; use simple query or Parse/Bind/Execute without Describe"))
 }
 
 func (c *Connection) handleExecute(msg *Message) error {
@@ -591,13 +609,20 @@ func (c *Connection) handleExecute(msg *Message) error {
 	if portal.executed {
 		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("portal can only be executed once"))
 	}
-	portal.executed = true
+	maxRows := int32(binary.BigEndian.Uint32(msg.Data[pos : pos+4]))
+	if maxRows < 0 {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Execute row limit"))
+	}
 	// Check the transaction state before catalog emulation. Catalog queries do
 	// not all parse as regular PizzaSQL statements, but must still return 25P02
 	// while the transaction is aborted.
 	if c.txStatus == TxStatusFailed && !isRollbackStatement(portal.query) {
 		return c.failExtended(ErrCodeTransactionAborted, fmt.Errorf("current transaction is aborted, commands ignored until end of transaction block"))
 	}
+	if maxRows != 0 {
+		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("bounded Execute is not supported; use maxRows=0"))
+	}
+	portal.executed = true
 	if result, handled, catalogErr := c.catalogResult(portal.query); handled {
 		if catalogErr != nil {
 			return c.failExtended(ErrCodeInternalError, catalogErr)
@@ -1051,7 +1076,7 @@ func parameterLiteral(param boundParameter) (string, error) {
 			}
 			return strconv.FormatInt(int64(binary.BigEndian.Uint64(param.value)), 10), nil
 		default:
-			return "", fmt.Errorf("binary format is unsupported for OID %d", param.oid)
+			return "", fmt.Errorf("%w: binary parameter format for OID %d", pgerror.ErrFeatureNotSupported, param.oid)
 		}
 	}
 	value := string(param.value)
