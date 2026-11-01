@@ -514,13 +514,15 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			break
 		}
 	}
-	appliedInScan := effectiveWhere != nil && !whereHasSubquery && stmt.From[0].Alias == "" && !isMultiTable && stmt.From[0].Join == nil
+	canFilterInScan := effectiveWhere != nil && !whereHasSubquery && stmt.From[0].Alias == "" && !isMultiTable && stmt.From[0].Join == nil
+	appliedInScan := false
 
+	// A lookup may only restrict a correctly bound, preserved table. The
+	// original predicate is still evaluated after the lookup/join.
 	if effectiveWhere != nil && !isMultiTable {
-		// Check if we can use an index
-		colName, colValue, isEquality := e.extractIndexableCondition(stmt.Where)
+		colName, colValue, isEquality := e.extractSelectLookupCondition(stmt.Where, stmt.From[0])
 		if isEquality {
-			if strings.EqualFold(schema.PrimaryKey, colName) {
+			if strings.EqualFold(schema.PrimaryKey, colName) && safePrimaryKeyLiteral(colValue) {
 				row, getErr := e.session.GetByPK(tableName, fmt.Sprintf("%v", colValue))
 				if getErr == nil {
 					normalizeRowBySchema(row, schema)
@@ -555,7 +557,8 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if !usedIndex {
 		var filterErr error
 		var filter func(storage.Row) bool
-		if appliedInScan {
+		if canFilterInScan {
+			appliedInScan = true
 			filter = func(row storage.Row) bool {
 				val, ferr := e.evalExpr(effectiveWhere, row)
 				if ferr != nil {
@@ -4333,7 +4336,7 @@ func (e *Executor) extractIndexableCondition(expr parser.Expr) (string, interfac
 	colRef, leftIsCol := binExpr.Left.(*parser.ColumnRef)
 	litExpr, rightIsLit := binExpr.Right.(*parser.LiteralExpr)
 
-	if leftIsCol && rightIsLit {
+	if leftIsCol && rightIsLit && colRef.Table == "" {
 		val, _ := e.evalLiteral(litExpr)
 		return colRef.Column, val, true
 	}
@@ -4342,12 +4345,57 @@ func (e *Executor) extractIndexableCondition(expr parser.Expr) (string, interfac
 	litExpr, leftIsLit := binExpr.Left.(*parser.LiteralExpr)
 	colRef, rightIsCol := binExpr.Right.(*parser.ColumnRef)
 
-	if leftIsLit && rightIsCol {
+	if leftIsLit && rightIsCol && colRef.Table == "" {
 		val, _ := e.evalLiteral(litExpr)
 		return colRef.Column, val, true
 	}
 
 	return "", nil, false
+}
+
+func (e *Executor) extractSelectLookupCondition(expr parser.Expr, table parser.TableRef) (string, interface{}, bool) {
+	for join := table.Join; join != nil; join = join.Table.Join {
+		if join.Type == parser.JoinRight || join.Type == parser.JoinFull {
+			return "", nil, false
+		}
+	}
+	bin, ok := expr.(*parser.BinaryExpr)
+	if !ok {
+		return "", nil, false
+	}
+	copyExpr := *bin
+	for _, side := range []*parser.Expr{&copyExpr.Left, &copyExpr.Right} {
+		if column, ok := (*side).(*parser.ColumnRef); ok {
+			if column.Table == "" && table.Join != nil {
+				return "", nil, false
+			}
+			qualifier := table.Alias
+			if qualifier == "" {
+				qualifier = table.Name
+			}
+			if column.Table != "" && !strings.EqualFold(column.Table, qualifier) {
+				return "", nil, false
+			}
+			copyColumn := *column
+			copyColumn.Table = ""
+			*side = &copyColumn
+		}
+	}
+	return e.extractIndexableCondition(&copyExpr)
+}
+
+// Numeric strings can compare equal to differently formatted primary keys;
+// a direct durable-key lookup would miss them. Keep those comparisons on the
+// scan path until primary-key affinity has a canonical storage representation.
+func safePrimaryKeyLiteral(value interface{}) bool {
+	if value == nil {
+		return false
+	}
+	if text, ok := value.(string); ok {
+		_, numeric := toNumeric(text)
+		return !numeric
+	}
+	return true
 }
 
 // executePragma executes a PRAGMA statement.
