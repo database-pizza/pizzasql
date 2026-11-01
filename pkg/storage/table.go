@@ -1368,19 +1368,37 @@ func (m *TableManager) indexPrefix(indexName string) string {
 }
 
 func formatIndexValue(value interface{}) string {
+	// Equality predicates compare numeric values (including numeric text) as
+	// float64. Use the same equivalence classes without decimal rounding.
+	// Index hits are candidates: the executor still evaluates the predicate.
+	var number float64
 	switch v := value.(type) {
 	case float64:
-		if v == float64(int64(v)) {
-			return fmt.Sprintf("%d", int64(v))
-		}
-		return fmt.Sprintf("%f", v)
+		number = v
 	case int64:
-		return fmt.Sprintf("%d", v)
+		number = float64(v)
 	case int:
-		return fmt.Sprintf("%d", v)
+		number = float64(v)
+	case bool:
+		if v {
+			return "1"
+		}
+		return "0"
+	case []byte:
+		return formatIndexValue(string(v))
+	case string:
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return v
+		}
+		number = parsed
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+	if number == 0 {
+		return "0"
+	}
+	return strconv.FormatFloat(number, 'g', -1, 64)
 }
 
 func rowIDFromRow(row Row) (int64, bool) {
