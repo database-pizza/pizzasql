@@ -127,9 +127,10 @@ func TestCompatibilitySuite(t *testing.T) {
 	expectCode("locking.for_update_0A000", `SELECT * FROM accounts FOR UPDATE`, "0A000")
 	expectCode("arrays.any_0A000", `SELECT * FROM accounts WHERE id = ANY('{1,2}')`, "0A000")
 
-	// CHECK and FOREIGN KEY are rejected at DDL instead of being silently
-	// discarded; enforce these rules in the application.
-	expectCode("ddl.check_0A000", `CREATE TABLE checked (n INTEGER CHECK (n > 0))`, "0A000")
+	// CHECK is accepted and enforced; FOREIGN KEY is still rejected at DDL
+	// instead of being silently discarded.
+	expectOK("ddl.check_accepted", `CREATE TABLE checked (n INTEGER CHECK (n > 0))`)
+	expectCode("constraints.check_23514", `INSERT INTO checked (n) VALUES (-1)`, "23514")
 	expectCode("ddl.foreign_key_0A000", `CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES accounts(id))`, "0A000")
 
 	expectCode("errors.syntax_42601", `SELEC 1`, "42601")

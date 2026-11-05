@@ -23,6 +23,12 @@ import (
 // feature-not-supported SQLSTATE rather than a generic internal error.
 var ErrUnsupportedFeature = errors.New("unsupported feature")
 
+// ErrNoTransaction marks a transaction-control statement that found no
+// transaction to act on. Adapters may report it as a benign no-op (PostgreSQL
+// treats ROLLBACK outside a transaction as a warning) instead of an internal
+// error.
+var ErrNoTransaction = errors.New("no transaction in progress")
+
 // Executor executes SQL statements.
 type Executor struct {
 	schema   *storage.SchemaManager
@@ -113,11 +119,12 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 		listens:           make(map[string]bool),
 	}
 
-	// Expression indexes persist only SQL text, so the storage layer needs a
-	// stateless evaluator to compute their values. The evaluator is a package
-	// function with no per-connection state, so registering it here is
-	// idempotent and safe across concurrent executors.
+	// Expression indexes and CHECK predicates persist only SQL text, so the
+	// storage layer needs a stateless evaluator to compute their values. The
+	// evaluator is a package function with no per-connection state, so
+	// registering it here is idempotent and safe across concurrent executors.
 	table.SetExpressionEvaluator(EvalStoredExpression)
+	schema.SetCheckEvaluator(EvalCheckExpression)
 
 	// Register the main database
 	executor.attachedDatabases["main"] = &DatabaseConnection{
@@ -3711,10 +3718,8 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			case parser.ConstraintAutoIncrement:
 				schema.AutoIncrement = true
 			case parser.ConstraintCheck:
-				return nil, pgerror.Unsupported(
-					"CHECK constraints are not supported: column %q declares CHECK; enforce the rule in the application (the engine parsed but never evaluated CHECK, so accepting it would silently allow invalid rows)",
-					col.Name,
-				)
+				// Collected after every column is known, because a table-level
+				// predicate may reference a later column.
 			case parser.ConstraintForeignKey:
 				return nil, pgerror.Unsupported(
 					"FOREIGN KEY constraints are not supported: column %q declares REFERENCES %s; enforce referential integrity in the application (the engine never validated foreign keys)",
@@ -3726,9 +3731,9 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		schema.Columns = append(schema.Columns, col)
 	}
 
-	// Handle table-level constraints. CHECK and FOREIGN KEY are rejected: they
-	// were previously parsed and discarded, which let applications believe a
-	// constraint existed when nothing enforced it.
+	// Handle table-level constraints. CHECK predicates are persisted and
+	// enforced; FOREIGN KEY is still rejected because the engine never validates
+	// referential integrity.
 	for _, constraint := range stmt.Constraints {
 		switch constraint.Type {
 		case parser.ConstraintPrimaryKey:
@@ -3745,9 +3750,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 				}
 			}
 		case parser.ConstraintCheck:
-			return nil, pgerror.Unsupported(
-				"CHECK constraints are not supported: enforce the rule in the application instead (the engine parsed but never evaluated CHECK)",
-			)
+			// Handled with the column-level predicates once every column is known.
 		case parser.ConstraintForeignKey:
 			return nil, pgerror.Unsupported(
 				"FOREIGN KEY constraints are not supported: enforce referential integrity in the application instead (the engine never validated foreign keys)",
@@ -3760,8 +3763,8 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	// produces, so both enforcement and the catalog observe them.
 	uniqIndexes := e.uniqueConstraintIndexes(stmt)
 
-	// Column references in generated expressions must resolve against the new
-	// table, so validate them once every column is known.
+	// Column references in generated expressions and CHECK predicates must
+	// resolve against the new table, so validate them once every column is known.
 	for _, colDef := range stmt.Columns {
 		if colDef.GeneratedExpr == nil {
 			continue
@@ -3770,6 +3773,15 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			return nil, err
 		}
 	}
+	var columnConstraints []parser.ColumnConstraint
+	for _, colDef := range stmt.Columns {
+		columnConstraints = append(columnConstraints, colDef.Constraints...)
+	}
+	checks, err := e.tableChecks(schema, columnConstraints, stmt.Constraints)
+	if err != nil {
+		return nil, err
+	}
+	schema.Checks = checks
 
 	if err := e.schema.CreateTable(schema); err != nil {
 		if stmt.IfNotExists && strings.Contains(err.Error(), "table already exists") {
@@ -4135,6 +4147,7 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 		Nullable: true,
 	}
 	var uniqueConstraint *parser.ColumnConstraint
+	var checkConstraints []parser.ColumnConstraint
 
 	// Process column constraints
 	for _, constraint := range action.Column.Constraints {
@@ -4156,10 +4169,9 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 				col.Default = val
 			}
 		case parser.ConstraintCheck:
-			return nil, pgerror.Unsupported(
-				"CHECK constraints are not supported: column %q declares CHECK; enforce the rule in the application instead",
-				col.Name,
-			)
+			// Validated with the other CHECK predicates once the column shape is
+			// final, so the predicate can reference the column being added.
+			checkConstraints = append(checkConstraints, constraint)
 		case parser.ConstraintForeignKey:
 			return nil, pgerror.Unsupported(
 				"FOREIGN KEY constraints are not supported: column %q declares REFERENCES %s; enforce referential integrity in the application instead",
@@ -4174,11 +4186,12 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 	}
 
 	// The schema manager validates the new column against durable rows, rewrites
-	// them, and publishes the column together with its UNIQUE index while holding
-	// the table's exclusive gate, so a writer cannot slip a row in between the
-	// validation and the publication. Rows this session staged in an open
-	// transaction are invisible to that scan, so reject them here as well; the
-	// commit re-validates them against the schema that is current by then.
+	// them, and publishes the column together with its CHECK constraints and
+	// UNIQUE index while holding the table's exclusive gate, so a writer cannot
+	// slip a row in between the validation and the publication. Rows this session
+	// staged in an open transaction are invisible to that scan, so reject them
+	// here as well; the commit re-validates them against the schema that is
+	// current by then.
 	if !col.Nullable && col.Default == nil {
 		stagedRows, err := e.session.CountFast(table)
 		if err != nil {
@@ -4189,7 +4202,12 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 		}
 	}
 
-	if err := e.schema.AddColumn(table, col, uniqueIndex); err != nil {
+	checks, err := e.tableChecks(schemaWithColumn(schema, col), checkConstraints, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := e.schema.AddColumn(table, col, checks, uniqueIndex); err != nil {
 		if action.IfNotExists && strings.Contains(err.Error(), "column already exists") {
 			return NewResult("ALTER TABLE"), nil
 		}
@@ -4230,6 +4248,9 @@ func (e *Executor) addColumnUniqueIndex(table, column string, constraint *parser
 
 // executeAlterTableDropColumn drops a column from a table.
 func (e *Executor) executeAlterTableDropColumn(table string, action *parser.DropColumnAction) (*Result, error) {
+	if err := e.rejectCheckColumnChange(table, action.Column, "drop"); err != nil {
+		return nil, err
+	}
 	if err := e.schema.DropColumn(table, action.Column); err != nil {
 		return nil, err
 	}
@@ -4259,6 +4280,9 @@ func (e *Executor) executeAlterTableRename(table string, action *parser.RenameTa
 // executeAlterTableRenameColumn renames a column.
 func (e *Executor) executeAlterTableRenameColumn(table string, action *parser.RenameColumnAction) (*Result, error) {
 	if err := e.rejectExpressionIndexRename(table, action.OldName); err != nil {
+		return nil, err
+	}
+	if err := e.rejectCheckColumnChange(table, action.OldName, "rename"); err != nil {
 		return nil, err
 	}
 	if err := e.schema.RenameColumn(table, action.OldName, action.NewName); err != nil {
@@ -4325,7 +4349,7 @@ func (e *Executor) executeBegin(stmt *parser.BeginStmt) (*Result, error) {
 // executeCommit commits the current transaction.
 func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 	if !e.inTransaction {
-		return nil, fmt.Errorf("cannot commit: no transaction in progress")
+		return nil, fmt.Errorf("cannot commit: %w", ErrNoTransaction)
 	}
 
 	lsn, err := e.session.CommitWithLSN()
@@ -4350,7 +4374,7 @@ func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 // executeRollback rolls back the current transaction or to a savepoint.
 func (e *Executor) executeRollback(stmt *parser.RollbackStmt) (*Result, error) {
 	if !e.inTransaction {
-		return nil, fmt.Errorf("cannot rollback: no transaction in progress")
+		return nil, fmt.Errorf("cannot rollback: %w", ErrNoTransaction)
 	}
 
 	if stmt.Savepoint != "" {
@@ -4397,7 +4421,7 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 // executeRelease releases a savepoint.
 func (e *Executor) executeRelease(stmt *parser.ReleaseStmt) (*Result, error) {
 	if !e.inTransaction {
-		return nil, fmt.Errorf("cannot release savepoint: no transaction in progress")
+		return nil, fmt.Errorf("cannot release savepoint: %w", ErrNoTransaction)
 	}
 
 	// Find and remove the savepoint
@@ -7535,6 +7559,10 @@ func collectTableColumnRefs(expr parser.Expr) []tableColRef {
 			for _, a := range n.Args {
 				walk(a)
 			}
+		case *parser.ParenExpr:
+			walk(n.Expr)
+		case *parser.CastExpr:
+			walk(n.Expr)
 		}
 	}
 	walk(expr)

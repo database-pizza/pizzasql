@@ -30,6 +30,10 @@ The migration command exits after writing and verifying the destination. It refu
 - Migration copies the final live key/value state. Legacy journal history is not imported, and imported records begin at the migration baseline LSN.
 - Existing PizzaSQL row values remain readable as legacy JSON after migration. New and updated rows use the versioned binary tuple encoding, so an eager row rewrite is unnecessary.
 - Schema and catalog values remain JSON because they are cold metadata.
+- `Schema.Checks` (CHECK constraints) is an additive, optional JSON field. A
+  pre-CHECK engine ignores it on read and drops it on the next schema write, so
+  rolling back to such an engine silently stops enforcing CHECK constraints;
+  restore the newer engine (or re-create the constraints) after a rollback.
 - Successful PKBFI writes are acknowledged only after PizzaKV's durability sync completes.
 - A `.pkvdb` file must have one PizzaSQL process owner. Optimistic scan and
   predicate conflict detection uses process-local generations and is not safe

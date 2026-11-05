@@ -429,6 +429,9 @@ func (s *Session) applyOverlaySchemaDefaults() error {
 			if err := applySchemaDefaults(schema, entry.row); err != nil {
 				return err
 			}
+			if err := s.schema.validateChecks(schema, entry.row); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -794,7 +797,7 @@ func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) 
 		}
 	}
 
-	if err := validateNotNull(schema, row); err != nil {
+	if err := s.schema.validateRowConstraints(schema, row); err != nil {
 		return nil, false, err
 	}
 	s.stagePut(table, key, row)
@@ -887,7 +890,7 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 				}
 			}
 		}
-		if err := validateNotNull(schema, row); err != nil {
+		if err := s.schema.validateRowConstraints(schema, row); err != nil {
 			return count, err
 		}
 		newKey := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))

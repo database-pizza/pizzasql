@@ -25,6 +25,27 @@ type Schema struct {
 	CreatedAt     time.Time `json:"created_at"`
 	NextRowID     int64     `json:"next_rowid"`
 	AutoIncrement bool      `json:"autoincrement"`
+	// Checks holds the row predicates declared with CHECK, at column and table
+	// level alike. Inline and table-level declarations are equivalent once
+	// parsed, so both live in this one list.
+	Checks []CheckConstraint `json:"checks,omitempty"`
+}
+
+// CheckConstraint is a persisted CHECK predicate. The predicate is stored as
+// SQL text and re-parsed by the evaluator installed on the SchemaManager, so a
+// durable reload keeps enforcing it.
+type CheckConstraint struct {
+	Name       string `json:"name,omitempty"`
+	Expression string `json:"expression"`
+}
+
+// Label identifies the constraint in error messages and the catalog: the
+// declared name when there is one, otherwise the expression text.
+func (c CheckConstraint) Label() string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return c.Expression
 }
 
 // Column represents a column definition.
@@ -84,8 +105,34 @@ type SchemaManager struct {
 	tableLocksMu    sync.Mutex
 	tableLocks      map[string]*sync.RWMutex
 
+	// checkMu guards checkEval, the pluggable evaluator for persisted CHECK
+	// predicates. It is set by the SQL executor so storage stays independent of
+	// the SQL front end.
+	checkMu   sync.RWMutex
+	checkEval CheckEvaluator
+
 	rowIDMu    sync.Mutex
 	rowIDAlloc map[string]*rowIDAllocator
+}
+
+// CheckEvaluator reports whether a persisted CHECK expression holds for a row.
+// A false result is a violation; NULL and other unknown results must be
+// reported as true, matching SQL three-valued logic. The SQL executor registers
+// one so the storage layer can enforce CHECK without importing the parser.
+type CheckEvaluator func(expression string, row Row) (bool, error)
+
+// SetCheckEvaluator installs the evaluator used to enforce persisted CHECK
+// predicates.
+func (m *SchemaManager) SetCheckEvaluator(eval CheckEvaluator) {
+	m.checkMu.Lock()
+	m.checkEval = eval
+	m.checkMu.Unlock()
+}
+
+func (m *SchemaManager) checkEvaluator() CheckEvaluator {
+	m.checkMu.RLock()
+	defer m.checkMu.RUnlock()
+	return m.checkEval
 }
 
 // BeginTransaction is retained for API compatibility. Buffered per-session
@@ -349,6 +396,7 @@ func cloneSchema(schema *Schema) *Schema {
 	}
 	cloned := *schema
 	cloned.Columns = append([]Column(nil), schema.Columns...)
+	cloned.Checks = append([]CheckConstraint(nil), schema.Checks...)
 	return &cloned
 }
 
@@ -943,27 +991,30 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 }
 
 // AddColumn adds a new column to a table. When unique is non-nil the column's
-// UNIQUE index is registered as part of the same statement.
+// UNIQUE index is registered as part of the same statement, and checks are
+// persisted with the column in the same schema snapshot.
 //
 // A constant DEFAULT is materialized into every existing row before the schema
-// is published. NOT NULL, UNIQUE, and index validation all read persisted row
-// values, so a default that only existed in the catalog would be invisible to
-// them: a UNIQUE index over the new column could not see the duplicate values
-// every existing row shares, and an UPDATE to NULL would look non-null. The
-// rewrite is the same shape as DropColumn: the table's exclusive gate keeps
-// point writes and CAS commits out while rows are scanned, validated, and
-// rewritten, the transform is idempotent, and the schema is saved last so an
-// interrupted operation resumes against the old schema.
+// is published. NOT NULL, UNIQUE, CHECK, and index validation all read
+// persisted row values, so a default that only existed in the catalog would be
+// invisible to them: a UNIQUE index over the new column could not see the
+// duplicate values every existing row shares, a CHECK predicate could not see a
+// violating default, and an UPDATE to NULL would look non-null. The rewrite is
+// the same shape as DropColumn: the table's exclusive gate keeps point writes
+// and CAS commits out while rows are scanned, validated, and rewritten, the
+// transform is idempotent, and the schema is saved last so an interrupted
+// operation resumes against the old schema.
 //
-// The gate also makes the validation authoritative: NOT NULL without a default
-// and duplicate UNIQUE values are rejected before any row is touched, and the
-// column and its index are published together in one batch write, so a crash
-// cannot leave the column visible without the constraint that validates it.
-// A nullable column without a default needs no rewrite because a missing row
-// field already reads as NULL. Like DROP COLUMN, the statement holds the catalog
-// lock for the whole scan, so the cost is one table scan (two for UNIQUE) and a
-// table-wide stall per ADD COLUMN that has a default or an index.
-func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) error {
+// The gate also makes the validation authoritative: NOT NULL without a default,
+// duplicate UNIQUE values, and rows a new CHECK predicate rejects are rejected
+// before any row is touched, and the column, its checks, and its index are
+// published together in one batch write, so a crash cannot leave the column
+// visible without the constraints that validate it. A nullable column without a
+// default needs no rewrite because a missing row field already reads as NULL.
+// Like DROP COLUMN, the statement holds the catalog lock for the whole scan, so
+// the cost is one table scan per validating constraint plus a table-wide stall
+// per ADD COLUMN that has a default, an index, or a check.
+func (m *SchemaManager) AddColumn(table string, column Column, checks []CheckConstraint, unique *Index) error {
 	tableLock := m.tableLock(table)
 	tableLock.Lock()
 	defer tableLock.Unlock()
@@ -988,6 +1039,9 @@ func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) er
 		if err := m.validateAddColumnUnique(table, column, unique); err != nil {
 			return err
 		}
+	}
+	if err := m.validateAddColumnChecks(table, column, checks); err != nil {
+		return err
 	}
 
 	// A required column with nothing to write into rows that already exist
@@ -1014,16 +1068,18 @@ func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) er
 		}
 	}
 
-	return m.publishAddedColumn(schema, column, unique)
+	return m.publishAddedColumn(schema, column, checks, unique)
 }
 
-// publishAddedColumn publishes a column and, when present, its unique index in
-// one atomic batch write (m.mu must be held): the schema snapshot, the index
-// definition, and the index list always become durable together or not at all.
-func (m *SchemaManager) publishAddedColumn(schema *Schema, column Column, unique *Index) error {
+// publishAddedColumn publishes a column, its checks, and, when present, its
+// unique index in one atomic batch write (m.mu must be held): the schema
+// snapshot, the index definition, and the index list always become durable
+// together or not at all.
+func (m *SchemaManager) publishAddedColumn(schema *Schema, column Column, checks []CheckConstraint, unique *Index) error {
 	// Publish a fresh snapshot instead of mutating readers' shared pointer.
 	schema = cloneSchema(schema)
 	schema.Columns = append(schema.Columns, column)
+	schema.Checks = append(schema.Checks, checks...)
 	schemaData, err := json.Marshal(schema)
 	if err != nil {
 		return fmt.Errorf("failed to serialize schema: %w", err)
@@ -1564,6 +1620,37 @@ func (m *SchemaManager) validateAddColumnUnique(table string, column Column, ind
 			return false, &UniqueViolationError{Constraint: index.Name}
 		}
 		seen[encoded] = struct{}{}
+		return false, nil
+	})
+}
+
+// validateAddColumnChecks rejects an ADD COLUMN ... CHECK whose predicate is
+// already false for an existing row. Like validateAddColumnUnique it reads rows
+// as they will look after the constant-default backfill, and it runs before that
+// rewrite so a rejected DDL leaves no row carrying the new field. The caller
+// holds the table's exclusive gate, so no writer can insert a violating row
+// between this validation and the publication of the check.
+func (m *SchemaManager) validateAddColumnChecks(table string, column Column, checks []CheckConstraint) error {
+	if len(checks) == 0 {
+		return nil
+	}
+	eval := m.checkEvaluator()
+	if eval == nil {
+		return fmt.Errorf("cannot validate CHECK constraints on %s: no CHECK evaluator installed", table)
+	}
+	return m.applyRows(table, func(row Row) (bool, error) {
+		if _, ok := rowColumnValue(row, column.Name); !ok && column.Default != nil {
+			row[column.Name] = column.Default
+		}
+		for _, check := range checks {
+			holds, err := eval(check.Expression, row)
+			if err != nil {
+				return false, fmt.Errorf("evaluate CHECK constraint %s on %s: %w", check.Label(), table, err)
+			}
+			if !holds {
+				return false, &CheckViolationError{Table: table, Constraint: check.Label()}
+			}
+		}
 		return false, nil
 	})
 }
