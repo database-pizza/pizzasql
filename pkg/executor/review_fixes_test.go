@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
@@ -195,19 +197,21 @@ func TestAnalyzeIsSafeNoOp(t *testing.T) {
 	}
 }
 
-func TestForeignKeysPragmaNoOp(t *testing.T) {
+func TestForeignKeysPragmaAlwaysOn(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
 
-	if res := execMust(t, e, "PRAGMA foreign_keys = OFF"); res.CommandTag != "PRAGMA" {
+	if res := execMust(t, e, "PRAGMA foreign_keys = ON"); res.CommandTag != "PRAGMA" {
 		t.Fatalf("PRAGMA tag = %q", res.CommandTag)
 	}
 	res := execMust(t, e, "PRAGMA foreign_keys")
-	if res.RowCount != 1 || res.Rows[0][0] != int64(0) {
-		t.Fatalf("foreign_keys = %v, want 0", res.Rows)
+	if res.RowCount != 1 || res.Rows[0][0] != int64(1) {
+		t.Fatalf("foreign_keys = %v, want 1", res.Rows)
 	}
-	if _, err := execSQL(e, "PRAGMA foreign_keys = ON"); err == nil {
-		t.Fatal("expected enabling unsupported foreign keys to fail")
+	if _, err := execSQL(e, "PRAGMA foreign_keys = OFF"); err == nil {
+		t.Fatal("expected disabling always-on foreign keys to fail")
+	} else if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+		t.Fatalf("PRAGMA foreign_keys = OFF error = %v, want ErrFeatureNotSupported", err)
 	}
 }
 

@@ -55,6 +55,12 @@ type TableManager struct {
 	// concurrently. Index is derived from the full data key (database+table+pk).
 	stripes [64]sync.Mutex
 
+	// foreignKeyMu serializes writes that touch a table participating in a
+	// FOREIGN KEY, so a child-side or parent-side validation scan cannot
+	// interleave with a conflicting write. It is always acquired before any
+	// table gate.
+	foreignKeyMu sync.Mutex
+
 	// generations tracks full-table scans. predicateGenerations narrows indexed
 	// equality reads to one index value so unrelated writes do not conflict.
 	genMu                sync.Mutex
@@ -595,6 +601,16 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 	rowid, _ := rowIDFromRow(nr)
 	wasInit := m.countInitialized(table)
 
+	// Foreign-key validation scans the parent (and, for a parent change, the
+	// child) rows. Take the foreign-key write gate before the table gate so a
+	// concurrent write on the other side of the constraint cannot interleave and
+	// so the lock order stays foreign-key gate -> table gate everywhere.
+	unlockFK, err := m.lockForeignKeyWrites(table)
+	if err != nil {
+		return 0, err
+	}
+	defer unlockFK()
+
 	// Point writers share this gate with each other. Transaction commits and
 	// scan-based writes take it exclusively, so generation validation and cache
 	// publication are ordered without serializing writes to different keys.
@@ -618,6 +634,9 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	if err := m.schema.validateChecks(schema, nr); err != nil {
+		return 0, err
+	}
+	if err := m.validateInsertForeignKeys(schema, []Row{nr}); err != nil {
 		return 0, err
 	}
 	data, err := encodeRow(nr)
@@ -710,6 +729,12 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 	if len(rows) == 0 {
 		return 0, 0, nil
 	}
+	unlockFK, err := m.lockForeignKeyWrites(table)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer unlockFK()
+
 	tl := m.tableLock(table)
 	tl.Lock()
 	defer tl.Unlock()
@@ -731,6 +756,12 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 		}
 		normalized = append(normalized, nr)
 		dataKeys = append(dataKeys, key)
+	}
+	// Every row of the batch is visible to the others, so a self-referential
+	// multi-row insert may reference a sibling that is written in the same
+	// atomic batch.
+	if err := m.validateInsertForeignKeys(schema, normalized); err != nil {
+		return 0, 0, err
 	}
 
 	// Serialize all rows into batch operations. A parallel slice keeps the
@@ -1015,6 +1046,11 @@ func (m *TableManager) updateLocked(table string, updateFn func(Row) (Row, error
 // same row fails with a serialization error instead of being silently lost.
 func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
 	key := m.dataKey(table, pk)
+	unlockFK, err := m.lockForeignKeyWrites(table)
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlockFK()
 	unlock, uniq, err := m.lockForWrite(table)
 	if err != nil {
 		return nil, false, err
@@ -1059,6 +1095,12 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 		return nil, false, err
 	}
 	if err := m.schema.validateChecks(schema, row); err != nil {
+		return nil, false, err
+	}
+	if err := m.validateInsertForeignKeys(schema, []Row{row}); err != nil {
+		return nil, false, err
+	}
+	if err := m.validateParentKeyRemoval(table, oldRow, row); err != nil {
 		return nil, false, err
 	}
 	data, err := encodeRow(row)
@@ -1123,6 +1165,12 @@ func (m *TableManager) DeleteByPK(table, pk string) (Row, bool, error) {
 		return nil, false, err
 	}
 
+	unlockFK, err := m.lockForeignKeyWrites(table)
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlockFK()
+
 	key := m.dataKey(table, pk)
 	tl := m.tableLock(table)
 	tl.RLock()
@@ -1137,6 +1185,10 @@ func (m *TableManager) DeleteByPK(table, pk string) (Row, bool, error) {
 		return nil, false, nil
 	}
 	if err != nil {
+		return nil, false, err
+	}
+
+	if err := m.validateParentKeyRemoval(table, row, nil); err != nil {
 		return nil, false, err
 	}
 

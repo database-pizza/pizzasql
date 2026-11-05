@@ -169,6 +169,29 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		return 0, fmt.Errorf("current transaction is aborted")
 	}
 
+	// Referential integrity spans tables: a commit must validate the final
+	// child rows against the final parent rows, including rows another table
+	// staged in this same transaction. Take the foreign-key write gate before
+	// any table gate (the canonical lock order) and register the constrained
+	// component as scan reads so acquireCommitLocks holds it exclusively while
+	// the validation scans run. A concurrent write on either side would bump one
+	// of those generations and fail the commit with 40001 instead of committing
+	// a dangling reference.
+	closure, err := s.foreignKeyClosure()
+	if err != nil {
+		s.resetLocked()
+		return 0, err
+	}
+	if len(closure) > 0 {
+		s.table.foreignKeyMu.Lock()
+		defer s.table.foreignKeyMu.Unlock()
+	}
+	for table := range closure {
+		if _, ok := s.scanGens[table]; !ok {
+			s.scanGens[table] = s.table.generation(table)
+		}
+	}
+
 	// Acquire the per-table gates, escalating any table whose UNIQUE index
 	// appeared after the initial unlocked probe. See acquireCommitLocks.
 	_, _, unlockAll, uniqueTables, err := s.acquireCommitLocks()
@@ -203,6 +226,16 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 			s.resetLocked()
 			return 0, ErrSerialization
 		}
+	}
+
+	// Validate the final overlay against every foreign key in the constrained
+	// component. The per-table gates acquired above exclude concurrent writers,
+	// so this sees a stable state; checking the final state (rather than each
+	// statement) is what lets a transaction delete a parent and its children in
+	// either order as long as the committed state stays consistent.
+	if err := s.validateForeignKeyFinalState(closure); err != nil {
+		s.resetLocked()
+		return 0, err
 	}
 
 	// Validate the final overlay of every unique-indexed written table against

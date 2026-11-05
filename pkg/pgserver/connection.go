@@ -417,6 +417,7 @@ func (c *Connection) handleQuery(msg *Message) error {
 			var uniqueErr *storage.UniqueViolationError
 			var notNullErr *storage.NotNullViolationError
 			var checkErr *storage.CheckViolationError
+			var foreignKeyErr *storage.ForeignKeyViolationError
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
@@ -429,6 +430,13 @@ func (c *Connection) handleQuery(msg *Message) error {
 				}
 			} else if errors.As(err, &checkErr) {
 				code = ErrCodeCheckViolation
+				if _, commit := stmt.(*parser.CommitStmt); commit {
+					c.txStatus = TxStatusIdle
+				} else if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if errors.As(err, &foreignKeyErr) {
+				code = ErrCodeForeignKeyViolation
 				if _, commit := stmt.(*parser.CommitStmt); commit {
 					c.txStatus = TxStatusIdle
 				} else if c.txStatus == TxStatusInBlock {
@@ -673,6 +681,7 @@ func (c *Connection) handleExecute(msg *Message) error {
 		var uniqueErr *storage.UniqueViolationError
 		var notNullErr *storage.NotNullViolationError
 		var checkErr *storage.CheckViolationError
+		var foreignKeyErr *storage.ForeignKeyViolationError
 		if errors.Is(err, storage.ErrSerialization) {
 			code = ErrCodeSerializationFailure
 			c.txStatus = TxStatusIdle
@@ -685,6 +694,13 @@ func (c *Connection) handleExecute(msg *Message) error {
 			}
 		} else if errors.As(err, &checkErr) {
 			code = ErrCodeCheckViolation
+			if _, commit := stmt.(*parser.CommitStmt); commit {
+				c.txStatus = TxStatusIdle
+			} else if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.As(err, &foreignKeyErr) {
+			code = ErrCodeForeignKeyViolation
 			if _, commit := stmt.(*parser.CommitStmt); commit {
 				c.txStatus = TxStatusIdle
 			} else if c.txStatus == TxStatusInBlock {

@@ -11,6 +11,7 @@ import (
 const (
 	CodeFeatureNotSupported  = "0A000"
 	CodeUniqueViolation      = "23505"
+	CodeForeignKeyViolation  = "23503"
 	CodeCheckViolation       = "23514"
 	CodeSerializationFailure = "40001"
 	CodeSyntaxError          = "42601"

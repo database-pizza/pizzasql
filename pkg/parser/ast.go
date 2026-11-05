@@ -214,12 +214,20 @@ type DataType struct {
 
 // ColumnConstraint represents a column-level constraint.
 type ColumnConstraint struct {
-	Type      ConstraintType
-	Name      string // optional constraint name
-	Default   Expr   // for DEFAULT
-	RefTable  string // for REFERENCES
-	RefColumn string // for REFERENCES
-	Check     Expr   // for CHECK
+	Type       ConstraintType
+	Name       string   // optional constraint name
+	Default    Expr     // for DEFAULT
+	RefTable   string   // for REFERENCES
+	RefColumns []string // for REFERENCES (empty means the parent's primary key)
+	Check      Expr     // for CHECK
+	// OnDelete and OnUpdate record the foreign-key referential actions. The
+	// engine enforces foreign keys immediately and implements no cascades, so
+	// only NO ACTION and RESTRICT are accepted; the rest are rejected at DDL.
+	OnDelete ReferentialAction
+	OnUpdate ReferentialAction
+	// Deferrable is set for a DEFERRABLE clause. Deferred enforcement is not
+	// implemented, so DDL rejects it instead of accepting a weaker guarantee.
+	Deferrable bool
 	// OnConflict is the conflict resolution algorithm declared with
 	// ON CONFLICT REPLACE/etc. (ConflictAbort is the zero value/default).
 	OnConflict    ConflictAction
@@ -239,6 +247,37 @@ const (
 	ConstraintAutoIncrement
 )
 
+// ReferentialAction is a parsed foreign-key ON DELETE/ON UPDATE action.
+type ReferentialAction int
+
+const (
+	// RefActionUnspecified is the default (no clause, equivalent to NO ACTION).
+	RefActionUnspecified ReferentialAction = iota
+	RefActionNoAction
+	RefActionRestrict
+	RefActionCascade
+	RefActionSetNull
+	RefActionSetDefault
+)
+
+// String returns the SQL spelling of the action.
+func (a ReferentialAction) String() string {
+	switch a {
+	case RefActionNoAction:
+		return "NO ACTION"
+	case RefActionRestrict:
+		return "RESTRICT"
+	case RefActionCascade:
+		return "CASCADE"
+	case RefActionSetNull:
+		return "SET NULL"
+	case RefActionSetDefault:
+		return "SET DEFAULT"
+	default:
+		return ""
+	}
+}
+
 // TableConstraint represents a table-level constraint.
 type TableConstraint struct {
 	Type       ConstraintType
@@ -247,6 +286,11 @@ type TableConstraint struct {
 	RefTable   string   // for FOREIGN KEY
 	RefColumns []string // for FOREIGN KEY
 	Check      Expr     // for CHECK
+	// OnDelete and OnUpdate record the foreign-key referential actions.
+	OnDelete ReferentialAction
+	OnUpdate ReferentialAction
+	// Deferrable is set for a DEFERRABLE clause.
+	Deferrable bool
 	// OnConflict is the conflict resolution declared with ON CONFLICT
 	// REPLACE/etc.; HasOnConflict distinguishes it from the default ABORT.
 	OnConflict    ConflictAction

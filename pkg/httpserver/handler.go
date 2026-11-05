@@ -433,7 +433,15 @@ func constraintViolationHTTPError(err error) *HTTPError {
 	var notNullErr *storage.NotNullViolationError
 	var uniqueErr *storage.UniqueViolationError
 	var primaryKeyErr *storage.PrimaryKeyViolationError
+	var foreignKeyErr *storage.ForeignKeyViolationError
 	switch {
+	case errors.As(err, &foreignKeyErr):
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    "23503",
+			Message: err.Error(),
+			Details: map[string]interface{}{"constraint": foreignKeyErr.Constraint},
+		}
 	case errors.As(err, &checkErr):
 		return &HTTPError{
 			Status:  http.StatusBadRequest,
@@ -492,6 +500,15 @@ func sqlStateHTTPError(err error) *HTTPError {
 			Status:  http.StatusBadRequest,
 			Code:    "23502",
 			Message: message,
+		}
+	}
+	if strings.HasPrefix(message, "FOREIGN KEY constraint failed: ") {
+		constraint := strings.TrimPrefix(message, "FOREIGN KEY constraint failed: ")
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    "23503",
+			Message: message,
+			Details: map[string]interface{}{"constraint": constraint},
 		}
 	}
 	if strings.HasPrefix(message, "CHECK constraint failed: ") {

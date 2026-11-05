@@ -339,6 +339,31 @@ func recreateCreateTableSQL(s *storage.Schema) string {
 		}
 		cols = append(cols, fmt.Sprintf("CHECK (%s)", check.Expression))
 	}
+	// Foreign keys are stored as resolved table-level constraints, so an inline
+	// REFERENCES declaration is reported in its equivalent table-level form.
+	for _, fk := range s.ForeignKeys {
+		child := make([]string, len(fk.Columns))
+		for i, name := range fk.Columns {
+			child[i] = quoteIdent(name)
+		}
+		parent := make([]string, len(fk.RefColumns))
+		for i, name := range fk.RefColumns {
+			parent[i] = quoteIdent(name)
+		}
+		clause := fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)", strings.Join(child, ", "), quoteIdent(fk.RefTable), strings.Join(parent, ", "))
+		for _, action := range []struct {
+			clause string
+			value  string
+		}{{"ON DELETE", fk.OnDelete}, {"ON UPDATE", fk.OnUpdate}} {
+			if action.value != "" {
+				clause += " " + action.clause + " " + action.value
+			}
+		}
+		if fk.Name != "" {
+			clause = fmt.Sprintf("CONSTRAINT %s %s", quoteIdent(fk.Name), clause)
+		}
+		cols = append(cols, clause)
+	}
 	return fmt.Sprintf("CREATE TABLE %s (%s)", quoteIdent(s.Name), strings.Join(cols, ", "))
 }
 
