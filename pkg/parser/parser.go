@@ -2562,12 +2562,38 @@ func (p *Parser) parseAddExpr() (Expr, error) {
 }
 
 func (p *Parser) parseMulExpr() (Expr, error) {
-	left, err := p.parseUnaryExpr()
+	left, err := p.parseJSONExpr()
 	if err != nil {
 		return nil, err
 	}
 
 	for p.curTokenIs(lexer.TokenStar) || p.curTokenIs(lexer.TokenSlash) || p.curTokenIs(lexer.TokenPercent) {
+		op := p.curToken.Type
+		p.nextToken()
+		right, err := p.parseJSONExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryExpr{Left: left, Op: op, Right: right}
+	}
+
+	return left, nil
+}
+
+// parseJSONExpr parses the JSON extraction operators -> and ->>.
+//
+// Precedence: they bind tighter than multiplicative, additive/concatenation,
+// bitwise, and comparison operators, and looser than unary -, +, and ~. So
+// "a -> 'x' || 'y'" concatenates the extracted value, "a -> 'x' = 1" compares
+// it, and "-a -> 'x'" negates a before extraction. They are left-associative,
+// so "a -> 'x' -> 0" extracts 'x' and then indexes the result at 0.
+func (p *Parser) parseJSONExpr() (Expr, error) {
+	left, err := p.parseUnaryExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	for p.curTokenIs(lexer.TokenArrow) || p.curTokenIs(lexer.TokenArrowText) {
 		op := p.curToken.Type
 		p.nextToken()
 		right, err := p.parseUnaryExpr()

@@ -4943,6 +4943,10 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 		return applyBitwise(expr.Op, left, right)
 	}
 
+	if expr.Op == lexer.TokenArrow || expr.Op == lexer.TokenArrowText {
+		return jsonArrowExtract(left, right, expr.Op == lexer.TokenArrowText)
+	}
+
 	switch expr.Op {
 	case lexer.TokenPlus:
 		if left == nil || right == nil {
@@ -5065,6 +5069,9 @@ func (e *Executor) applyBinaryOp(op lexer.TokenType, left, right interface{}) (i
 			return nil, nil
 		}
 		return applyBitwise(op, left, right)
+	}
+	if op == lexer.TokenArrow || op == lexer.TokenArrowText {
+		return jsonArrowExtract(left, right, op == lexer.TokenArrowText)
 	}
 	switch op {
 	case lexer.TokenPlus:

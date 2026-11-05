@@ -994,6 +994,10 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 	case lexer.TokenConcat:
 		// String concatenation
 		info.Type = TypeText
+	case lexer.TokenArrow, lexer.TokenArrowText:
+		// JSON extraction. Like json_extract, the result follows the JSON value
+		// and is not a fixed SQL type (a JSON number extracts as a number).
+		info.Type = TypeAny
 	default:
 		info.Type = TypeUnknown
 	}

@@ -171,6 +171,17 @@ func (l *Lexer) NextToken() Token {
 		if l.peekChar() == '-' {
 			// Line comment
 			tok = l.readLineComment()
+		} else if l.peekChar() == '>' {
+			l.readChar() // consume '-'
+			if l.peekChar() == '>' {
+				l.readChar() // consume the first '>'
+				tok.Type = TokenArrowText
+				tok.Literal = "->>"
+			} else {
+				tok.Type = TokenArrow
+				tok.Literal = "->"
+			}
+			l.readChar()
 		} else {
 			tok.Type = TokenMinus
 			tok.Literal = "-"
