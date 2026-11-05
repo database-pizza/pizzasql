@@ -491,6 +491,15 @@ func (e *Executor) evalJSONBBinary(op lexer.TokenType, leftExpr, rightExpr parse
 	leftJSONB := e.isJSONBExpr(leftExpr)
 	rightJSONB := e.isJSONBExpr(rightExpr)
 
+	// Array @> and <@ compare arrays element-wise and must not fall into the
+	// jsonb path, which would reject an array operand with a jsonb type error.
+	if (op == lexer.TokenAtArrow || op == lexer.TokenLtAt) && !leftJSONB && !rightJSONB {
+		if arrayType, ok := e.arrayContainmentType(leftExpr, rightExpr); ok {
+			value, err := e.arrayContainment(op, arrayType, leftExpr, rightExpr, left, right)
+			return value, true, err
+		}
+	}
+
 	if isComparisonOp(op) && (leftJSONB || rightJSONB) {
 		if left == nil || right == nil {
 			return nil, true, nil

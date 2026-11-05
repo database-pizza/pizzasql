@@ -226,3 +226,25 @@ func TestBracketAliasShapesAfterExpression(t *testing.T) {
 		}
 	}
 }
+
+func TestTableFunctionColumnAliasListParses(t *testing.T) {
+	stmt := parseOne(t, `SELECT unnest FROM unnest(ARRAY[1,2,3]) AS t(unnest)`).(*SelectStmt)
+	if got := stmt.From[0].ColumnAliases; len(got) != 1 || got[0] != "unnest" {
+		t.Fatalf("unnest column aliases = %v, want [unnest]", got)
+	}
+	if stmt.From[0].Alias != "t" {
+		t.Fatalf("unnest table alias = %q, want t", stmt.From[0].Alias)
+	}
+
+	// The AS keyword is optional, and the list may rename several columns.
+	stmt = parseOne(t, `SELECT k, v FROM jsonb_each('{"a":1}') e(k, v)`).(*SelectStmt)
+	if got := stmt.From[0].ColumnAliases; len(got) != 2 || got[0] != "k" || got[1] != "v" {
+		t.Fatalf("jsonb_each column aliases = %v, want [k v]", got)
+	}
+
+	// An alias without a list keeps the function's default column names.
+	stmt = parseOne(t, `SELECT * FROM unnest(ARRAY[1]) AS u`).(*SelectStmt)
+	if len(stmt.From[0].ColumnAliases) != 0 {
+		t.Fatalf("alias-only column aliases = %v, want none", stmt.From[0].ColumnAliases)
+	}
+}

@@ -1,6 +1,9 @@
 package parser
 
-import "github.com/danfragoso/pizzasql-next/pkg/lexer"
+import (
+	"github.com/danfragoso/pizzasql-next/pkg/lexer"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
+)
 
 // Node is the base interface for all AST nodes.
 type Node interface {
@@ -87,9 +90,32 @@ type TableRef struct {
 	Alias    string
 	Subquery *SelectStmt // for derived tables (SELECT ... FROM (SELECT ...) AS alias)
 	Join     *JoinClause // for joined tables
-	// Function is set for a table function in FROM (currently only unnest()).
-	// Name holds the function name so ordinary table dispatch ignores it.
+	// Function is set for a table function in FROM (currently only unnest() and
+	// the jsonb set-returning functions). Name holds the function name so
+	// ordinary table dispatch ignores it.
 	Function *FunctionCall
+	// ColumnAliases holds the optional `AS alias(col, ...)` list that renames a
+	// table function's output columns.
+	ColumnAliases []string
+}
+
+// ApplyColumnAliases renames a table function's output columns with the
+// reference's `AS alias(col, ...)` list. A list whose length does not match the
+// function's output arity is rejected, as PostgreSQL does.
+func (t *TableRef) ApplyColumnAliases(columns []string) ([]string, error) {
+	if len(t.ColumnAliases) == 0 {
+		return columns, nil
+	}
+	if len(t.ColumnAliases) != len(columns) {
+		name := t.Alias
+		if name == "" {
+			name = t.Name
+		}
+		return nil, pgerror.InvalidColumnReference(
+			"table %q has %d columns available but %d columns specified",
+			name, len(columns), len(t.ColumnAliases))
+	}
+	return append([]string(nil), t.ColumnAliases...), nil
 }
 
 // JoinClause represents a JOIN clause.

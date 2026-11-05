@@ -69,6 +69,8 @@ func TestNegotiatedParameterOIDs(t *testing.T) {
 		{"placeholder_in_comment", `SELECT id FROM t WHERE id = 1 -- $1`, nil, []int32{}},
 		{"first_occurrence_wins", `SELECT id FROM t WHERE id = $1 OR big = $1`, nil, []int32{23}},
 		{"array_column_any", `SELECT tags FROM arr WHERE tags = ANY($1)`, nil, []int32{1009}},
+		{"array_containment", `SELECT id FROM arr WHERE nums @> $1`, nil, []int32{1007}},
+		{"array_containment_reversed", `SELECT id FROM arr WHERE $1 <@ nums`, nil, []int32{1007}},
 		{"limit_bigint", `SELECT id FROM t LIMIT $1 OFFSET $2`, nil, []int32{20, 20}},
 		{"join_condition", `SELECT t.id FROM t JOIN arr ON t.big = $1`, nil, []int32{20}},
 		{"join_subquery_body", `SELECT t.id FROM t JOIN (SELECT id FROM arr WHERE nums[1] = $1) AS x ON x.id = t.id`, nil, []int32{23}},

@@ -34,6 +34,8 @@ func jsonbErrorCode(t *testing.T, err error) string {
 		return pgerror.CodeFeatureNotSupported
 	case errors.Is(err, pgerror.ErrDatatypeMismatch):
 		return pgerror.CodeDatatypeMismatch
+	case errors.Is(err, pgerror.ErrInvalidColumnReference):
+		return pgerror.CodeInvalidColumnReference
 	}
 	var analysisErr *analyzer.AnalysisError
 	if errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch {
@@ -428,6 +430,28 @@ func TestJSONBSetReturningFunctionsInFrom(t *testing.T) {
 		t.Fatalf("aliased jsonb_each rows = %v", res.Rows)
 	}
 
+	// PostgreSQL's AS alias(col, ...) list renames the output columns.
+	res = execMust(t, e, `SELECT e.k, e.v FROM jsonb_each('{"a":1}') AS e(k, v)`)
+	if len(res.Columns) != 2 || res.Columns[0] != "k" || res.Columns[1] != "v" {
+		t.Fatalf("jsonb_each renamed columns = %v", res.Columns)
+	}
+	if res.RowCount != 1 || res.Rows[0][0] != "a" || res.Rows[0][1] != `1` || res.ColumnTypes[1] != "JSONB" {
+		t.Fatalf("jsonb_each renamed rows = %v types = %v", res.Rows, res.ColumnTypes)
+	}
+
+	res = execMust(t, e, `SELECT * FROM jsonb_each_text('{"a":true}') AS e(name, text_value)`)
+	if len(res.Columns) != 2 || res.Columns[0] != "name" || res.Columns[1] != "text_value" {
+		t.Fatalf("jsonb_each_text renamed columns = %v", res.Columns)
+	}
+	if res.Rows[0][1] != "true" {
+		t.Fatalf("jsonb_each_text renamed rows = %v", res.Rows)
+	}
+
+	res = execMust(t, e, `SELECT element FROM jsonb_array_elements('[1,2]') AS t(element) WHERE element @> '1'::jsonb`)
+	if res.RowCount != 1 || res.Rows[0][0] != `1` {
+		t.Fatalf("jsonb_array_elements renamed rows = %v", res.Rows)
+	}
+
 	res = execMust(t, e, `SELECT key, value FROM jsonb_each_text('{"a":null,"b":true}')`)
 	if res.RowCount != 2 || res.Rows[0][0] != "a" || res.Rows[0][1] != nil || res.Rows[1][1] != "true" {
 		t.Fatalf("jsonb_each_text rows = %v", res.Rows)
@@ -471,6 +495,8 @@ func TestJSONBSetReturningFunctionsInFrom(t *testing.T) {
 		{`SELECT jsonb_each('{"a":1}')`, pgerror.CodeFeatureNotSupported},
 		{`SELECT jsonb_array_elements('[1]')`, pgerror.CodeFeatureNotSupported},
 		{`SELECT * FROM jsonb_each('{"a":1}') AS e JOIN docs d ON TRUE`, pgerror.CodeFeatureNotSupported},
+		{`SELECT * FROM jsonb_each('{"a":1}') AS e(k)`, pgerror.CodeInvalidColumnReference},
+		{`SELECT * FROM jsonb_array_elements('[1]') AS t(a, b)`, pgerror.CodeInvalidColumnReference},
 	} {
 		if _, err := execSQL(e, tc.sql); jsonbErrorCode(t, err) != tc.code {
 			t.Errorf("%s error = %v, want %s", tc.sql, err, tc.code)

@@ -643,6 +643,13 @@ func (p *Parser) parseTableRef(allowFunction bool) (*TableRef, error) {
 		if p.curTokenIs(lexer.TokenIdent) && !p.isClauseKeyword() {
 			ref.Alias = p.curToken.Literal
 			p.nextToken()
+			if p.curTokenIs(lexer.TokenLParen) {
+				aliases, err := p.parseColumnAliasList()
+				if err != nil {
+					return nil, err
+				}
+				ref.ColumnAliases = aliases
+			}
 		}
 		return ref, nil
 	}
@@ -672,6 +679,32 @@ func (p *Parser) parseTableRef(allowFunction bool) (*TableRef, error) {
 	}
 
 	return ref, nil
+}
+
+// parseColumnAliasList parses the parenthesized column alias list of a table
+// function: `AS t(a, b)`. The caller has already consumed the alias.
+func (p *Parser) parseColumnAliasList() ([]string, error) {
+	if !p.curTokenIs(lexer.TokenLParen) {
+		return nil, p.curError("expected ( before column aliases")
+	}
+	p.nextToken()
+	var aliases []string
+	for {
+		if !p.curTokenIs(lexer.TokenIdent) {
+			return nil, p.curError("expected a column alias")
+		}
+		aliases = append(aliases, p.curToken.Literal)
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenComma) {
+			break
+		}
+		p.nextToken()
+	}
+	if !p.curTokenIs(lexer.TokenRParen) {
+		return nil, p.curError("expected ) after column aliases")
+	}
+	p.nextToken()
+	return aliases, nil
 }
 
 func (p *Parser) isJoinKeyword() bool {
