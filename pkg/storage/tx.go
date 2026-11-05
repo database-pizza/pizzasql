@@ -1205,20 +1205,20 @@ func (s *Session) insertLocked(table string, row Row) (int64, error) {
 	}
 	rowid, _ := rowIDFromRow(nr)
 	tl := strings.ToLower(table)
-	// prepareInsert returned the durable key; duplicate reporting shows the same
-	// encoded primary-key component the key carries.
+	// The durable key stays internal; the duplicate message renders the key
+	// components from the normalized row.
 	pk := strings.TrimPrefix(key, s.table.dataPrefix(table))
 
 	if e, ok := s.overlay[tl][key]; ok {
 		if !e.absent {
-			return 0, &PrimaryKeyViolationError{Table: table, Key: pk}
+			return 0, newPrimaryKeyViolation(table, schema, nr)
 		}
 	} else {
 		durableKey := s.durableDataKeyLocked(table, pk)
 		_, lsn, err := s.table.getKeyWithLSN(durableKey)
 		if err == nil {
 			s.reads[durableKey] = lsn
-			return 0, &PrimaryKeyViolationError{Table: table, Key: pk}
+			return 0, newPrimaryKeyViolation(table, schema, nr)
 		}
 		if err != nil && err != ErrKeyNotFound {
 			return 0, err

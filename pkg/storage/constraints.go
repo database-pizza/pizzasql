@@ -10,11 +10,51 @@ import (
 // executor errors so wire adapters can report integrity SQLSTATE 23505.
 type PrimaryKeyViolationError struct {
 	Table string
-	Key   string
+	// Key is the primary key rendered for a reader, never the durable
+	// length-prefixed encoding.
+	Key string
 }
 
 func (e *PrimaryKeyViolationError) Error() string {
 	return fmt.Sprintf("duplicate primary key: %s", e.Key)
+}
+
+// newPrimaryKeyViolation reports the duplicate key its write collided with. The
+// message renders the key from the row instead of the durable key: a composite
+// key is stored length-prefixed ("<len>:<value>" repeated), so splitting that
+// encoding to label the violation would corrupt any component that itself
+// contains the separator.
+func newPrimaryKeyViolation(table string, schema *Schema, row Row) *PrimaryKeyViolationError {
+	return &PrimaryKeyViolationError{Table: table, Key: primaryKeyLabel(schema, row)}
+}
+
+// primaryKeyLabel renders a row's primary-key components for a reader: a
+// single-column key is that one component and a composite key is a parenthesized
+// tuple such as (1,11). A text component is rendered as a SQL literal with
+// embedded quotes doubled, so a value containing a comma or a quote stays
+// distinguishable from the tuple syntax.
+func primaryKeyLabel(schema *Schema, row Row) string {
+	columns := schema.PrimaryKeyList()
+	parts := make([]string, len(columns))
+	for i, column := range columns {
+		value, _ := rowColumnValue(row, column)
+		parts[i] = primaryKeyComponent(value)
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return "(" + strings.Join(parts, ",") + ")"
+}
+
+func primaryKeyComponent(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	case []byte:
+		return "'" + strings.ReplaceAll(string(v), "'", "''") + "'"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // NotNullViolationError identifies the final row that violates a required column.

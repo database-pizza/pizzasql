@@ -20,14 +20,28 @@ func TestCompositePrimaryKeyWireBehavior(t *testing.T) {
 	if msgs := query("INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'one')"); errorCode(msgs[0]) != "" {
 		t.Fatalf("INSERT failed: %s", errorMessage(msgs[0]))
 	}
-	if code := errorCode(query("INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'two')")[0]); code != ErrCodeUniqueViolation {
-		t.Fatalf("duplicate composite key SQLSTATE = %q, want 23505", code)
+	if msgs := query("INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'two')"); errorCode(msgs[0]) != ErrCodeUniqueViolation {
+		t.Fatalf("duplicate composite key SQLSTATE = %q, want 23505", errorCode(msgs[0]))
+	} else if got, want := errorMessage(msgs[0]), "Execution error: duplicate primary key: ('x','y')"; got != want {
+		t.Fatalf("duplicate composite key message = %q, want %q", got, want)
+	}
+
+	// A numeric composite key renders as a tuple, not the length-prefixed
+	// durable encoding.
+	if msgs := query("CREATE TABLE numbered (a INTEGER, b INTEGER, PRIMARY KEY (a, b))"); errorCode(msgs[0]) != "" {
+		t.Fatalf("CREATE TABLE numbered failed: %s", errorMessage(msgs[0]))
+	}
+	query("INSERT INTO numbered (a, b) VALUES (1, 11)")
+	if msgs := query("INSERT INTO numbered (a, b) VALUES (1, 11)"); errorCode(msgs[0]) != ErrCodeUniqueViolation {
+		t.Fatalf("duplicate numeric composite key SQLSTATE = %q, want 23505", errorCode(msgs[0]))
+	} else if got, want := errorMessage(msgs[0]), "Execution error: duplicate primary key: (1,11)"; got != want {
+		t.Fatalf("duplicate numeric composite key message = %q, want %q", got, want)
 	}
 	if code := errorCode(query("INSERT INTO pairs (a, v) VALUES ('x', 'missing b')")[0]); code != "23502" {
 		t.Fatalf("missing key component SQLSTATE = %q, want 23502", code)
 	}
 
-	// Only the accepted row survived the two rejected inserts.
+	// Only the accepted row survived the rejected inserts.
 	selectRows := query("SELECT v FROM pairs WHERE a = 'x' AND b = 'y'")
 	var dataRows []*Message
 	for _, msg := range selectRows {

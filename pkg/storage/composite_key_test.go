@@ -118,6 +118,75 @@ func TestCompositePrimaryKeyInsertErrors(t *testing.T) {
 	}
 }
 
+// A duplicate composite key reports its components in declaration order, not the
+// length-prefixed durable encoding, and a component that itself contains the
+// encoding separator or a quote keeps its own tuple position.
+func TestCompositePrimaryKeyViolationMessage(t *testing.T) {
+	_, _, schemas, tables := newTestSession(t)
+	compositeTestTable(t, schemas)
+
+	cases := []struct {
+		row  Row
+		want string
+	}{
+		{Row{"a": "x", "b": "y"}, "duplicate primary key: ('x','y')"},
+		{Row{"a": "a:b", "b": "c"}, "duplicate primary key: ('a:b','c')"},
+		{Row{"a": "a,b", "b": "it's"}, "duplicate primary key: ('a,b','it''s')"},
+	}
+	for _, tc := range cases {
+		if err := tables.Insert("t", tc.row); err != nil {
+			t.Fatalf("insert %v: %v", tc.row, err)
+		}
+		err := tables.Insert("t", tc.row)
+		var duplicate *PrimaryKeyViolationError
+		if !errors.As(err, &duplicate) {
+			t.Fatalf("duplicate insert %v error = %v, want PrimaryKeyViolationError", tc.row, err)
+		}
+		if got := err.Error(); got != tc.want {
+			t.Fatalf("duplicate insert %v message = %q, want %q", tc.row, got, tc.want)
+		}
+	}
+}
+
+// The transaction paths report the same rendering for a key staged in the
+// overlay and for one already durable outside the transaction.
+func TestSessionCompositePrimaryKeyViolationMessage(t *testing.T) {
+	_, _, schemas, tables := newTestSession(t)
+	compositeTestTable(t, schemas)
+
+	if err := tables.Insert("t", Row{"a": "durable", "b": "x:y"}); err != nil {
+		t.Fatalf("insert durable: %v", err)
+	}
+
+	s := NewSession(schemas, tables)
+	if err := s.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Insert("t", Row{"a": "staged", "b": "y,z"}); err != nil {
+		t.Fatalf("insert staged: %v", err)
+	}
+
+	for _, tc := range []struct {
+		row  Row
+		want string
+	}{
+		{Row{"a": "staged", "b": "y,z"}, "duplicate primary key: ('staged','y,z')"},
+		{Row{"a": "durable", "b": "x:y"}, "duplicate primary key: ('durable','x:y')"},
+	} {
+		err := s.Insert("t", tc.row)
+		var duplicate *PrimaryKeyViolationError
+		if !errors.As(err, &duplicate) {
+			t.Fatalf("transaction duplicate %v error = %v, want PrimaryKeyViolationError", tc.row, err)
+		}
+		if got := err.Error(); got != tc.want {
+			t.Fatalf("transaction duplicate %v message = %q, want %q", tc.row, got, tc.want)
+		}
+	}
+	if err := s.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+}
+
 func TestCompositePrimaryKeyUpdateAndDelete(t *testing.T) {
 	_, _, schemas, tables := newTestSession(t)
 	compositeTestTable(t, schemas)

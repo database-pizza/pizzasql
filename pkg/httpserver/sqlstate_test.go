@@ -48,6 +48,33 @@ func TestHTTPUniqueViolationReturns23505(t *testing.T) {
 	}
 }
 
+// A duplicate composite key over HTTP keeps SQLSTATE 23505 and reports the key
+// components instead of the length-prefixed durable encoding.
+func TestHTTPCompositePrimaryKeyViolationReportsComponents(t *testing.T) {
+	server := setupKVTestServer(t)
+	queryHTTP(t, server, "CREATE TABLE pairs (a INTEGER, b INTEGER, PRIMARY KEY (a, b))")
+	queryHTTP(t, server, "INSERT INTO pairs (a, b) VALUES (1, 11)")
+
+	body, _ := json.Marshal(QueryRequest{SQL: "INSERT INTO pairs (a, b) VALUES (1, 11)"})
+	r := httptest.NewRequest(http.MethodPost, "/query", strings.NewReader(string(body)))
+	w := httptest.NewRecorder()
+	server.handleQuery(w, r)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body %s", w.Code, w.Body.String())
+	}
+	var resp httpErrorBody
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Error.Code != "23505" {
+		t.Fatalf("code = %q, want 23505", resp.Error.Code)
+	}
+	if want := "duplicate primary key: (1,11)"; resp.Error.Message != want {
+		t.Fatalf("message = %q, want %q", resp.Error.Message, want)
+	}
+}
+
 // A constraint the commit discovers must report its SQLSTATE instead of the
 // generic TRANSACTION_ERROR the transaction endpoints use for other failures.
 func TestHTTPCommitCheckViolationReturns23514(t *testing.T) {
