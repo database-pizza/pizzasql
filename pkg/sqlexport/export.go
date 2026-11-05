@@ -150,6 +150,13 @@ func generateCreateTable(schema *storage.Schema) string {
 		}
 		defs = append(defs, "    PRIMARY KEY ("+strings.Join(quoted, ", ")+")")
 	}
+	for _, check := range schema.Checks {
+		label := ""
+		if check.Name != "" {
+			label = "CONSTRAINT " + quoteIdentifier(check.Name) + " "
+		}
+		defs = append(defs, "    "+label+"CHECK ("+check.Expression+")")
+	}
 
 	return fmt.Sprintf("CREATE TABLE %s (\n%s\n);", quoteIdentifier(schema.Name), strings.Join(defs, ",\n"))
 }

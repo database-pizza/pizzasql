@@ -630,7 +630,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		modifiedStmt := *stmt
 		modifiedFrom := make([]parser.TableRef, len(stmt.From))
 		copy(modifiedFrom, stmt.From)
-		modifiedFrom[0] = parser.TableRef{Subquery: viewDef, Alias: alias}
+		modifiedFrom[0] = parser.TableRef{Subquery: viewDef, Alias: alias, Join: stmt.From[0].Join}
 		modifiedStmt.From = modifiedFrom
 		return e.executeSelectFromSubquery(&modifiedStmt)
 	}
@@ -1869,7 +1869,12 @@ func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, 
 	if qualifier == "" {
 		qualifier = stmt.From[0].Name
 	}
-	return e.executeSelectOnMaterializedTyped(stmt, subqueryResult.Columns, subqueryResult.ColumnTypes, subqueryResult.Rows, qualifier)
+	result, err := e.executeSelectOnMaterializedTyped(stmt, subqueryResult.Columns, subqueryResult.ColumnTypes, subqueryResult.Rows, qualifier)
+	if err != nil {
+		return nil, err
+	}
+	e.setMaterializedColumnTypes(stmt, subqueryResult.Columns, subqueryResult.ColumnTypes, result)
+	return result, nil
 }
 
 func (e *Executor) executeSelectFromSubqueries(stmt *parser.SelectStmt) (*Result, error) {
@@ -1915,7 +1920,12 @@ func (e *Executor) executeSelectFromSubqueries(stmt *parser.SelectStmt) (*Result
 	}
 	e.pushTypeScope(materializedTypeResolver(columns, types, qualifiers))
 	defer e.popTypeScope()
-	return e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
+	result, err := e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
+	if err != nil {
+		return nil, err
+	}
+	e.setMaterializedColumnTypes(stmt, columns, types, result)
+	return result, nil
 }
 
 // typeAt returns the type at index i, or the empty string when the position has
@@ -1955,7 +1965,12 @@ func (e *Executor) executeSelectOnMaterializedTyped(stmt *parser.SelectStmt, col
 		}
 		derivedRows = append(derivedRows, row)
 	}
-	return e.executeSelectOnMaterializedRows(stmt, columns, columns, derivedRows)
+	result, err := e.executeSelectOnMaterializedRows(stmt, columns, columns, derivedRows)
+	if err != nil {
+		return nil, err
+	}
+	e.setMaterializedColumnTypes(stmt, columns, columnTypes, result)
+	return result, nil
 }
 
 // executeSelectOnMaterializedCTEs cross-joins comma-separated CTEs while
@@ -1998,7 +2013,49 @@ func (e *Executor) executeSelectOnMaterializedCTEs(stmt *parser.SelectStmt) (*Re
 	}
 	e.pushTypeScope(materializedTypeResolver(columns, types, qualifiers))
 	defer e.popTypeScope()
-	return e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
+	result, err := e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
+	if err != nil {
+		return nil, err
+	}
+	e.setMaterializedColumnTypes(stmt, columns, types, result)
+	return result, nil
+}
+
+// setMaterializedColumnTypes restores result metadata for a derived table, CTE,
+// or view. Values already resolve through the materialized type scope, but the
+// result column types must be recomputed for the outer projection so array and
+// jsonb OIDs do not fall back to TEXT.
+func (e *Executor) setMaterializedColumnTypes(stmt *parser.SelectStmt, columns, types []string, result *Result) {
+	if result == nil {
+		return
+	}
+	resolve := func(_, column string) (string, bool) {
+		for i, candidate := range columns {
+			if strings.EqualFold(candidate, column) {
+				return typeAt(types, i), true
+			}
+		}
+		return "", false
+	}
+	resolved := make([]string, 0, len(result.Columns))
+	for _, projection := range stmt.Columns {
+		if projection.Star || projection.TableStar != "" {
+			for i := range columns {
+				typ := typeAt(types, i)
+				if typ == "" {
+					typ = "TEXT"
+				}
+				resolved = append(resolved, typ)
+			}
+			continue
+		}
+		if projection.Expr == nil {
+			resolved = append(resolved, "TEXT")
+			continue
+		}
+		resolved = append(resolved, inferExprType(projection.Expr, resolve))
+	}
+	result.ColumnTypes = resolved
 }
 
 func (e *Executor) executeSelectOnMaterializedRows(stmt *parser.SelectStmt, columns, starKeys []string, derivedRows []storage.Row) (*Result, error) {

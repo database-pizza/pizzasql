@@ -701,48 +701,110 @@ func (s *Server) handleTransactionCommit(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, resp, pretty)
 }
 
-// substituteParams replaces ? placeholders with actual parameter values.
-// This is a simple implementation that handles basic SQL escaping.
+// substituteParams replaces ? placeholders with actual parameter values. It
+// scans the original SQL once, skipping quoted strings, quoted identifiers, and
+// comments, so a question mark inside a bound value or a literal is never
+// mistaken for the next placeholder.
 func substituteParams(sql string, params []interface{}) string {
 	if len(params) == 0 {
 		return sql
 	}
-
-	result := sql
-	for _, param := range params {
-		idx := strings.Index(result, "?")
-		if idx == -1 {
-			break
-		}
-
-		var replacement string
-		switch v := param.(type) {
-		case nil:
-			replacement = "NULL"
-		case string:
-			// Escape single quotes in strings
-			escaped := strings.ReplaceAll(v, "'", "''")
-			replacement = "'" + escaped + "'"
-		case int, int64, int32, int16, int8:
-			replacement = fmt.Sprintf("%d", v)
-		case float64, float32:
-			replacement = fmt.Sprintf("%g", v)
-		case bool:
-			if v {
-				replacement = "1"
-			} else {
-				replacement = "0"
+	var b strings.Builder
+	b.Grow(len(sql) + 32)
+	param := 0
+	for i := 0; i < len(sql); {
+		switch sql[i] {
+		case '\'':
+			j := i + 1
+			for j < len(sql) {
+				if sql[j] == '\'' {
+					if j+1 < len(sql) && sql[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					j++
+					break
+				}
+				j++
 			}
+			b.WriteString(sql[i:j])
+			i = j
+		case '"':
+			j := i + 1
+			for j < len(sql) {
+				if sql[j] == '"' {
+					if j+1 < len(sql) && sql[j+1] == '"' {
+						j += 2
+						continue
+					}
+					j++
+					break
+				}
+				j++
+			}
+			b.WriteString(sql[i:j])
+			i = j
+		case '-':
+			if i+1 < len(sql) && sql[i+1] == '-' {
+				j := i + 2
+				for j < len(sql) && sql[j] != '\n' {
+					j++
+				}
+				b.WriteString(sql[i:j])
+				i = j
+				continue
+			}
+			b.WriteByte(sql[i])
+			i++
+		case '/':
+			if i+1 < len(sql) && sql[i+1] == '*' {
+				j := i + 2
+				for j+1 < len(sql) && !(sql[j] == '*' && sql[j+1] == '/') {
+					j++
+				}
+				if j+1 < len(sql) {
+					j += 2
+				}
+				b.WriteString(sql[i:j])
+				i = j
+				continue
+			}
+			b.WriteByte(sql[i])
+			i++
+		case '?':
+			if param < len(params) {
+				b.WriteString(formatParam(params[param]))
+				param++
+			} else {
+				b.WriteByte('?')
+			}
+			i++
 		default:
-			// For other types, convert to string
-			escaped := strings.ReplaceAll(fmt.Sprintf("%v", v), "'", "''")
-			replacement = "'" + escaped + "'"
+			b.WriteByte(sql[i])
+			i++
 		}
-
-		result = result[:idx] + replacement + result[idx+1:]
 	}
+	return b.String()
+}
 
-	return result
+func formatParam(param interface{}) string {
+	switch v := param.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	case int, int64, int32, int16, int8:
+		return fmt.Sprintf("%d", v)
+	case float64, float32:
+		return fmt.Sprintf("%g", v)
+	case bool:
+		if v {
+			return "1"
+		}
+		return "0"
+	default:
+		return "'" + strings.ReplaceAll(fmt.Sprintf("%v", v), "'", "''") + "'"
+	}
 }
 
 // inferType infers SQL type from a Go value.
