@@ -2,7 +2,6 @@ package executor
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -23,6 +22,18 @@ func (c *testClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
 
 func newTestClock() *testClock {
 	return &testClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+}
+
+// steppingClock advances one second per call, so a test can see whether a
+// value was evaluated once per statement or once per row.
+type steppingClock struct {
+	now time.Time
+}
+
+func (c *steppingClock) Now() time.Time {
+	current := c.now
+	c.now = c.now.Add(time.Second)
+	return current
 }
 
 func TestCreateTableWithCurrentTimestampDefaultAppliesOnInsert(t *testing.T) {
@@ -194,28 +205,22 @@ func TestMultiRowInsertSharesStatementDefault(t *testing.T) {
 func TestAlterTableAddColumnBackfillsNonConstantDefaultPerRow(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
+	// The storage-side evaluator samples the executor clock for every rewritten
+	// row, so a stepping clock shows per-row evaluation without patching the
+	// schema manager.
+	e.clock = (&steppingClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}).Now
+
 	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
-
-	// The storage-level evaluator is the per-row injection point for the
-	// rewrite; a counting evaluator proves each rewritten row is stamped again.
-	calls := 0
-	schema.SetDefaultEvaluator(func(expression string) (interface{}, error) {
-		calls++
-		return fmt.Sprintf("stamp-%d", calls), nil
-	})
-
 	execMust(t, e, "ALTER TABLE t ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
-	if calls != 2 {
-		t.Fatalf("evaluator calls = %d, want one per rewritten row (2)", calls)
-	}
 	res := execMust(t, e, "SELECT id, created_at FROM t ORDER BY id")
-	if got, want := res.Rows[0][1], "stamp-1"; got != want {
-		t.Fatalf("row 1 created_at = %v, want %q", got, want)
+	first, second := res.Rows[0][1], res.Rows[1][1]
+	if first == second {
+		t.Fatalf("both rows were stamped %v; the ADD COLUMN rewrite must evaluate each row", first)
 	}
-	if got, want := res.Rows[1][1], "stamp-2"; got != want {
-		t.Fatalf("row 2 created_at = %v, want %q", got, want)
+	if compare(first, second) >= 0 {
+		t.Fatalf("timestamps %v then %v are not ordered", first, second)
 	}
 
 	col, ok := e.schemaColumn(t, "t", "created_at")
@@ -227,6 +232,115 @@ func TestAlterTableAddColumnBackfillsNonConstantDefaultPerRow(t *testing.T) {
 	}
 	if col.Default != nil {
 		t.Fatalf("ADD COLUMN stored an evaluated default %v instead of an expression", col.Default)
+	}
+}
+
+func TestMultipleClockDefaultsInOneRowShareInstant(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	// A stepping clock makes per-column sampling visible: the two columns must
+	// still share the single instant sampled for the statement.
+	e.clock = (&steppingClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}).Now
+
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+
+	res := execMust(t, e, "SELECT created_at, updated_at FROM t WHERE id = 1")
+	if got := res.Rows[0][0]; got != "2026-01-02 03:04:05" {
+		t.Fatalf("created_at = %v, want the statement instant", got)
+	}
+	if res.Rows[0][0] != res.Rows[0][1] {
+		t.Fatalf("created_at = %v, updated_at = %v; both clock defaults must share one instant", res.Rows[0][0], res.Rows[0][1])
+	}
+}
+
+func TestParenthesizedClockDefaults(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	e.clock = newTestClock().Now
+
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TIMESTAMP DEFAULT (CURRENT_TIMESTAMP), b TIMESTAMP DEFAULT (datetime('now')))")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+	execMust(t, e, "ALTER TABLE t ADD COLUMN c TIMESTAMP DEFAULT (CURRENT_TIMESTAMP)")
+
+	res := execMust(t, e, "SELECT a, b, c FROM t WHERE id = 1")
+	want := "2026-01-02 03:04:05"
+	for i, name := range []string{"a", "b", "c"} {
+		if got := res.Rows[0][i]; got != want {
+			t.Fatalf("%s = %v, want %q", name, got, want)
+		}
+	}
+
+	execMust(t, e, "INSERT INTO t (id) VALUES (2)")
+	res = execMust(t, e, "SELECT a, b, c FROM t WHERE id = 2")
+	if got := res.Rows[0][2]; got != want {
+		t.Fatalf("new row c = %v, want %q", got, want)
+	}
+}
+
+func TestAlterTableAddColumnUniqueClockDefaultRejectsDuplicates(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	e.clock = newTestClock().Now // one fixed instant: both backfilled rows collide
+
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
+
+	_, err := execSQL(e, "ALTER TABLE t ADD COLUMN tag TEXT DEFAULT CURRENT_TIMESTAMP UNIQUE")
+	var violation *storage.UniqueViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("ALTER error = %v, want a UNIQUE violation", err)
+	}
+
+	// The duplicate must abort before the column and index become visible.
+	stored, gerr := storage.NewSchemaManager(schema.GetPool(), schema.GetDatabaseName()).GetSchema("t")
+	if gerr != nil {
+		t.Fatalf("reload schema: %v", gerr)
+	}
+	if _, ok := stored.GetColumn("tag"); ok {
+		t.Fatal("aborted ADD COLUMN published the tag column")
+	}
+	if e.schema.IndexExists("uniq_t_tag") {
+		t.Fatal("aborted ADD COLUMN published the UNIQUE index")
+	}
+}
+
+func TestAlterTableAddColumnUniqueClockDefaultValidatesTheRewrite(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	// The first two samples (the rewrite of rows 1 and 2) are distinct; later
+	// samples collide. A separate prediction scan would have seen the distinct
+	// values and then published an index over the colliding rewrite values.
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	calls := 0
+	e.clock = func() time.Time {
+		calls++
+		if calls == 2 {
+			return base.Add(time.Second)
+		}
+		if calls > 2 {
+			return base.Add(2 * time.Second)
+		}
+		return base
+	}
+
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
+	execMust(t, e, "ALTER TABLE t ADD COLUMN tag TEXT DEFAULT CURRENT_TIMESTAMP UNIQUE")
+
+	if calls != 2 {
+		t.Fatalf("clock sampled %d times, want once per rewritten row (2); the UNIQUE check must validate the rewrite itself", calls)
+	}
+	res := execMust(t, e, "SELECT id, tag FROM t ORDER BY id")
+	if res.Rows[0][1] == res.Rows[1][1] {
+		t.Fatalf("both rows got tag %v; the published index must cover distinct rewrite values", res.Rows[0][1])
+	}
+
+	// The published index enforces uniqueness for later writes.
+	execMust(t, e, "INSERT INTO t (id) VALUES (3)")
+	if _, err := execSQL(e, "INSERT INTO t (id, tag) VALUES (4, '"+res.Rows[0][1].(string)+"')"); err == nil {
+		t.Fatal("expected the published UNIQUE index to reject a duplicate")
 	}
 }
 

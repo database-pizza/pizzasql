@@ -64,6 +64,11 @@ func isConstantExpr(expr parser.Expr) bool {
 // are the forms that SQLite applications declare, and each maps to a value the
 // engine already produces for the equivalent expression.
 func isWhitelistedDefaultExpr(expr parser.Expr) bool {
+	// SQLite applications commonly wrap a default in parentheses, for example
+	// DEFAULT (datetime('now')). The wrapper does not change the expression.
+	if paren, ok := expr.(*parser.ParenExpr); ok {
+		return isWhitelistedDefaultExpr(paren.Expr)
+	}
 	switch ex := expr.(type) {
 	case *parser.ColumnRef:
 		if ex.Table != "" {
@@ -95,7 +100,9 @@ var defaultExprCache sync.Map // map[string]parser.Expr
 
 func parseDefaultExpr(text string) (parser.Expr, error) {
 	if cached, ok := defaultExprCache.Load(text); ok {
-		return cached.(parser.Expr), nil
+		if expr, ok := cached.(parser.Expr); ok {
+			return expr, nil
+		}
 	}
 	expr, err := parser.ParseExpr(text)
 	if err != nil {
@@ -103,14 +110,6 @@ func parseDefaultExpr(text string) (parser.Expr, error) {
 	}
 	defaultExprCache.Store(text, expr)
 	return expr, nil
-}
-
-// EvalDefaultExpression evaluates a persisted non-constant DEFAULT expression
-// at the current time. It is the storage layer's evaluator for columns added
-// with ALTER TABLE ADD COLUMN and for row images that predate such a column; an
-// INSERT or UPDATE evaluates the expression once per statement itself.
-func EvalDefaultExpression(text string) (interface{}, error) {
-	return evalDefaultExpressionAt(text, time.Now().UTC())
 }
 
 // evalDefaultExpressionAt evaluates a persisted default with an explicit clock.
@@ -125,6 +124,13 @@ func evalDefaultExpressionAt(text string, now time.Time) (interface{}, error) {
 	expr, err := parseDefaultExpr(text)
 	if err != nil {
 		return nil, err
+	}
+	for {
+		paren, ok := expr.(*parser.ParenExpr)
+		if !ok {
+			break
+		}
+		expr = paren.Expr
 	}
 	if !isWhitelistedDefaultExpr(expr) {
 		return nil, pgerror.Unsupported(
@@ -153,29 +159,42 @@ func evalDefaultExpressionAt(text string, now time.Time) (interface{}, error) {
 // value, while a later statement reads the clock again. Constant defaults stay
 // in the catalog and are applied by the storage layer.
 func (e *Executor) statementDefaults(schema *storage.Schema) (map[string]interface{}, error) {
+	// One instant per statement: two clock-default columns in the same row must
+	// not disagree because the loop sampled the clock twice. The clock is read
+	// lazily so a schema without expression defaults never samples it.
+	var now time.Time
 	var defaults map[string]interface{}
 	for _, column := range schema.Columns {
 		if column.DefaultExpr == "" {
 			continue
 		}
-		value, err := e.evalDefaultExpr(column.DefaultExpr)
+		if defaults == nil {
+			now = e.statementNow()
+			defaults = make(map[string]interface{})
+		}
+		value, err := evalDefaultExpressionAt(column.DefaultExpr, now)
 		if err != nil {
 			return nil, fmt.Errorf("evaluate DEFAULT for column %q: %w", column.Name, err)
-		}
-		if defaults == nil {
-			defaults = make(map[string]interface{})
 		}
 		defaults[column.Name] = value
 	}
 	return defaults, nil
 }
 
-func (e *Executor) evalDefaultExpr(text string) (interface{}, error) {
-	now := time.Now().UTC()
+// evalStorageDefault is the storage-facing evaluator. ADD COLUMN evaluates a
+// default once per rewritten row, so every call samples the executor clock;
+// that keeps a storage-side backfill on the same clock as the session.
+func (e *Executor) evalStorageDefault(expression string) (interface{}, error) {
+	return evalDefaultExpressionAt(expression, e.statementNow())
+}
+
+// statementNow returns the instant one statement's expression defaults use.
+// Tests inject e.clock to make that instant deterministic.
+func (e *Executor) statementNow() time.Time {
 	if e.clock != nil {
-		now = e.clock().UTC()
+		return e.clock().UTC()
 	}
-	return evalDefaultExpressionAt(text, now)
+	return time.Now().UTC()
 }
 
 // applyRowDefaults fills the expression-defaulted columns a statement omitted.

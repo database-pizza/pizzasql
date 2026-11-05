@@ -126,9 +126,10 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 	table.SetExpressionEvaluator(EvalStoredExpression)
 	// Non-constant DEFAULT expressions are likewise stored as SQL text; storage
 	// evaluates them when it backfills ADD COLUMN rows or completes a row image
-	// that predates the column. Ordinary writes evaluate them once per statement
-	// in this package.
-	schema.SetDefaultEvaluator(EvalDefaultExpression)
+	// that predates the column. The evaluator closes over this executor so the
+	// session clock also drives storage-side evaluation. Ordinary writes
+	// evaluate them once per statement in this package.
+	schema.SetDefaultEvaluator(executor.evalStorageDefault)
 
 	// Register the main database
 	executor.attachedDatabases["main"] = &DatabaseConnection{

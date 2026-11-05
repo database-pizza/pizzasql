@@ -988,8 +988,8 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 // AddColumn adds a new column to a table. When unique is non-nil the column's
 // UNIQUE index is registered as part of the same statement.
 //
-// A constant DEFAULT is materialized into every existing row before the schema
-// is published. NOT NULL, UNIQUE, and index validation all read persisted row
+// A DEFAULT is materialized into every existing row before the schema is
+// published. NOT NULL, UNIQUE, and index validation all read persisted row
 // values, so a default that only existed in the catalog would be invisible to
 // them: a UNIQUE index over the new column could not see the duplicate values
 // every existing row shares, and an UPDATE to NULL would look non-null. The
@@ -998,14 +998,19 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 // rewritten, the transform is idempotent, and the schema is saved last so an
 // interrupted operation resumes against the old schema.
 //
-// The gate also makes the validation authoritative: NOT NULL without a default
-// and duplicate UNIQUE values are rejected before any row is touched, and the
-// column and its index are published together in one batch write, so a crash
-// cannot leave the column visible without the constraint that validates it.
-// A nullable column without a default needs no rewrite because a missing row
-// field already reads as NULL. Like DROP COLUMN, the statement holds the catalog
-// lock for the whole scan, so the cost is one table scan (two for UNIQUE) and a
-// table-wide stall per ADD COLUMN that has a default or an index.
+// The gate also makes the validation authoritative. A constant default is
+// deterministic, so its UNIQUE prediction can run as a cheap pre-scan. A
+// clock-reading default cannot be predicted: the validation must observe the
+// values the rewrite actually writes, so it is folded into the rewrite and a
+// duplicate aborts before the column and index are published. NOT NULL without
+// a default is rejected before any row is touched. The column and its index are
+// published together in one batch write, so a crash cannot leave the column
+// visible without the constraint that validates it. A nullable column without a
+// default needs no rewrite because a missing row field already reads as NULL.
+// Like DROP COLUMN, the statement holds the catalog lock for the whole scan, so
+// the cost is one table scan (plus one table scan for a constant-default UNIQUE
+// prediction) and a table-wide stall per ADD COLUMN that has a default or an
+// index.
 func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) error {
 	tableLock := m.tableLock(table)
 	tableLock.Lock()
@@ -1028,8 +1033,13 @@ func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) er
 		if m.indexExistsUnsafe(unique.Name) {
 			return fmt.Errorf("index already exists: %s", unique.Name)
 		}
-		if err := m.validateAddColumnUnique(table, column, unique); err != nil {
-			return err
+		// A clock-reading default is validated during the rewrite below, which
+		// samples the same values it writes. Predicting them in a separate scan
+		// could disagree across a second boundary and publish duplicates.
+		if column.DefaultExpr == "" {
+			if err := m.validateAddColumnUnique(table, column, unique); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1045,20 +1055,35 @@ func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) er
 		}
 	}
 
+	// An expression default is evaluated per rewritten row. When the column is
+	// also UNIQUE, collect the values this rewrite writes and abort on a
+	// duplicate, so validation cannot disagree with the published rows.
+	var seen map[string]struct{}
+	if unique != nil && column.DefaultExpr != "" {
+		seen = make(map[string]struct{})
+	}
 	if columnHasDefault(column) {
-		// Each rewritten row evaluates the default at rewrite time. That is
-		// indistinguishable from a constant default except for a clock-reading
-		// default, which stamps the rows this statement backfills.
 		if err := m.applyRows(table, func(row Row) (bool, error) {
-			if _, ok := rowColumnValue(row, column.Name); ok {
-				return false, nil
+			value, present := rowColumnValue(row, column.Name)
+			if !present {
+				var err error
+				value, _, err = m.columnDefaultValue(column)
+				if err != nil {
+					return false, err
+				}
+				row[column.Name] = value
 			}
-			value, _, err := m.columnDefaultValue(column)
-			if err != nil {
-				return false, err
+			if seen != nil {
+				if value == nil {
+					return !present, nil
+				}
+				encoded := encodeUniqueScalar(value)
+				if _, duplicate := seen[encoded]; duplicate {
+					return false, &UniqueViolationError{Constraint: unique.Name}
+				}
+				seen[encoded] = struct{}{}
 			}
-			row[column.Name] = value
-			return true, nil
+			return !present, nil
 		}); err != nil {
 			return err
 		}
@@ -1596,11 +1621,10 @@ func (m *SchemaManager) applyRows(table string, transform func(Row) (bool, error
 // values would duplicate across existing rows. It reads rows as they will look
 // after the rewrite (a row that already carries the field from an interrupted
 // earlier attempt keeps its value) and mirrors ValidateUniqueIndex for a single
-// plain column: NULLs do not collide. An expression default is evaluated once
-// per row here, like the rewrite that follows; a clock-reading default can
-// still cross a second boundary between the two scans, so this prediction is
-// best effort for that combination. The caller holds the table's exclusive
-// gate, so no writer can insert a conflicting row between this check and the
+// plain column: NULLs do not collide. It is used only for a constant or absent
+// default; a clock-reading default is validated by the rewrite itself because
+// its values cannot be predicted. The caller holds the table's exclusive gate,
+// so no writer can insert a conflicting row between this check and the
 // publication of the index.
 func (m *SchemaManager) validateAddColumnUnique(table string, column Column, index *Index) error {
 	seen := make(map[string]struct{})

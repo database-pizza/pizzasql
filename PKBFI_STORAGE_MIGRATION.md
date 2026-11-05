@@ -30,6 +30,11 @@ The migration command exits after writing and verifying the destination. It refu
 - Migration copies the final live key/value state. Legacy journal history is not imported, and imported records begin at the migration baseline LSN.
 - Existing PizzaSQL row values remain readable as legacy JSON after migration. New and updated rows use the versioned binary tuple encoding, so an eager row rewrite is unnecessary.
 - Schema and catalog values remain JSON because they are cold metadata.
+- `Column.DefaultExpr` is an additive schema-catalog field (`default_expr`)
+  holding the SQL text of a write-time default. An engine without it ignores the
+  field, so rolling back to a pre-`default_expr` binary silently loses write-time
+  defaults: nullable columns read as NULL and NOT NULL columns reject the insert.
+  Constant defaults in the `default` field are unaffected.
 - Successful PKBFI writes are acknowledged only after PizzaKV's durability sync completes.
 - A `.pkvdb` file must have one PizzaSQL process owner. Optimistic scan and
   predicate conflict detection uses process-local generations and is not safe
