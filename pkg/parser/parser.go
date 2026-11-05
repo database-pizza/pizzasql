@@ -144,6 +144,8 @@ func (p *Parser) parseStatement() (Statement, error) {
 			return p.parseUnlisten()
 		case "NOTIFY":
 			return p.parseNotify()
+		case "SHOW":
+			return p.parseShow()
 		}
 	}
 	switch p.curToken.Type {
@@ -167,6 +169,8 @@ func (p *Parser) parseStatement() (Statement, error) {
 		return p.parseDetach()
 	case lexer.TokenPRAGMA:
 		return p.parsePragma()
+	case lexer.TokenSET:
+		return p.parseSet()
 	case lexer.TokenANALYZE:
 		return p.parseAnalyze()
 	case lexer.TokenEXPLAIN:
@@ -1348,7 +1352,11 @@ func (p *Parser) tryParseGeneratedColumn(col *ColumnDef) (bool, error) {
 // to their canonical data type name. These are stored with SQLite text
 // affinity and never gain native PostgreSQL semantics.
 var identTypeAliases = map[string]string{
-	"UUID": "UUID",
+	"UUID":     "UUID",
+	"OID":      "OID",
+	"REGCLASS": "REGCLASS",
+	"REGTYPE":  "REGTYPE",
+	"NAME":     "NAME",
 }
 
 func (p *Parser) parseDataType() (*DataType, error) {
@@ -2249,6 +2257,91 @@ func (p *Parser) parsePragma() (*PragmaStmt, error) {
 	return stmt, nil
 }
 
+// parseSet parses a PostgreSQL SET statement. Drivers and ORMs issue session
+// settings that have no effect on a PizzaSQL connection; the parser accepts the
+// setting name and values so the executor can acknowledge them. Only
+// search_path is retained, because current_schema() and pg_table_is_visible()
+// report it.
+func (p *Parser) parseSet() (*SetStmt, error) {
+	stmt := &SetStmt{}
+	p.nextToken() // consume SET
+
+	// SESSION CHARACTERISTICS AS TRANSACTION ... is a session-wide statement
+	// whose "SESSION" is not a scope modifier.
+	sessionCharacteristics := p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "SESSION") &&
+		p.peekTokenIs(lexer.TokenIdent) && strings.EqualFold(p.peekToken.Literal, "CHARACTERISTICS")
+	if !sessionCharacteristics && p.curTokenIs(lexer.TokenIdent) {
+		switch strings.ToUpper(p.curToken.Literal) {
+		case "LOCAL":
+			stmt.Local = true
+			p.nextToken()
+		case "SESSION":
+			p.nextToken()
+		}
+	}
+
+	var name strings.Builder
+	for p.isSettingNameToken() {
+		if name.Len() > 0 {
+			name.WriteByte(' ')
+		}
+		name.WriteString(p.curToken.Literal)
+		p.nextToken()
+	}
+	if name.Len() == 0 {
+		return nil, p.curError("expected setting name after SET")
+	}
+	stmt.Name = name.String()
+
+	if p.curTokenIs(lexer.TokenTO) || p.curTokenIs(lexer.TokenEq) {
+		p.nextToken()
+	}
+
+	// The remaining tokens are the setting value. They are retained as text for
+	// search_path and otherwise ignored, so forms such as SET TIME ZONE 'UTC',
+	// SET NAMES 'utf8', and SET SESSION CHARACTERISTICS AS TRANSACTION
+	// ISOLATION LEVEL READ COMMITTED parse without a value grammar.
+	for !p.curTokenIs(lexer.TokenSemicolon) && !p.curTokenIs(lexer.TokenEOF) {
+		switch p.curToken.Type {
+		case lexer.TokenIdent, lexer.TokenNumber, lexer.TokenString:
+			stmt.Values = append(stmt.Values, p.curToken.Literal)
+		}
+		p.nextToken()
+	}
+	return stmt, nil
+}
+
+// parseShow parses SHOW name. SHOW ALL is not supported because the engine has
+// no settings catalog.
+func (p *Parser) parseShow() (*ShowStmt, error) {
+	p.nextToken() // consume SHOW
+	if !p.isSettingNameToken() {
+		return nil, p.curError("expected setting name after SHOW")
+	}
+	var name strings.Builder
+	for p.isSettingNameToken() {
+		if name.Len() > 0 && p.curTokenIs(lexer.TokenIdent) {
+			name.WriteByte(' ')
+		}
+		name.WriteString(p.curToken.Literal)
+		p.nextToken()
+	}
+	return &ShowStmt{Name: name.String()}, nil
+}
+
+// isSettingNameToken reports whether the current token can be part of a SET or
+// SHOW setting name. PostgreSQL setting names may contain non-reserved words
+// that the lexer promotes to type keywords (TIME ZONE), so every token with
+// literal text qualifies except the TO/= punctuation that starts the value.
+func (p *Parser) isSettingNameToken() bool {
+	switch p.curToken.Type {
+	case lexer.TokenTO, lexer.TokenEq, lexer.TokenComma, lexer.TokenSemicolon,
+		lexer.TokenEOF, lexer.TokenLParen, lexer.TokenRParen:
+		return false
+	}
+	return p.curToken.Literal != ""
+}
+
 // parseAnalyze parses ANALYZE [schema.]table. PizzaSQL does not maintain
 // optimizer statistics, so the statement is accepted and ignored at execution.
 func (p *Parser) parseAnalyze() (*AnalyzeStmt, error) {
@@ -3085,6 +3178,12 @@ func (p *Parser) parseIdentOrFunction() (Expr, error) {
 			return nil, p.curError("expected column name after dot")
 		}
 		col := p.curToken.Literal
+		// A schema-qualified function call (pg_catalog.format_type(...)) keeps
+		// the bare function name: the engine has one function namespace.
+		if p.peekTokenIs(lexer.TokenLParen) {
+			p.nextToken()
+			return p.parseFunctionCall(col)
+		}
 		p.nextToken()
 		return &ColumnRef{Table: name, Column: col}, nil
 	}

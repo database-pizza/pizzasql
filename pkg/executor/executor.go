@@ -40,6 +40,16 @@ type Executor struct {
 	// Last SchemaManager version reflected in catalog.
 	catalogVersion uint64
 
+	// pgCatalog caches the virtual PostgreSQL catalog snapshot for the current
+	// statement. It is discarded by Execute so each statement observes DDL
+	// committed (or staged) since the previous one.
+	pgCatalog *catalogSnapshot
+
+	// searchPath is the session search path used by current_schema() and SHOW
+	// search_path. Only public, pg_catalog, and information_schema are
+	// materialized; drivers may name other schemas.
+	searchPath []string
+
 	// Multi-database support
 	attachedDatabases map[string]*DatabaseConnection // alias -> connection
 	currentDatabase   string                         // current database alias (default is "main")
@@ -148,6 +158,7 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 		currentDatabase:   "main",
 		views:             make(map[string]*parser.SelectStmt),
 		listens:           make(map[string]bool),
+		searchPath:        []string{publicSchemaName},
 	}
 
 	// Expression indexes and CHECK predicates persist only SQL text, so the
@@ -222,8 +233,35 @@ func (e *Executor) SyncCatalog() error {
 		}
 	}
 
+	e.registerCatalogRelations()
 	e.catalogVersion = e.session.Version()
 	return nil
+}
+
+// registerCatalogRelations adds the read-only pg_catalog and information_schema
+// relations to the analyzer catalog. Qualified names are always registered;
+// a bare pg_catalog name is registered only when no durable table shadows it,
+// matching PostgreSQL's implicit pg_catalog search path.
+func (e *Executor) registerCatalogRelations() {
+	register := func(def catalogRelationDef, name string) {
+		if e.catalog.TableExists(name) {
+			return
+		}
+		entry := pgCatalogRelationIndex[def.schema+"."+strings.ToLower(def.name)]
+		info := entry.schema.ToAnalyzerTableInfo()
+		info.Name = name
+		info.IsView = true
+		_ = e.catalog.CreateTable(info)
+	}
+	for _, def := range pgCatalogRelationDefs {
+		register(def, def.schema+"."+def.name)
+	}
+	for _, def := range informationSchemaRelationDefs {
+		register(def, def.schema+"."+def.name)
+	}
+	for _, def := range pgCatalogRelationDefs {
+		register(def, def.name)
+	}
 }
 
 // Execute executes a SQL statement.
@@ -237,12 +275,17 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	e.arrayCache = make(map[parser.Expr]*arrayParseEntry)
 	e.arrayValueCache = make(map[parser.Expr]interface{})
 	e.arrayCanonicalCache = make(map[parser.Expr]*arrayCanonicalEntry)
+	// The virtual catalog snapshot is statement-scoped: DDL executed by this
+	// statement (or committed since the last one) must be visible to the next
+	// catalog read.
+	e.pgCatalog = nil
 	defer func() {
 		e.subqueryCache = nil
 		e.correlatedAggCache = nil
 		e.arrayCache = nil
 		e.arrayValueCache = nil
 		e.arrayCanonicalCache = nil
+		e.pgCatalog = nil
 	}()
 
 	// PRAGMA doesn't need analysis. SQLite catalog-introspection pragmas
@@ -258,6 +301,22 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	// EXPLAIN doesn't need analysis
 	if explain, ok := stmt.(*parser.ExplainStmt); ok {
 		return e.executeExplain(explain)
+	}
+
+	// Session settings and SHOW are acknowledged without analysis. SET is
+	// accepted for driver/ORM compatibility; only search_path is retained.
+	switch s := stmt.(type) {
+	case *parser.SetStmt:
+		return e.executeSet(s)
+	case *parser.ShowStmt:
+		return e.executeShow(s)
+	}
+
+	// Catalog relations are read-only virtual relations. Reject writes with a
+	// clear feature-not-supported error instead of letting them fall through to
+	// a confusing table-not-found from storage.
+	if err := e.rejectCatalogWriteTarget(stmt); err != nil {
+		return nil, err
 	}
 
 	// Transaction statements don't need analysis
@@ -459,6 +518,13 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	if stmt.From[0].Function != nil {
 		return e.executeSelectFromTableFunction(stmt)
+	}
+
+	// PostgreSQL catalog relations are materialized virtual relations. Answer
+	// any SELECT whose FROM reads one of them before the storage path, which
+	// would otherwise reject the relation as unknown.
+	if e.fromReferencesCatalogRelation(stmt.From) {
+		return e.executeSelectOnCatalogRelations(stmt)
 	}
 
 	// Non-recursive CTEs are desugared to derived tables by the parser. Preserve
@@ -2331,6 +2397,22 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 		rightSchema = schemaFromColumns(cte.columns)
 		e.recordJoinColumns(rightAlias, cte.columns, cte.types)
 	default:
+		if entry, ok := e.catalogRelationFor(*rightTableRef); ok {
+			rightSchema = entry.schema
+			snapshot, snapErr := e.catalogSnapshotForQuery()
+			if snapErr != nil {
+				return nil, snapErr
+			}
+			rightRows = cloneRows(snapshot.relationRows(entry.def.schema + "." + entry.def.name))
+			columns := make([]string, len(rightSchema.Columns))
+			types := make([]string, len(rightSchema.Columns))
+			for i, column := range rightSchema.Columns {
+				columns[i] = column.Name
+				types[i] = column.Type
+			}
+			e.recordJoinColumns(rightAlias, columns, types)
+			break
+		}
 		rightSchema, err = e.session.GetSchema(rightTable)
 		if err != nil {
 			return nil, err
@@ -2473,6 +2555,21 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 		rightRows = cloneRows(cte.rows)
 		e.recordJoinColumns(rightQualifier, cte.columns, cte.types)
 	default:
+		if entry, ok := e.catalogRelationFor(*join.Table); ok {
+			snapshot, snapErr := e.catalogSnapshotForQuery()
+			if snapErr != nil {
+				return nil, snapErr
+			}
+			rightRows = cloneRows(snapshot.relationRows(entry.def.schema + "." + entry.def.name))
+			columns := make([]string, len(entry.schema.Columns))
+			types := make([]string, len(entry.schema.Columns))
+			for i, column := range entry.schema.Columns {
+				columns[i] = column.Name
+				types[i] = column.Type
+			}
+			e.recordJoinColumns(rightQualifier, columns, types)
+			break
+		}
 		rightRows, err = e.session.Select(rightTable, nil)
 	}
 	if err != nil {
@@ -2657,6 +2754,10 @@ func makeNullRow(rightRows []storage.Row, rightTable string, e *Executor) storag
 		rightSchema, err := e.session.GetSchema(rightTable)
 		if err == nil {
 			for _, col := range rightSchema.Columns {
+				nullRight[col.Name] = nil
+			}
+		} else if schema, ok := e.catalogSchemaByName(rightTable); ok {
+			for _, col := range schema.Columns {
 				nullRight[col.Name] = nil
 			}
 		}
@@ -5968,6 +6069,9 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 	if val, handled, err := evalJSONFunction(name, args); handled {
 		return val, err
 	}
+	if val, handled, err := e.evalCatalogFunction(name, fn, args); handled {
+		return val, err
+	}
 
 	switch name {
 	case "UPPER":
@@ -6245,6 +6349,8 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		return e.evalArrayLength(fn.Args[0], args)
 	case "UNNEST":
 		return nil, pgerror.Unsupported("unnest() is only supported as a table function in FROM, as in SELECT * FROM unnest(array)")
+	case "VERSION":
+		return "PostgreSQL " + version.PostgreSQLCompatVersion + " (PizzaSQL)", nil
 	case "PIZZASQL_VERSION":
 		return version.String(), nil
 	case "SQLITE_VERSION":
@@ -6566,6 +6672,9 @@ func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interfa
 	}
 	if expr.Type.Array {
 		return evalArrayCast(expr.Type, val)
+	}
+	if cast, handled, err := e.catalogCast(expr, val); handled {
+		return cast, err
 	}
 
 	typeName := strings.ToUpper(expr.Type.Name)
@@ -7905,7 +8014,7 @@ func (e *Executor) evalIntExpr(expr parser.Expr) int {
 
 func isIntVal(v interface{}) bool {
 	switch v.(type) {
-	case int64, int, bool:
+	case int64, int, bool, RegOID:
 		return true
 	default:
 		return false
@@ -7920,6 +8029,8 @@ func toInt64(v interface{}) int64 {
 		return int64(val)
 	case float64:
 		return int64(val)
+	case RegOID:
+		return val.oid
 	case bool:
 		if val {
 			return 1
@@ -7997,6 +8108,8 @@ func toString(v interface{}) string {
 		return string(t)
 	case jsonText:
 		return string(t)
+	case RegOID:
+		return t.name
 	case bool:
 		if t {
 			return "1"
@@ -8057,6 +8170,8 @@ func toNumeric(v interface{}) (float64, bool) {
 		return float64(val), true
 	case float64:
 		return val, true
+	case RegOID:
+		return float64(val.oid), true
 	case string:
 		f, err := strconv.ParseFloat(val, 64)
 		return f, err == nil

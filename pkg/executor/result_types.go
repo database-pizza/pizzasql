@@ -387,6 +387,14 @@ func castResultType(name string) (string, bool) {
 		return "BLOB", true
 	case "JSONB":
 		return "JSONB", true
+	case "REGCLASS":
+		return "REGCLASS", true
+	case "REGTYPE":
+		return "REGTYPE", true
+	case "OID":
+		return "OID", true
+	case "NAME":
+		return "NAME", true
 	default:
 		return "", false
 	}
