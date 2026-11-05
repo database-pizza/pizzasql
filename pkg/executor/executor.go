@@ -4161,6 +4161,9 @@ func (e *Executor) executeAlterTableRename(table string, action *parser.RenameTa
 
 // executeAlterTableRenameColumn renames a column.
 func (e *Executor) executeAlterTableRenameColumn(table string, action *parser.RenameColumnAction) (*Result, error) {
+	if err := e.rejectExpressionIndexRename(table, action.OldName); err != nil {
+		return nil, err
+	}
 	if err := e.schema.RenameColumn(table, action.OldName, action.NewName); err != nil {
 		return nil, err
 	}
@@ -4170,6 +4173,36 @@ func (e *Executor) executeAlterTableRenameColumn(table string, action *parser.Re
 
 	result := NewResult("ALTER TABLE")
 	return result, nil
+}
+
+// rejectExpressionIndexRename refuses to rename a column that a stored index
+// expression references. Expression text is persisted verbatim, so the rename
+// cannot rewrite it; leaving the old identifier behind would silently unbind a
+// UNIQUE expression index, because its rows no longer resolve the referenced
+// column.
+func (e *Executor) rejectExpressionIndexRename(table, column string) error {
+	indexes, err := e.schema.ListTableIndexes(table)
+	if err != nil {
+		return err
+	}
+	for _, idx := range indexes {
+		for _, ic := range idx.Columns {
+			if ic.Expression == "" {
+				continue
+			}
+			references, err := storedExpressionReferencesColumn(ic.Expression, column)
+			if err != nil {
+				return fmt.Errorf("index %s: %w", idx.Name, err)
+			}
+			if references {
+				return pgerror.Unsupported(
+					"cannot rename column %s: index %s depends on it through the expression %s; drop the index, rename the column, then recreate the index",
+					column, idx.Name, ic.Expression,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 // Transaction execution methods

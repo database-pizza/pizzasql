@@ -51,6 +51,22 @@ func EvalStoredExpression(text string, row storage.Row) (interface{}, error) {
 	return statelessEval.evalExpr(expr, row)
 }
 
+// storedExpressionReferencesColumn reports whether a persisted index expression
+// names column. The engine stores expression SQL text verbatim, so a column
+// rename cannot rewrite the reference.
+func storedExpressionReferencesColumn(text, column string) (bool, error) {
+	expr, err := parseStoredExpr(text)
+	if err != nil {
+		return false, err
+	}
+	for _, ref := range collectColumnRefs(expr) {
+		if strings.EqualFold(ref, column) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // ValidateDeterministicExpr rejects an expression that SQLite would not allow in
 // an index or generated column: subqueries, window functions, aggregates, and
 // non-deterministic or unknown functions.

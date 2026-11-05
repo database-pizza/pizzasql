@@ -258,3 +258,71 @@ func TestAlterTableRenameColumnCycleRestoresIndexMetadata(t *testing.T) {
 		t.Fatalf("uq_a columns after rejected rename = %#v, want [a]", idx.Columns)
 	}
 }
+
+// A column referenced by an expression index cannot be renamed: the engine
+// stores expression text verbatim, so the rename is rejected instead of leaving
+// a UNIQUE expression index silently unbound from the column it enforces.
+func TestAlterTableRenameColumnRejectsExpressionIndexDependency(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, tag TEXT)")
+	execMust(t, e, "CREATE UNIQUE INDEX uq_lower_email ON t(lower(email))")
+	execMust(t, e, "INSERT INTO t (id, email, tag) VALUES (1, 'a@x', 'keep')")
+
+	_, err := execSQL(e, "ALTER TABLE t RENAME COLUMN email TO mail")
+	if err == nil {
+		t.Fatal("rename of a column used by an expression index must be rejected")
+	}
+	for _, want := range []string{"uq_lower_email", "lower(email)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("rename error = %v, want it to name %q", err, want)
+		}
+	}
+
+	// Nothing was renamed, and the UNIQUE expression index still enforces.
+	sch, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if _, ok := sch.GetColumn("email"); !ok {
+		t.Fatal("rejected rename removed the email column")
+	}
+	if _, ok := sch.GetColumn("mail"); ok {
+		t.Fatal("rejected rename added the mail column")
+	}
+	if _, err := execSQL(e, "INSERT INTO t (id, email, tag) VALUES (2, 'a@x', 'dup')"); err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		t.Fatalf("duplicate on expression index after rejected rename = %v, want UNIQUE constraint failure", err)
+	}
+
+	// A column the expression does not reference can still be renamed.
+	execMust(t, e, "ALTER TABLE t RENAME COLUMN tag TO label")
+	idx, err := schema.GetIndex("uq_lower_email")
+	if err != nil {
+		t.Fatalf("get uq_lower_email: %v", err)
+	}
+	if len(idx.Columns) != 1 || idx.Columns[0].Expression != "lower(email)" {
+		t.Fatalf("uq_lower_email columns = %#v, want the untouched lower(email) expression", idx.Columns)
+	}
+	if res := execMust(t, e, "SELECT label FROM t WHERE id = 1"); res.RowCount != 1 || res.Rows[0][0] != "keep" {
+		t.Fatalf("renamed label = %v, want keep", res.Rows)
+	}
+}
+
+// Conflict targets that name a hidden rowid alias are not table columns but are
+// still valid targets, including after a rename.
+func TestAlterTableRenameColumnKeepsRowIDConflictTarget(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+	execMust(t, e, "INSERT INTO t (id, a) VALUES (1, 'x')")
+
+	execMust(t, e, "ALTER TABLE t RENAME COLUMN a TO b")
+
+	execMust(t, e, "INSERT INTO t (id, b) VALUES (2, 'y') ON CONFLICT (rowid) DO NOTHING")
+	execMust(t, e, "INSERT INTO t (id, b) VALUES (3, 'z') ON CONFLICT (oid) DO NOTHING")
+	execMust(t, e, "INSERT INTO t (id, b) VALUES (4, 'w') ON CONFLICT (_rowid_) DO NOTHING")
+
+	if res := execMust(t, e, "SELECT count(*) FROM t"); res.Rows[0][0] != int64(4) {
+		t.Fatalf("row count = %v, want 4", res.Rows[0][0])
+	}
+}

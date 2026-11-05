@@ -1155,8 +1155,10 @@ func (m *SchemaManager) renameDataKeys(oldName, newName string) error {
 // updateIndexesOfTableLocked applies mutate to the durable definition of every
 // index on table and persists the definitions it changed. mutate reports
 // whether it modified the definition; unmodified indexes are left untouched.
-// The caller holds m.mu; it reads the durable index list directly rather than
-// calling the self-locking ListIndexes helper.
+// The changed definitions are written in one batch, so a table's indexes never
+// split between the old and new shape. The caller holds m.mu; it reads the
+// durable index list directly rather than calling the self-locking ListIndexes
+// helper.
 func (m *SchemaManager) updateIndexesOfTableLocked(table string, mutate func(*Index) bool) error {
 	var names []string
 	if m.indexListCached {
@@ -1179,6 +1181,12 @@ func (m *SchemaManager) updateIndexesOfTableLocked(table string, mutate func(*In
 		}
 	}
 
+	type indexUpdate struct {
+		index Index
+		key   string
+		value []byte
+	}
+	var updates []indexUpdate
 	for _, name := range names {
 		key := m.indexKey(name)
 		var data string
@@ -1207,13 +1215,26 @@ func (m *SchemaManager) updateIndexesOfTableLocked(table string, mutate func(*In
 		if err != nil {
 			return err
 		}
-		if err := m.pool.WithClient(func(c *KVClient) error {
-			return c.Write(key, string(updated))
-		}); err != nil {
-			return err
-		}
-		if cached, ok := m.indexCache[strings.ToLower(name)]; ok {
-			*cached = idx
+		updates = append(updates, indexUpdate{index: idx, key: key, value: updated})
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	ops := make([]BatchOp, 0, len(updates))
+	for _, update := range updates {
+		ops = append(ops, BatchOp{Op: batchPut, Key: []byte(update.key), Value: update.value})
+	}
+	if err := m.pool.WithClient(func(c *KVClient) error {
+		_, err := c.BatchWrite(ops, nil)
+		return err
+	}); err != nil {
+		return fmt.Errorf("update index definitions for table %s: %w", table, err)
+	}
+
+	for _, update := range updates {
+		if cached, ok := m.indexCache[strings.ToLower(update.index.Name)]; ok {
+			*cached = update.index
 		}
 	}
 	return nil
@@ -1231,7 +1252,9 @@ func (m *SchemaManager) repointIndexesLocked(oldName, newName string) error {
 // table so a reference to oldName becomes newName. Index names stay unchanged:
 // they are independent identifiers that SQLite does not derive from column
 // names, and callers may have chosen them explicitly. A rename to an existing
-// column name is rejected before this runs.
+// column name is rejected before this runs. Expression columns keep their SQL
+// text; callers must reject a rename that such an expression depends on,
+// because the text is not rewritten.
 func (m *SchemaManager) renameIndexColumnsLocked(table, oldName, newName string) error {
 	return m.updateIndexesOfTableLocked(table, func(idx *Index) bool {
 		changed := false
@@ -1247,7 +1270,9 @@ func (m *SchemaManager) renameIndexColumnsLocked(table, oldName, newName string)
 	})
 }
 
-// RenameColumn renames a column in a table.
+// RenameColumn renames a column in a table. Column references in index
+// definitions are rewritten; expression-index text is not, so a SQL caller must
+// reject a rename that an expression depends on.
 func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 	tableLock := m.tableLock(table)
 	tableLock.Lock()
