@@ -175,8 +175,8 @@ func Current() *Document {
 		},
 
 		DDL: DDL{
-			AddColumn:              Feature{Supported: true, Status: "metadata_only"},
-			AddColumnBackfill:      Feature{Supported: false, Status: "no_backfill", Notes: "existing rows read NULL; a DEFAULT applies to later INSERTs only"},
+			AddColumn:              Feature{Supported: true, Status: "materializes_constant_default", Notes: "adds one nullable column; a constant DEFAULT is written into every existing row, so the rewrite cost is O(rows) and holds the table's exclusive gate"},
+			AddColumnBackfill:      Feature{Supported: true, Status: "rewrites_rows", Notes: "a constant DEFAULT is materialized into existing rows at DDL time; ADD COLUMN ... NOT NULL without a DEFAULT fails with 23502 on a non-empty table, ADD COLUMN ... UNIQUE conflicts with 23505 when backfilling a non-NULL default into more than one row, and the column is published together with its UNIQUE index in one atomic schema write"},
 			DropColumn:             Feature{Supported: true, Status: "rewrites_rows"},
 			RenameColumn:           Feature{Supported: true, Status: "rewrites_rows"},
 			RenameColumnIndexes:    Feature{Supported: true, Status: "rewrites_index_metadata", Notes: "column references in index definitions are rewritten in place, including composite and unique indexes; index names are unchanged; RENAME COLUMN is rejected when an expression index references the column (drop that index, rename, then recreate it)"},

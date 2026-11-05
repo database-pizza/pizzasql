@@ -4113,22 +4113,28 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 	}
 }
 
-// executeAlterTableAddColumn adds a column to a table.
+// executeAlterTableAddColumn adds a column to a table. A constant DEFAULT is
+// written into every existing row (see SchemaManager.AddColumn), so the column
+// reads the default on rows that predate the statement as well as on later
+// INSERTs that omit it.
 func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddColumnAction) (*Result, error) {
-	if action.IfNotExists {
-		schema, err := e.schema.GetSchema(table)
-		if err != nil {
-			return nil, err
-		}
-		if _, exists := schema.GetColumn(action.Column.Name); exists {
+	schema, err := e.schema.GetSchema(table)
+	if err != nil {
+		return nil, err
+	}
+	if _, exists := schema.GetColumn(action.Column.Name); exists {
+		if action.IfNotExists {
 			return NewResult("ALTER TABLE"), nil
 		}
+		return nil, fmt.Errorf("column already exists: %s", action.Column.Name)
 	}
+
 	col := storage.Column{
 		Name:     action.Column.Name,
 		Type:     action.Column.Type.Name,
 		Nullable: true,
 	}
+	var uniqueConstraint *parser.ColumnConstraint
 
 	// Process column constraints
 	for _, constraint := range action.Column.Constraints {
@@ -4138,6 +4144,9 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 			col.Nullable = false
 		case parser.ConstraintNotNull:
 			col.Nullable = false
+		case parser.ConstraintUnique:
+			unique := constraint
+			uniqueConstraint = &unique
 		case parser.ConstraintDefault:
 			if constraint.Default != nil {
 				val, err := constantDefaultValue(e, col.Name, constraint.Default)
@@ -4159,7 +4168,28 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 		}
 	}
 
-	if err := e.schema.AddColumn(table, col); err != nil {
+	var uniqueIndex *storage.Index
+	if uniqueConstraint != nil {
+		uniqueIndex = e.addColumnUniqueIndex(table, col.Name, uniqueConstraint)
+	}
+
+	// The schema manager validates the new column against durable rows, rewrites
+	// them, and publishes the column together with its UNIQUE index while holding
+	// the table's exclusive gate, so a writer cannot slip a row in between the
+	// validation and the publication. Rows this session staged in an open
+	// transaction are invisible to that scan, so reject them here as well; the
+	// commit re-validates them against the schema that is current by then.
+	if !col.Nullable && col.Default == nil {
+		stagedRows, err := e.session.CountFast(table)
+		if err != nil {
+			return nil, err
+		}
+		if stagedRows > 0 {
+			return nil, &storage.NotNullViolationError{Table: table, Column: col.Name}
+		}
+	}
+
+	if err := e.schema.AddColumn(table, col, uniqueIndex); err != nil {
 		if action.IfNotExists && strings.Contains(err.Error(), "column already exists") {
 			return NewResult("ALTER TABLE"), nil
 		}
@@ -4171,6 +4201,31 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 
 	result := NewResult("ALTER TABLE")
 	return result, nil
+}
+
+// addColumnUniqueIndex names the index an ADD COLUMN ... UNIQUE constraint
+// materializes, using the declared constraint name when there is one and the
+// same deterministic internal name CREATE TABLE gives an unnamed column-level
+// UNIQUE constraint otherwise, suffixing collisions.
+func (e *Executor) addColumnUniqueIndex(table, column string, constraint *parser.ColumnConstraint) *storage.Index {
+	base := "uniq_" + strings.ToLower(table) + "_" + strings.ToLower(column)
+	if constraint.Name != "" {
+		base = constraint.Name
+	}
+	name := base
+	for n := 2; e.schema.IndexExists(name); n++ {
+		name = fmt.Sprintf("%s_%d", base, n)
+	}
+	index := &storage.Index{
+		Name:    name,
+		Table:   table,
+		Unique:  true,
+		Columns: []storage.IndexColumn{{Name: column}},
+	}
+	if constraint.HasOnConflict {
+		index.OnConflict = conflictActionName(constraint.OnConflict)
+	}
+	return index
 }
 
 // executeAlterTableDropColumn drops a column from a table.

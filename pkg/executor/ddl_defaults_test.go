@@ -59,7 +59,7 @@ func TestConstantDefaultsStillApplyOnInsert(t *testing.T) {
 	}
 }
 
-func TestAlterTableAddColumnDoesNotBackfill(t *testing.T) {
+func TestAlterTableAddColumnBackfillsExistingRows(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
 	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -71,8 +71,8 @@ func TestAlterTableAddColumnDoesNotBackfill(t *testing.T) {
 	if res.RowCount != 1 {
 		t.Fatalf("row count = %d, want 1", res.RowCount)
 	}
-	if got := res.Rows[0][1]; got != nil {
-		t.Fatalf("existing row status = %v, want NULL (ADD COLUMN does not backfill)", got)
+	if got := res.Rows[0][1]; got != "pending" {
+		t.Fatalf("existing row status = %v, want pending (ADD COLUMN backfills)", got)
 	}
 
 	execMust(t, e, "INSERT INTO t (id) VALUES (2)")

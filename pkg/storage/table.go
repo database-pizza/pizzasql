@@ -574,10 +574,6 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	rowid, _ := rowIDFromRow(nr)
-	data, err := encodeRow(nr)
-	if err != nil {
-		return 0, fmt.Errorf("failed to serialize row: %w", err)
-	}
 	wasInit := m.countInitialized(table)
 
 	// Point writers share this gate with each other. Transaction commits and
@@ -590,6 +586,23 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	defer unlock()
+
+	// prepareInsert normalized the row before this gate was held, so a
+	// concurrent ADD COLUMN may have published a column the row image predates.
+	// Re-apply the schema that is current under the gate; schema DDL needs the
+	// exclusive form of this gate, so it cannot change again before the write.
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return 0, err
+	}
+	if err := applySchemaDefaults(schema, nr); err != nil {
+		return 0, err
+	}
+	data, err := encodeRow(nr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to serialize row: %w", err)
+	}
+
 	var uniquePlan uniqueCachePlan
 	if uniq {
 		uniquePlan, err = m.prepareUniqueRows(table, map[string]*overlayEntry{key: {row: nr}})
@@ -623,9 +636,7 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	m.bumpGeneration(table)
-	if schema, serr := m.schema.GetSchema(table); serr == nil {
-		m.incrCount(table, schema.CreatedAt, 1, wasInit)
-	}
+	m.incrCount(table, schema.CreatedAt, 1, wasInit)
 	return rowid, nil
 }
 
@@ -1047,17 +1058,21 @@ func (m *TableManager) updateLocked(table string, updateFn func(Row) (Row, error
 // striped lock and a compare-and-swap write so a concurrent modification of the
 // same row fails with a serialization error instead of being silently lost.
 func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
-		return nil, false, err
-	}
-
 	key := m.dataKey(table, pk)
 	unlock, uniq, err := m.lockForWrite(table)
 	if err != nil {
 		return nil, false, err
 	}
 	defer unlock()
+
+	// Read the schema under the gate so validation sees every column a
+	// concurrent ADD COLUMN has published; the row itself is read below, also
+	// under the gate.
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return nil, false, err
+	}
+
 	st := m.stripeKey(key)
 	st.Lock()
 	defer st.Unlock()
@@ -1084,7 +1099,7 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 		}
 	}
 
-	if err := validateNotNull(schema, row); err != nil {
+	if err := applySchemaDefaults(schema, row); err != nil {
 		return nil, false, err
 	}
 	data, err := encodeRow(row)

@@ -870,3 +870,110 @@ func TestListTableIndexesSkipsOnlyNotFound(t *testing.T) {
 		t.Fatalf("expected only uq_v, got %v", indexes)
 	}
 }
+
+// AddColumn publishes the column together with its unique index in one durable
+// batch: the schema key, the index definition, and the index list share a single
+// LSN, so a crash can never expose the column without the constraint that
+// validates it.
+func TestAddColumnPublishesUniqueIndexInOneWrite(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+	pool := newTestKVPool(kv, 4, 5*time.Second)
+	defer pool.Close()
+	schemas := NewSchemaManager(pool, "testdb")
+	tables := NewTableManager(pool, schemas, "testdb")
+
+	if err := schemas.CreateTable(&Schema{
+		Name:       "t",
+		PrimaryKey: "id",
+		Columns:    []Column{{Name: "id", Type: "INTEGER", PrimaryKey: true, Nullable: false}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tables.Insert("t", Row{"id": int64(1)}); err != nil {
+		t.Fatal(err)
+	}
+
+	index := &Index{Name: "uniq_t_code", Table: "t", Unique: true, Columns: []IndexColumn{{Name: "code"}}}
+	schemaWritesBefore := kv.writeCount(":_schema:")
+	if err := schemas.AddColumn("t", Column{Name: "code", Type: "TEXT", Nullable: true, Default: "x"}, index); err != nil {
+		t.Fatalf("add column: %v", err)
+	}
+
+	schema, err := schemas.GetSchema("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := schema.GetColumn("code"); !ok {
+		t.Fatal("schema is missing the added column")
+	}
+	stored, err := schemas.GetIndex("uniq_t_code")
+	if err != nil {
+		t.Fatalf("get index: %v", err)
+	}
+	if !stored.Unique || len(stored.Columns) != 1 || stored.Columns[0].Name != "code" || stored.Table != "t" {
+		t.Fatalf("stored index = %+v, want a unique index over t.code", stored)
+	}
+	names, err := schemas.ListIndexes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "uniq_t_code" {
+		t.Fatalf("index list = %v, want [uniq_t_code]", names)
+	}
+
+	kv.mu.Lock()
+	schemaLSN := kv.lsns["testdb:_schema:t"]
+	indexLSN := kv.lsns["testdb:index:uniq_t_code"]
+	listLSN := kv.lsns["testdb:indexes"]
+	schemaWrites := kv.writes["testdb:_schema:t"]
+	indexWrites := kv.writes["testdb:index:uniq_t_code"]
+	kv.mu.Unlock()
+	if schemaLSN == 0 || schemaLSN != indexLSN || schemaLSN != listLSN {
+		t.Fatalf("schema/index/list LSNs = %d/%d/%d, want one shared LSN", schemaLSN, indexLSN, listLSN)
+	}
+	if schemaWrites != schemaWritesBefore+1 || indexWrites != 1 {
+		t.Fatalf("schema/index writes = %d/%d (schema had %d before), want one write each", schemaWrites, indexWrites, schemaWritesBefore)
+	}
+}
+
+// A rejected unique index must not leave the column behind, and an existing
+// index with the same name must be left intact.
+func TestAddColumnRejectsDuplicateIndexName(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+	pool := newTestKVPool(kv, 4, 5*time.Second)
+	defer pool.Close()
+	schemas := NewSchemaManager(pool, "testdb")
+
+	if err := schemas.CreateTable(&Schema{
+		Name:       "t",
+		PrimaryKey: "id",
+		Columns:    []Column{{Name: "id", Type: "INTEGER", PrimaryKey: true, Nullable: false}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := schemas.CreateIndex(&Index{Name: "uniq_t_code", Table: "t", Unique: true, Columns: []IndexColumn{{Name: "id"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := schemas.AddColumn("t", Column{Name: "code", Type: "TEXT", Nullable: true, Default: "x"},
+		&Index{Name: "uniq_t_code", Table: "t", Unique: true, Columns: []IndexColumn{{Name: "code"}}})
+	if err == nil {
+		t.Fatal("expected the existing index name to be rejected")
+	}
+	schema, err := schemas.GetSchema("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := schema.GetColumn("code"); ok {
+		t.Fatal("rejected ADD COLUMN published the column")
+	}
+	stored, err := schemas.GetIndex("uniq_t_code")
+	if err != nil {
+		t.Fatalf("existing index disappeared: %v", err)
+	}
+	if len(stored.Columns) != 1 || stored.Columns[0].Name != "id" {
+		t.Fatalf("existing index was overwritten: %+v", stored)
+	}
+}
