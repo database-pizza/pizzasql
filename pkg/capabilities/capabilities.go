@@ -169,7 +169,7 @@ func Current() *Document {
 			Unique:        Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "unique indexes, INLINE UNIQUE, and ON CONFLICT are enforced atomically"},
 			PrimaryKey:    Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "inline and table-level single-column keys; INTEGER PRIMARY KEY remains the rowid alias"},
 			CompositePK:   Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "table-level PRIMARY KEY (a, b) with ordered columns; key columns are implicitly NOT NULL (23502) and a composite key is never a rowid alias; two inline PRIMARY KEY declarations or an inline/table-level mix are rejected with 0A000; the key is durable under a length-prefixed encoding and reported by PRAGMA table_info pk ordinals and sqlite_master table SQL, but no implicit index is created for it; a conflict target that names the key columns matches them in any order, and ON CONFLICT DO UPDATE cannot assign a key column (0A000)"},
-			ForeignKey:    Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level FOREIGN KEY are rejected; enforce referential integrity in the application, cascades are not implemented"},
+			ForeignKey:    Feature{Supported: true, Status: "enforced", SQLState: "23503", Notes: "inline REFERENCES and table-level FOREIGN KEY (named or unnamed, single or multi-column) are accepted in CREATE TABLE; the parent table must already exist and the referenced columns must be its PRIMARY KEY or exactly the column set of a UNIQUE index, otherwise DDL fails with 0A000 (foreign key mismatch); a dangling reference is 23503 on INSERT, multi-row INSERT, UPDATE, and parent DELETE/UPDATE, and COMMIT re-validates the transaction's final state so a staged child insert and a staged parent delete cannot both land; MATCH SIMPLE (a NULL component skips the check) and self-references are supported; ON DELETE/ON UPDATE CASCADE, SET NULL, SET DEFAULT, and DEFERRABLE are rejected with 0A000; reported in sqlite_master/sqlite_schema table SQL only (pg_constraint and information_schema foreign keys are not emulated)"},
 			Check:         Feature{Supported: true, Status: "enforced", SQLState: "23514", Notes: "inline and table-level CHECK are evaluated on INSERT, multi-row INSERT, UPDATE, and ON CONFLICT DO UPDATE; NULL/unknown results pass; predicates are restricted to deterministic, subquery-free expressions over unqualified columns; exposed in sqlite_master/sqlite_schema table SQL only (pg_constraint and information_schema.check_constraints are not emulated)"},
 			DefaultValues: Feature{Supported: true, Status: "evaluated_at_write_time", SQLState: "0A000", Notes: "constant defaults are stored as their evaluated value; CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, datetime('now'), date('now'), and time('now') are stored as SQL text and evaluated once per statement on write (once per ALTER statement for an ADD COLUMN backfill), so they are never frozen at DDL time; any other non-constant default is rejected with 0A000"},
 		},
@@ -224,6 +224,7 @@ func Current() *Document {
 		ErrorCodes: map[string]string{
 			"23502": "not_null_violation",
 			"23505": "unique_violation",
+			"23503": "foreign_key_violation",
 			"23514": "check_violation",
 			"40001": "serialization_failure",
 			"0A000": "feature_not_supported",

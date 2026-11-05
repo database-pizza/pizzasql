@@ -3781,19 +3781,17 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 				// Collected after every column is known, because a table-level
 				// predicate may reference a later column.
 			case parser.ConstraintForeignKey:
-				return nil, pgerror.Unsupported(
-					"FOREIGN KEY constraints are not supported: column %q declares REFERENCES %s; enforce referential integrity in the application (the engine never validated foreign keys)",
-					col.Name, constraint.RefTable,
-				)
+				// Resolved once every column and the primary key are known, so a
+				// self-reference sees this table's final key.
 			}
 		}
 
 		schema.Columns = append(schema.Columns, col)
 	}
 
-	// Handle table-level constraints. CHECK predicates are persisted and
-	// enforced; FOREIGN KEY is still rejected because the engine never validates
-	// referential integrity.
+	// Handle table-level constraints. CHECK predicates and FOREIGN KEY
+	// declarations are persisted and enforced; foreign keys are resolved after
+	// every column and the primary key are known.
 	var tablePrimaryKeyColumns []string
 	for _, constraint := range stmt.Constraints {
 		switch constraint.Type {
@@ -3840,9 +3838,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		case parser.ConstraintCheck:
 			// Handled with the column-level predicates once every column is known.
 		case parser.ConstraintForeignKey:
-			return nil, pgerror.Unsupported(
-				"FOREIGN KEY constraints are not supported: enforce referential integrity in the application instead (the engine never validated foreign keys)",
-			)
+			// Resolved with the inline REFERENCES constraints below.
 		}
 	}
 
@@ -3851,6 +3847,11 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			"table %s declares more than one inline PRIMARY KEY; use a table-level PRIMARY KEY (%s) instead",
 			stmt.Table.Name, strings.Join(inlinePrimaryKeyColumns, ", "),
 		)
+	}
+	if len(inlinePrimaryKeyColumns) == 1 {
+		// Mirror the catalog's normalization so foreign-key validation below can
+		// resolve a self-reference against this table's primary key.
+		schema.PrimaryKey = inlinePrimaryKeyColumns[0]
 	}
 	if len(tablePrimaryKeyColumns) > 0 {
 		schema.PrimaryKeyColumns = tablePrimaryKeyColumns
@@ -3886,6 +3887,12 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		return nil, err
 	}
 	schema.Checks = checks
+
+	foreignKeys, err := e.createTableForeignKeys(stmt, schema, uniqIndexes)
+	if err != nil {
+		return nil, err
+	}
+	schema.ForeignKeys = foreignKeys
 
 	if err := e.schema.CreateTable(schema); err != nil {
 		if stmt.IfNotExists && strings.Contains(err.Error(), "table already exists") {
@@ -4283,8 +4290,8 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 			checkConstraints = append(checkConstraints, constraint)
 		case parser.ConstraintForeignKey:
 			return nil, pgerror.Unsupported(
-				"FOREIGN KEY constraints are not supported: column %q declares REFERENCES %s; enforce referential integrity in the application instead",
-				col.Name, constraint.RefTable,
+				"ALTER TABLE ADD COLUMN cannot declare REFERENCES %s on column %q; declare the foreign key in CREATE TABLE",
+				constraint.RefTable, col.Name,
 			)
 		}
 	}
@@ -4795,19 +4802,28 @@ func (e *Executor) executePragma(stmt *parser.PragmaStmt) (*Result, error) {
 	case "version":
 		return e.pragmaVersion()
 	case "foreign_keys":
+		// Foreign keys are always enforced, so the pragma reports them as on.
+		// Enabling is a no-op; disabling would require silently dropping
+		// constraint enforcement, which the engine does not offer.
 		result := NewResult("PRAGMA")
 		if stmt.Value == nil {
 			result.AddColumn("foreign_keys")
-			result.AddRow(int64(0))
+			result.AddRow(int64(1))
 			return result, nil
 		}
-		if ref, ok := stmt.Value.(*parser.ColumnRef); ok && strings.EqualFold(ref.Column, "off") {
+		if ref, ok := stmt.Value.(*parser.ColumnRef); ok && (strings.EqualFold(ref.Column, "on") || strings.EqualFold(ref.Column, "off")) {
+			if strings.EqualFold(ref.Column, "off") {
+				return nil, fmt.Errorf("feature not supported: foreign keys are always enforced; PRAGMA foreign_keys = OFF is not supported")
+			}
 			return result, nil
 		}
-		if literal, ok := stmt.Value.(*parser.LiteralExpr); ok && literal.Value == "0" {
+		if literal, ok := stmt.Value.(*parser.LiteralExpr); ok && (literal.Value == "1" || literal.Value == "0") {
+			if literal.Value == "0" {
+				return nil, fmt.Errorf("feature not supported: foreign keys are always enforced; PRAGMA foreign_keys = OFF is not supported")
+			}
 			return result, nil
 		}
-		return nil, fmt.Errorf("PizzaSQL does not enforce foreign keys; only PRAGMA foreign_keys = OFF is supported")
+		return nil, fmt.Errorf("feature not supported: PRAGMA foreign_keys accepts ON or OFF")
 	default:
 		return nil, fmt.Errorf("unknown pragma: %s", stmt.Name)
 	}

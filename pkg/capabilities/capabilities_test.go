@@ -147,3 +147,28 @@ func TestCompositePrimaryKeyIsAdvertised(t *testing.T) {
 		t.Fatalf("document does not advertise composite_primary_key as supported: %s", body)
 	}
 }
+
+// Foreign keys are advertised as enforced, with the SQLSTATE callers should
+// expect for a dangling reference and the explicit exclusions for cascades and
+// deferred enforcement.
+func TestForeignKeyIsAdvertised(t *testing.T) {
+	doc := Current()
+	fk := doc.Constraints.ForeignKey
+	if !fk.Supported {
+		t.Fatalf("foreign_key = %+v, want supported", fk)
+	}
+	if fk.Status != "enforced" {
+		t.Fatalf("foreign_key status = %q, want enforced", fk.Status)
+	}
+	if fk.SQLState != pgerror.CodeForeignKeyViolation {
+		t.Fatalf("foreign_key SQLSTATE = %q, want %q", fk.SQLState, pgerror.CodeForeignKeyViolation)
+	}
+	for _, want := range []string{"UNIQUE", "COMMIT", "MATCH SIMPLE", "self", "CASCADE", "DEFERRABLE", "0A000", "pg_constraint"} {
+		if !strings.Contains(fk.Notes, want) {
+			t.Fatalf("foreign_key notes = %q, want it to mention %q", fk.Notes, want)
+		}
+	}
+	if got := doc.ErrorCodes[pgerror.CodeForeignKeyViolation]; got != "foreign_key_violation" {
+		t.Fatalf("23503 mapping = %q, want foreign_key_violation", got)
+	}
+}

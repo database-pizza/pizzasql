@@ -124,6 +124,8 @@ func TestSQLStateHTTPErrorMapping(t *testing.T) {
 		code   string
 	}{
 		{"unique", fmt.Errorf("UNIQUE constraint failed: uniq_users_email"), http.StatusConflict, "23505"},
+		{"foreign key", fmt.Errorf("FOREIGN KEY constraint failed: parent_id -> parent"), http.StatusConflict, "23503"},
+		{"typed foreign key", &storage.ForeignKeyViolationError{Table: "child", Constraint: "parent_id -> parent"}, http.StatusConflict, "23503"},
 		{"not null", fmt.Errorf("NOT NULL constraint failed: t.v"), http.StatusBadRequest, "23502"},
 		{"check", fmt.Errorf("CHECK constraint failed: positive_age"), http.StatusBadRequest, "23514"},
 		{"typed check", &storage.CheckViolationError{Table: "t", Constraint: "positive_age"}, http.StatusBadRequest, "23514"},
@@ -168,5 +170,32 @@ func TestHTTPExecuteCommitCheckViolationReturns23514(t *testing.T) {
 	}
 	if resp.Error.Code != "23514" {
 		t.Fatalf("code = %q, want 23514", resp.Error.Code)
+	}
+}
+
+// A dangling foreign key reports 23503 through the query endpoint, with the
+// constraint label in details.
+func TestHTTPForeignKeyViolationReturns23503(t *testing.T) {
+	server := setupKVTestServer(t)
+	queryHTTP(t, server, "CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+	queryHTTP(t, server, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, CONSTRAINT child_parent FOREIGN KEY (parent_id) REFERENCES parent(id))")
+
+	body, _ := json.Marshal(QueryRequest{SQL: "INSERT INTO child (id, parent_id) VALUES (1, 99)"})
+	r := httptest.NewRequest(http.MethodPost, "/query", strings.NewReader(string(body)))
+	w := httptest.NewRecorder()
+	server.handleQuery(w, r)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body %s", w.Code, w.Body.String())
+	}
+	var resp httpErrorBody
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Error.Code != "23503" {
+		t.Fatalf("code = %q, want 23503", resp.Error.Code)
+	}
+	if constraint, _ := resp.Error.Details["constraint"].(string); constraint != "child_parent" {
+		t.Fatalf("details.constraint = %q, want child_parent", constraint)
 	}
 }

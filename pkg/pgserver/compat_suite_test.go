@@ -137,11 +137,13 @@ func TestCompatibilitySuite(t *testing.T) {
 	expectCode("locking.for_update_0A000", `SELECT * FROM accounts FOR UPDATE`, "0A000")
 	expectCode("arrays.any_0A000", `SELECT * FROM accounts WHERE id = ANY('{1,2}')`, "0A000")
 
-	// CHECK is accepted and enforced; FOREIGN KEY is still rejected at DDL
-	// instead of being silently discarded.
+	// CHECK and FOREIGN KEY are accepted and enforced.
 	expectOK("ddl.check_accepted", `CREATE TABLE checked (n INTEGER CHECK (n > 0))`)
 	expectCode("constraints.check_23514", `INSERT INTO checked (n) VALUES (-1)`, "23514")
-	expectCode("ddl.foreign_key_0A000", `CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES accounts(id))`, "0A000")
+	expectOK("ddl.foreign_key_accepted", `CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES accounts(id))`)
+	expectOK("dml.foreign_key_valid", `INSERT INTO child (id, parent_id) VALUES (1, 1)`)
+	expectCode("constraints.foreign_key_23503", `INSERT INTO child (id, parent_id) VALUES (2, 99)`, "23503")
+	expectCode("constraints.foreign_key_parent_delete_23503", `DELETE FROM accounts WHERE id = 1`, "23503")
 
 	expectCode("errors.syntax_42601", `SELEC 1`, "42601")
 

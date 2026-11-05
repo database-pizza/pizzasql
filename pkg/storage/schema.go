@@ -38,6 +38,29 @@ type Schema struct {
 	// level alike. Inline and table-level declarations are equivalent once
 	// parsed, so both live in this one list.
 	Checks []CheckConstraint `json:"checks,omitempty"`
+	// ForeignKeys holds the immediate FOREIGN KEY declarations. Each constraint
+	// is enforced on every write and re-validated at transaction commit.
+	ForeignKeys []ForeignKeyConstraint `json:"foreign_keys,omitempty"`
+}
+
+// ForeignKeyConstraint is a persisted FOREIGN KEY declaration. Columns are the
+// child columns in declaration order; RefColumns are the parent columns they are
+// matched against. Both sides have the same length, and the parent side is
+// validated at DDL to be the parent's PRIMARY KEY or a UNIQUE index.
+type ForeignKeyConstraint struct {
+	Name       string   `json:"name,omitempty"`
+	Columns    []string `json:"columns"`
+	RefTable   string   `json:"ref_table"`
+	RefColumns []string `json:"ref_columns"`
+}
+
+// Label identifies the constraint in error messages: the declared name when
+// there is one, otherwise the child column list.
+func (fk ForeignKeyConstraint) Label() string {
+	if fk.Name != "" {
+		return fk.Name
+	}
+	return strings.Join(fk.Columns, ", ") + " -> " + fk.RefTable
 }
 
 // CheckConstraint is a persisted CHECK predicate. The predicate is stored as
@@ -150,6 +173,11 @@ type SchemaManager struct {
 	defaultEvalMu sync.RWMutex
 	defaultEval   DefaultEvaluator
 	defaultClock  DefaultClock
+
+	// fkCatalogMu guards fkCatalog, the cached foreign-key metadata used to find
+	// referencing tables without re-reading every schema on every write.
+	fkCatalogMu sync.Mutex
+	fkCatalog   *foreignKeyCatalog
 }
 
 // DefaultEvaluator evaluates a persisted non-constant DEFAULT expression, such
@@ -471,6 +499,17 @@ func cloneSchema(schema *Schema) *Schema {
 	cloned.Columns = append([]Column(nil), schema.Columns...)
 	cloned.Checks = append([]CheckConstraint(nil), schema.Checks...)
 	cloned.PrimaryKeyColumns = append([]string(nil), schema.PrimaryKeyColumns...)
+	if schema.ForeignKeys != nil {
+		cloned.ForeignKeys = make([]ForeignKeyConstraint, len(schema.ForeignKeys))
+		for i, fk := range schema.ForeignKeys {
+			cloned.ForeignKeys[i] = ForeignKeyConstraint{
+				Name:       fk.Name,
+				Columns:    append([]string(nil), fk.Columns...),
+				RefTable:   fk.RefTable,
+				RefColumns: append([]string(nil), fk.RefColumns...),
+			}
+		}
+	}
 	return &cloned
 }
 

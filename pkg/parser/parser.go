@@ -1449,16 +1449,14 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 		constraint.RefTable = p.curToken.Literal
 		p.nextToken()
 		if p.curTokenIs(lexer.TokenLParen) {
-			p.nextToken()
-			if !p.curTokenIs(lexer.TokenIdent) {
-				return nil, false, p.curError("expected column name")
+			refCols, err := p.parseParenIdentList()
+			if err != nil {
+				return nil, false, err
 			}
-			constraint.RefColumn = p.curToken.Literal
-			p.nextToken()
-			if !p.curTokenIs(lexer.TokenRParen) {
-				return nil, false, p.curError("expected )")
-			}
-			p.nextToken()
+			constraint.RefColumns = refCols
+		}
+		if err := p.parseForeignKeyClauses(&constraint.OnDelete, &constraint.OnUpdate, &constraint.Deferrable); err != nil {
+			return nil, false, err
 		}
 
 	case lexer.TokenAUTOINCREMENT:
@@ -1536,23 +1534,88 @@ func (p *Parser) parseOnConflictAction() (ConflictAction, bool, error) {
 	}
 }
 
-// consumeReferentialAction consumes one foreign-key referential action
-// (CASCADE, RESTRICT, SET NULL, SET DEFAULT, NO ACTION). It is a no-op for the
-// engine, which does not enforce foreign keys.
-func (p *Parser) consumeReferentialAction() {
-	if p.curTokenIs(lexer.TokenSET) {
-		p.nextToken() // NULL or DEFAULT
+// parseForeignKeyClauses parses the optional ON DELETE/ON UPDATE referential
+// actions and the optional DEFERRABLE clause that follow a REFERENCES target.
+// The engine enforces foreign keys immediately, so the parsed actions are kept
+// for the DDL layer to accept (NO ACTION/RESTRICT) or reject (cascades), and a
+// DEFERRABLE clause is recorded so it can be rejected instead of silently
+// weakening the constraint.
+func (p *Parser) parseForeignKeyClauses(onDelete, onUpdate *ReferentialAction, deferrable *bool) error {
+	for p.curTokenIs(lexer.TokenON) {
 		p.nextToken()
-		return
-	}
-	if p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "NO") {
-		p.nextToken()
-		if p.curTokenIs(lexer.TokenIdent) {
-			p.nextToken() // ACTION
+		var target *ReferentialAction
+		switch {
+		case p.curTokenIs(lexer.TokenDELETE):
+			target = onDelete
+		case p.curTokenIs(lexer.TokenUPDATE):
+			target = onUpdate
+		default:
+			return p.curError("expected DELETE or UPDATE after ON")
 		}
-		return
+		p.nextToken()
+		action, err := p.parseReferentialAction()
+		if err != nil {
+			return err
+		}
+		*target = action
 	}
-	p.nextToken() // CASCADE, RESTRICT, ...
+	if p.curTokenIs(lexer.TokenNOT) && p.peekToken.Type == lexer.TokenIdent && strings.EqualFold(p.peekToken.Literal, "DEFERRABLE") {
+		// NOT DEFERRABLE is the default; consume it so it parses. A following
+		// NOT NULL belongs to the column constraint list, so only consume NOT
+		// when DEFERRABLE actually follows.
+		p.nextToken()
+		p.nextToken()
+		return nil
+	}
+	if p.curIdentIs("DEFERRABLE") {
+		*deferrable = true
+		p.nextToken()
+		if p.curIdentIs("INITIALLY") {
+			p.nextToken()
+			switch {
+			case p.curIdentIs("DEFERRED"):
+				p.nextToken()
+			case p.curIdentIs("IMMEDIATE"):
+				p.nextToken()
+			default:
+				return p.curError("expected DEFERRED or IMMEDIATE after INITIALLY")
+			}
+		}
+	}
+	return nil
+}
+
+// parseReferentialAction parses one foreign-key action.
+func (p *Parser) parseReferentialAction() (ReferentialAction, error) {
+	switch {
+	case p.curIdentIs("CASCADE"):
+		p.nextToken()
+		return RefActionCascade, nil
+	case p.curIdentIs("RESTRICT"):
+		p.nextToken()
+		return RefActionRestrict, nil
+	case p.curIdentIs("NO"):
+		p.nextToken()
+		if !p.curIdentIs("ACTION") {
+			return RefActionUnspecified, p.curError("expected ACTION after NO")
+		}
+		p.nextToken()
+		return RefActionNoAction, nil
+	case p.curTokenIs(lexer.TokenSET):
+		p.nextToken()
+		switch {
+		case p.curTokenIs(lexer.TokenNULL):
+			p.nextToken()
+			return RefActionSetNull, nil
+		case p.curTokenIs(lexer.TokenDEFAULT):
+			p.nextToken()
+			return RefActionSetDefault, nil
+		default:
+			return RefActionUnspecified, p.curError("expected NULL or DEFAULT after SET")
+		}
+	default:
+		return RefActionUnspecified, p.curError("expected CASCADE, RESTRICT, NO ACTION, SET NULL, or SET DEFAULT")
+	}
 }
 
 func (p *Parser) parseTableConstraint() (*TableConstraint, error) {
@@ -1631,15 +1694,8 @@ func (p *Parser) parseTableConstraint() (*TableConstraint, error) {
 		}
 		constraint.RefColumns = refCols
 
-		// Consume and ignore referential actions (ON DELETE/UPDATE ...). The
-		// engine does not enforce foreign keys, but the clause must parse.
-		for p.curTokenIs(lexer.TokenON) {
-			p.nextToken()
-			if !p.curTokenIs(lexer.TokenDELETE) && !p.curTokenIs(lexer.TokenUPDATE) {
-				return nil, p.curError("expected DELETE or UPDATE after ON")
-			}
-			p.nextToken()
-			p.consumeReferentialAction()
+		if err := p.parseForeignKeyClauses(&constraint.OnDelete, &constraint.OnUpdate, &constraint.Deferrable); err != nil {
+			return nil, err
 		}
 
 	case lexer.TokenCHECK:
@@ -2076,6 +2132,13 @@ func (p *Parser) parsePragma() (*PragmaStmt, error) {
 	// Check for value assignment: PRAGMA name = value
 	if p.curTokenIs(lexer.TokenEq) {
 		p.nextToken()
+		// ON is a keyword token, so it cannot start an expression. Accept it here
+		// as the value for boolean pragmas such as PRAGMA foreign_keys = ON.
+		if p.curTokenIs(lexer.TokenON) {
+			stmt.Value = &ColumnRef{Column: "on"}
+			p.nextToken()
+			return stmt, nil
+		}
 		val, err := p.parseExpr()
 		if err != nil {
 			return nil, err

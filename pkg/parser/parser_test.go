@@ -1764,3 +1764,42 @@ func TestParseDetachOptional(t *testing.T) {
 		t.Errorf("expected alias 'other', got '%s'", detach.Alias)
 	}
 }
+
+// The foreign-key clause parser must not swallow a following column constraint:
+// NOT NULL after REFERENCES belongs to the column, and NOT DEFERRABLE is the
+// default that is accepted and recorded as immediate enforcement.
+func TestParseInlineForeignKeyClauseBoundaries(t *testing.T) {
+	stmt := parse(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) NOT NULL UNIQUE)")
+	create := stmt.(*CreateTableStmt)
+	column := create.Columns[1]
+	if len(column.Constraints) != 3 {
+		t.Fatalf("constraints = %+v, want REFERENCES, NOT NULL, and UNIQUE", column.Constraints)
+	}
+	if column.Constraints[0].Type != ConstraintForeignKey || column.Constraints[0].RefTable != "p" {
+		t.Fatalf("foreign key = %+v", column.Constraints[0])
+	}
+	if len(column.Constraints[0].RefColumns) != 1 || column.Constraints[0].RefColumns[0] != "id" {
+		t.Fatalf("ref columns = %v, want [id]", column.Constraints[0].RefColumns)
+	}
+	if column.Constraints[1].Type != ConstraintNotNull || column.Constraints[2].Type != ConstraintUnique {
+		t.Fatalf("following constraints = %+v, want NOT NULL then UNIQUE", column.Constraints[1:])
+	}
+
+	stmt = parse(t, "CREATE TABLE t2 (pid INTEGER REFERENCES p(id) NOT DEFERRABLE)")
+	column = stmt.(*CreateTableStmt).Columns[0]
+	if len(column.Constraints) != 1 || column.Constraints[0].Type != ConstraintForeignKey {
+		t.Fatalf("constraints = %+v, want one foreign key", column.Constraints)
+	}
+	if column.Constraints[0].Deferrable {
+		t.Fatal("NOT DEFERRABLE was recorded as deferrable")
+	}
+
+	stmt = parse(t, "CREATE TABLE t3 (pid INTEGER REFERENCES p(id) ON DELETE RESTRICT ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED)")
+	constraint := stmt.(*CreateTableStmt).Columns[0].Constraints[0]
+	if constraint.OnDelete != RefActionRestrict || constraint.OnUpdate != RefActionNoAction {
+		t.Fatalf("actions = %v/%v, want RESTRICT/NO ACTION", constraint.OnDelete, constraint.OnUpdate)
+	}
+	if !constraint.Deferrable {
+		t.Fatal("DEFERRABLE INITIALLY DEFERRED was not recorded")
+	}
+}
