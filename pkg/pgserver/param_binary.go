@@ -43,7 +43,9 @@ func binaryArrayText(elementType string, value []byte) (string, error) {
 		return "", pgerror.InvalidText("invalid binary array header")
 	}
 	if dimensions > 1 {
-		return "", pgerror.InvalidText("multidimensional arrays are not supported")
+		// Text-format arrays reject nested braces with 0A000; binary arrays
+		// report the same unsupported-feature error for parity.
+		return "", fmt.Errorf("%w: multidimensional arrays are not supported", pgerror.ErrFeatureNotSupported)
 	}
 	expectedOID, ok := binaryArrayElementOID(elementType)
 	if !ok {
@@ -229,12 +231,11 @@ func binaryNumericText(data []byte) (string, error) {
 	}
 	switch sign {
 	case 0x0000, 0x4000:
-	case 0xC000:
-		return "NaN", nil
-	case 0xD000:
-		return "Infinity", nil
-	case 0xF000:
-		return "-Infinity", nil
+	case 0xC000, 0xD000, 0xF000:
+		// The engine has no numeric representation for NaN or infinities;
+		// splicing the bare word into SQL would fail later as an unknown
+		// column, so reject the value as invalid text input here.
+		return "", pgerror.InvalidText("binary numeric parameter has an unsupported special value")
 	default:
 		return "", pgerror.InvalidText("binary numeric parameter has an invalid sign")
 	}

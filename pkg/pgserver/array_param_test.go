@@ -117,8 +117,9 @@ func TestArrayParameterOverExtendedQuery(t *testing.T) {
 		t.Fatalf("text[] ANY($1) returned %v", row)
 	}
 
-	// An unspecified parameter OID keeps the array literal untyped; ANY still
-	// reads it as array text, which is what drivers that omit OIDs rely on.
+	// With no declared OID the server infers int4[] from id = ANY($1). The
+	// text-format value still binds as array text, which is what drivers that
+	// send text parameters rely on.
 	conn.reset()
 	messages = runExtendedParseBindExecute(t, c, conn, `SELECT id FROM t WHERE id = ANY($1) ORDER BY id`, 0, "{2,3}")
 	if errMsg := findError(messages); errMsg != nil {
@@ -345,7 +346,8 @@ func TestArraySubscriptParameterBinding(t *testing.T) {
 		t.Fatalf("tags[$1] row = %v, want [b]", row)
 	}
 
-	// An untyped parameter binds the same way.
+	// A parameter with no declared OID is inferred as INTEGER from the
+	// subscript and binds the same way.
 	conn.reset()
 	messages = runExtendedParseBindExecute(t, c, conn, `SELECT tags[$1] FROM t`, 0, "3")
 	if errMsg := findError(messages); errMsg != nil {

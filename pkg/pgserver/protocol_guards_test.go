@@ -177,7 +177,9 @@ func TestTypicalExtendedSequenceWithDescribeSucceeds(t *testing.T) {
 			row = dataRowValues(t, message)
 		}
 	}
-	if string(types) != "12tnTDCZ" {
+	// Portal Describe sends NoData only; ParameterDescription belongs to
+	// Describe('S') and PostgreSQL does not send it for a portal.
+	if string(types) != "12nTDCZ" {
 		t.Fatalf("message sequence = %q", types)
 	}
 	if len(row) != 1 || row[0] != "7" {

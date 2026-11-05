@@ -212,17 +212,11 @@ func TestBinaryArrayParameterMalformed(t *testing.T) {
 		{"truncated_dimension", valid[:14]},
 		{"truncated_elements", valid[:len(valid)-2]},
 		{"trailing_bytes", append(append([]byte(nil), valid...), 0)},
-		{"multidimensional", encodeBinaryArray(23, [][]byte{encodeInt4(1)})},
 		{"element_oid_mismatch", encodeBinaryArray(25, [][]byte{[]byte("x")})},
 		{"null_without_flag", nullWithoutFlag},
 		{"invalid_boolean", encodeBinaryArray(16, [][]byte{{2}})},
 		{"short_int4", encodeBinaryArray(23, [][]byte{{0, 0}})},
 	}
-	// ndim = 2 is rejected before any dimension header is read.
-	multiDimensional := encodeBinaryArray(23, [][]byte{encodeInt4(1)})
-	binary.BigEndian.PutUint32(multiDimensional[0:4], 2)
-	cases[4].value = multiDimensional
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			messages := runBinaryParameter(t, c, conn, `SELECT $1::INTEGER[]`, 1007, tc.value)
@@ -234,6 +228,123 @@ func TestBinaryArrayParameterMalformed(t *testing.T) {
 				t.Fatalf("%s SQLSTATE = %q, want %q", tc.name, code, ErrCodeInvalidText)
 			}
 		})
+	}
+}
+
+// Multidimensional binary arrays report the same unsupported-feature error as
+// their text-format equivalent.
+func TestBinaryArrayParameterMultidimensional(t *testing.T) {
+	c, conn := arrayConnection(t)
+	value := encodeBinaryArray(23, [][]byte{encodeInt4(1)})
+	binary.BigEndian.PutUint32(value[0:4], 2)
+	messages := runBinaryParameter(t, c, conn, `SELECT $1::INTEGER[]`, 1007, value)
+	errMsg := findError(messages)
+	if errMsg == nil {
+		t.Fatal("multidimensional binary array was accepted")
+	}
+	if code := errorCode(errMsg); code != ErrCodeFeatureNotSupported {
+		t.Fatalf("binary multidimensional SQLSTATE = %q, want %q", code, ErrCodeFeatureNotSupported)
+	}
+
+	messages = runExtendedParseBindExecute(t, c, conn, `SELECT $1::INTEGER[]`, 1007, "{{1}}")
+	errMsg = findError(messages)
+	if errMsg == nil {
+		t.Fatal("multidimensional text array was accepted")
+	}
+	if code := errorCode(errMsg); code != ErrCodeFeatureNotSupported {
+		t.Fatalf("text multidimensional SQLSTATE = %q, want %q", code, ErrCodeFeatureNotSupported)
+	}
+}
+
+// The engine has no numeric NaN or infinity, so both the scalar and array
+// paths must reject those binary values as invalid text instead of splicing a
+// bare NaN into SQL.
+func TestBinaryNumericSpecialValuesRejected(t *testing.T) {
+	c, conn := arrayConnection(t)
+	for _, tc := range []struct {
+		name  string
+		sql   string
+		oid   int32
+		value []byte
+	}{
+		{"scalar_nan", `SELECT $1::NUMERIC`, 1700, encodeNumeric(0xC000, 0, 0)},
+		{"scalar_infinity", `SELECT $1::NUMERIC`, 1700, encodeNumeric(0xD000, 0, 0)},
+		{"scalar_negative_infinity", `SELECT $1::NUMERIC`, 1700, encodeNumeric(0xF000, 0, 0)},
+		{"array_nan", `SELECT $1::NUMERIC[]`, 1231, encodeBinaryArray(1700, [][]byte{encodeNumeric(0xC000, 0, 0)})},
+		{"array_infinity", `SELECT $1::NUMERIC[]`, 1231, encodeBinaryArray(1700, [][]byte{encodeNumeric(0xD000, 0, 0)})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			messages := runBinaryParameter(t, c, conn, tc.sql, tc.oid, tc.value)
+			errMsg := findError(messages)
+			if errMsg == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+			if code := errorCode(errMsg); code != ErrCodeInvalidText {
+				t.Fatalf("%s SQLSTATE = %q, want %q", tc.name, code, ErrCodeInvalidText)
+			}
+		})
+	}
+}
+
+// Scalar binary booleans validate the payload byte like the array element path.
+func TestBinaryBooleanParameterValidation(t *testing.T) {
+	c, conn := arrayConnection(t)
+	for _, value := range [][]byte{{}, {2}, {0, 0}} {
+		messages := runBinaryParameter(t, c, conn, `SELECT $1::BOOLEAN`, 16, value)
+		errMsg := findError(messages)
+		if errMsg == nil {
+			t.Fatalf("binary boolean %v was accepted", value)
+		}
+		if code := errorCode(errMsg); code != ErrCodeInvalidText {
+			t.Fatalf("binary boolean %v SQLSTATE = %q, want %q", value, code, ErrCodeInvalidText)
+		}
+	}
+}
+
+// Parameter formats are per parameter: one text parameter and one binary
+// parameter in the same Bind message decode independently.
+func TestMixedParameterFormats(t *testing.T) {
+	c, conn := arrayConnection(t)
+	conn.reset()
+	parse := NewMessageBuilder()
+	parse.WriteString("s1")
+	parse.WriteString(`SELECT $1::INTEGER, $2::INTEGER`)
+	parse.WriteInt16(0)
+
+	bind := NewMessageBuilder()
+	bind.WriteString("p1")
+	bind.WriteString("s1")
+	bind.WriteInt16(2) // one format code per parameter
+	bind.WriteInt16(0) // $1 text
+	bind.WriteInt16(1) // $2 binary
+	bind.WriteInt16(2)
+	bind.WriteInt32(1)
+	bind.WriteBytes([]byte("5"))
+	binaryValue := encodeInt4(7)
+	bind.WriteInt32(int32(len(binaryValue)))
+	bind.WriteBytes(binaryValue)
+	bind.WriteInt16(0)
+
+	execute := NewMessageBuilder()
+	execute.WriteString("p1")
+	execute.WriteInt32(0)
+
+	for _, msg := range []*Message{
+		{Type: MsgParse, Data: parse.Bytes()},
+		{Type: MsgBind, Data: bind.Bytes()},
+		{Type: MsgExecute, Data: execute.Bytes()},
+		{Type: MsgSync},
+	} {
+		if err := c.handleMessage(msg); err != nil {
+			t.Fatalf("handle %c: %v", msg.Type, err)
+		}
+	}
+	messages := readAllMessages(t, conn.bytes())
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("mixed formats failed: %s", errorCode(errMsg))
+	}
+	if row := firstDataRow(t, messages); len(row) != 2 || row[0] != "5" || row[1] != "7" {
+		t.Fatalf("mixed formats row = %v, want [5 7]", row)
 	}
 }
 

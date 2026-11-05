@@ -72,9 +72,6 @@ type preparedStatement struct {
 type portal struct {
 	query    string
 	executed bool
-	// paramOIDs copies the bound statement's negotiated types so Describe
-	// (Portal) reports the same ParameterDescription as Describe (Statement).
-	paramOIDs []int32
 }
 
 // NewConnection creates a new connection handler
@@ -538,7 +535,11 @@ func (c *Connection) handleParse(msg *Message) error {
 	if !isSingleStatementSQL(query) {
 		return c.failExtended(ErrCodeSyntaxError, fmt.Errorf("prepared statements must contain one command"))
 	}
-	c.statements[name] = &preparedStatement{query: query, paramOIDs: c.negotiateParameterOIDs(query, oids)}
+	paramOIDs, err := c.negotiateParameterOIDs(query, oids)
+	if err != nil {
+		return c.failExtended(ErrCodeProgramLimitExceeded, err)
+	}
+	c.statements[name] = &preparedStatement{query: query, paramOIDs: paramOIDs}
 	return c.writeMessage(MsgParseComplete, nil)
 }
 
@@ -620,7 +621,7 @@ func (c *Connection) handleBind(msg *Message) error {
 		}
 		return c.failExtended(code, err)
 	}
-	c.portals[portalName] = &portal{query: query, paramOIDs: append([]int32(nil), statement.paramOIDs...)}
+	c.portals[portalName] = &portal{query: query}
 	return c.writeMessage(MsgBindComplete, nil)
 }
 
@@ -645,12 +646,11 @@ func (c *Connection) handleDescribe(msg *Message) error {
 			return err
 		}
 	case 'P':
-		portal, ok := c.portals[name]
-		if !ok {
+		// PostgreSQL reports parameter types only for Describe('S'). Portal
+		// Describe returns row metadata (here NoData) without a
+		// ParameterDescription.
+		if _, ok := c.portals[name]; !ok {
 			return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("portal %q does not exist", name))
-		}
-		if err := c.sendParameterDescription(portal.paramOIDs); err != nil {
-			return err
 		}
 	default:
 		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Describe target"))
@@ -1161,8 +1161,8 @@ func parameterLiteral(param boundParameter) (string, error) {
 		case 1700:
 			return binaryNumericText(param.value)
 		case 16:
-			if len(param.value) != 1 {
-				return "", fmt.Errorf("invalid binary boolean")
+			if len(param.value) != 1 || param.value[0] > 1 {
+				return "", pgerror.InvalidText("invalid binary boolean parameter")
 			}
 			if param.value[0] == 0 {
 				return "FALSE", nil
@@ -1415,10 +1415,14 @@ func (c *Connection) sendEmptyQueryResponse() error {
 }
 
 // sendParameterDescription reports the negotiated parameter types of a
-// prepared statement or a bound portal.
+// prepared statement. The protocol count field is 16-bit and the negotiated
+// list never exceeds maxParameterNumber, so the conversion cannot lose a count.
 func (c *Connection) sendParameterDescription(oids []int32) error {
+	if len(oids) > maxParameterNumber {
+		return fmt.Errorf("parameter description has %d entries; the protocol limit is %d", len(oids), maxParameterNumber)
+	}
 	mb := NewMessageBuilder()
-	mb.WriteInt16(int16(len(oids)))
+	mb.WriteInt16(int16(uint16(len(oids))))
 	for _, oid := range oids {
 		mb.WriteInt32(oid)
 	}

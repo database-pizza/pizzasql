@@ -1,6 +1,7 @@
 package pgserver
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -22,9 +23,16 @@ const textParameterOID = 25
 // context.
 const markerPrefix = "__pizzasql_parameter_"
 
+// maxParameterNumber is PostgreSQL's protocol limit on parameter numbers. A
+// Parse message addresses parameters by number and ParameterDescription counts
+// them in a 16-bit field, so a larger placeholder can never be described; it is
+// rejected before any allocation sized from the query text.
+const maxParameterNumber = 65535
+
 // parameterReference records one $n placeholder found by the quote- and
-// comment-aware scan that Bind uses. number is 0 when the digits do not fit in
-// an int, which Bind reports as a missing parameter.
+// comment-aware scan that Bind uses. number is clamped to maxParameterNumber+1
+// when the digits exceed the protocol limit, and stays 0 for $0; Bind reports
+// both as a missing parameter.
 type parameterReference struct {
 	number int
 	start  int
@@ -34,19 +42,27 @@ type parameterReference struct {
 // negotiateParameterOIDs builds the ParameterDescription type list for query.
 // The list length is the highest placeholder number (or the client's declared
 // count when that is larger), client-declared non-zero OIDs win, and every
-// remaining entry is inferred from the SQL or falls back to TEXT.
-func (c *Connection) negotiateParameterOIDs(query string, declared []int32) []int32 {
+// remaining entry is inferred from the SQL or falls back to TEXT. A placeholder
+// number above the protocol limit is an error, so a hostile query can never
+// size the list.
+func (c *Connection) negotiateParameterOIDs(query string, declared []int32) ([]int32, error) {
 	references := scanParameters(query)
 	count := len(declared)
 	for _, reference := range references {
+		if reference.number > maxParameterNumber {
+			return nil, fmt.Errorf("parameter %s exceeds PostgreSQL's limit of %d parameters", query[reference.start:reference.end], maxParameterNumber)
+		}
 		if reference.number > count {
 			count = reference.number
 		}
 	}
+	if count > maxParameterNumber {
+		return nil, fmt.Errorf("statement declares %d parameters; PostgreSQL's limit is %d", count, maxParameterNumber)
+	}
 	oids := make([]int32, count)
 	copy(oids, declared)
 	if count == 0 {
-		return oids
+		return oids, nil
 	}
 	inferred := c.inferParameterTypes(query, references)
 	for i := range oids {
@@ -58,7 +74,7 @@ func (c *Connection) negotiateParameterOIDs(query string, declared []int32) []in
 			oids[i] = c.getOIDForType(typeName)
 		}
 	}
-	return oids
+	return oids, nil
 }
 
 // inferParameterTypes returns the type name of every parameter whose SQL
@@ -129,7 +145,18 @@ func scanParameters(query string) []parameterReference {
 			for end < len(query) && query[end] >= '0' && query[end] <= '9' {
 				end++
 			}
-			number, _ := strconv.Atoi(query[i+1 : end])
+			// Clamp at the protocol limit instead of accumulating every digit:
+			// a hostile $999... must not overflow or size an allocation.
+			number := 0
+			for _, digit := range query[i+1 : end] {
+				if number > maxParameterNumber {
+					break
+				}
+				number = number*10 + int(digit-'0')
+				if number > maxParameterNumber {
+					number = maxParameterNumber + 1
+				}
+			}
 			references = append(references, parameterReference{number: number, start: i, end: end})
 			i = end
 			continue
@@ -286,14 +313,40 @@ func (in *parameterInferrer) walkStatement(scope *parameterScope, stmt parser.St
 	case *parser.CompoundSelect:
 		in.walkSelect(scope, s.Left)
 		in.walkSelect(scope, s.Right)
-		in.walkExpr(scope, s.Limit, "")
-		in.walkExpr(scope, s.Offset, "")
+		in.walkExpr(scope, s.Limit, "BIGINT")
+		in.walkExpr(scope, s.Offset, "BIGINT")
 	case *parser.InsertStmt:
 		in.walkInsert(scope, s)
 	case *parser.UpdateStmt:
 		in.walkUpdate(scope, s)
 	case *parser.DeleteStmt:
 		in.walkDelete(scope, s)
+	}
+}
+
+// walkTableRefs visits the bodies and join conditions of a FROM list. The scope
+// already contains every table in the query level, so a join condition resolves
+// columns from both sides.
+func (in *parameterInferrer) walkTableRefs(scope *parameterScope, refs []parser.TableRef) {
+	for _, ref := range refs {
+		in.walkTableRef(scope, ref)
+	}
+}
+
+func (in *parameterInferrer) walkTableRef(scope *parameterScope, ref parser.TableRef) {
+	if ref.Subquery != nil {
+		in.walkSelect(scope, ref.Subquery)
+	}
+	if ref.Function != nil {
+		for _, arg := range ref.Function.Args {
+			in.walkExpr(scope, arg, "")
+		}
+	}
+	if ref.Join != nil {
+		if ref.Join.Table != nil {
+			in.walkTableRef(scope, *ref.Join.Table)
+		}
+		in.walkExpr(scope, ref.Join.Condition, "")
 	}
 }
 
@@ -305,6 +358,7 @@ func (in *parameterInferrer) walkSelect(parent *parameterScope, stmt *parser.Sel
 		in.walkSelect(parent, cte.Query)
 	}
 	scope := in.conn.newParameterScope(parent, stmt.From)
+	in.walkTableRefs(scope, stmt.From)
 	for _, column := range stmt.Columns {
 		in.walkExpr(scope, column.Expr, "")
 	}
@@ -316,8 +370,8 @@ func (in *parameterInferrer) walkSelect(parent *parameterScope, stmt *parser.Sel
 	for _, item := range stmt.OrderBy {
 		in.walkExpr(scope, item.Expr, "")
 	}
-	in.walkExpr(scope, stmt.Limit, "")
-	in.walkExpr(scope, stmt.Offset, "")
+	in.walkExpr(scope, stmt.Limit, "BIGINT")
+	in.walkExpr(scope, stmt.Offset, "BIGINT")
 	if stmt.Compound != nil {
 		in.walkStatement(parent, stmt.Compound)
 	}
@@ -376,6 +430,7 @@ func (in *parameterInferrer) walkUpdate(parent *parameterScope, stmt *parser.Upd
 	}
 	schema := in.conn.parameterTableSchema(tableRefName(stmt.Table))
 	scope := in.conn.newParameterScope(parent, append(target, stmt.From...))
+	in.walkTableRefs(scope, stmt.From)
 	for _, assignment := range stmt.Set {
 		in.walkExpr(scope, assignment.Value, schemaColumnType(schema, assignment.Column))
 	}
@@ -454,9 +509,13 @@ func (in *parameterInferrer) walkExpr(scope *parameterScope, expr parser.Expr, e
 		in.walkExpr(scope, e.Left, "")
 		in.walkSelect(scope, e.Subquery)
 	case *parser.BetweenExpr:
-		columnType, _ := in.exprType(scope, e.Left)
-		in.walkExpr(scope, e.Low, columnType)
-		in.walkExpr(scope, e.High, columnType)
+		if columnType, ok := in.exprType(scope, e.Left); ok {
+			in.walkExpr(scope, e.Low, columnType)
+			in.walkExpr(scope, e.High, columnType)
+		} else {
+			in.walkExpr(scope, e.Low, "")
+			in.walkExpr(scope, e.High, "")
+		}
 		in.walkExpr(scope, e.Left, "")
 	case *parser.IsDistinctExpr:
 		leftType, leftOK := in.exprType(scope, e.Left)
@@ -531,6 +590,14 @@ func (in *parameterInferrer) exprType(scope *parameterScope, expr parser.Expr) (
 		return scope.columnType(e)
 	case *parser.CastExpr:
 		return e.Type.SQLTypeName(), true
+	case *parser.SubscriptExpr:
+		// An array subscript has the column's element type, so
+		// `nums[1] = $1` infers INTEGER from an INTEGER[] column.
+		if baseType, ok := in.exprType(scope, e.Expr); ok {
+			if element, isArray := arrayElementTypeName(baseType); isArray {
+				return element, true
+			}
+		}
 	}
 	return "", false
 }

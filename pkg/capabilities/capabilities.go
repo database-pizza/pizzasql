@@ -160,7 +160,7 @@ func Current() *Document {
 			SQLiteCompat:   "3.35.0",
 			SimpleQuery:    true,
 			ExtendedQuery:  true,
-			Describe:       Feature{Supported: true, Status: "compatibility_no_data", Notes: "statement Describe returns ParameterDescription with the negotiated parameter types (a client Parse OID wins; an OID of 0 is inferred from casts, comparisons, assignment targets, and ANY/ALL operands, and falls back to TEXT rather than 0) then NoData; portal Describe returns the same ParameterDescription then NoData; Execute still emits the real RowDescription"},
+			Describe:       Feature{Supported: true, Status: "compatibility_no_data", Notes: "statement Describe returns ParameterDescription with the negotiated parameter types (a client Parse OID wins; an OID of 0 is inferred from casts, comparisons, assignment targets, and ANY/ALL operands, and falls back to TEXT rather than 0) then NoData; portal Describe returns NoData without a ParameterDescription, matching PostgreSQL; Execute still emits the real RowDescription; a placeholder number above the 65535-parameter protocol limit fails Parse with 54000 before any allocation"},
 			BinaryResults:  Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "all-text result formats only; per-column format lists are also rejected"},
 			BoundedExecute: Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "Execute maxRows must be zero; portals are one-shot, not resumable"},
 			ProxyErrors:    true,

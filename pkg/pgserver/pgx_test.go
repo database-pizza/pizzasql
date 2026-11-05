@@ -66,6 +66,8 @@ func preparePGXSchema(t *testing.T, conn *pgx.Conn) {
 		`CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, doc JSONB)`,
 		`INSERT INTO t (id, name, doc) VALUES (1, 'alpha', '{"a": 1}')`,
 		`INSERT INTO t (id, name, doc) VALUES (2, 'beta', '{"b": 2}')`,
+		`CREATE TABLE n (id INTEGER PRIMARY KEY, amount NUMERIC)`,
+		`INSERT INTO n (id, amount) VALUES (1, '1.5'), (2, '2.25')`,
 	} {
 		if _, err := conn.Exec(ctx, sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
@@ -89,6 +91,9 @@ func TestPGXDescribesInferredParameterTypes(t *testing.T) {
 		{`SELECT id FROM t WHERE id = $1`, []uint32{23}},
 		{`SELECT name FROM t WHERE name = $1`, []uint32{25}},
 		{`SELECT id FROM t WHERE id = ANY($1)`, []uint32{1007}},
+		{`SELECT id FROM t WHERE name = ANY($1)`, []uint32{1009}},
+		{`SELECT id FROM n WHERE amount = ANY($1)`, []uint32{1231}},
+		{`SELECT id FROM t LIMIT $1 OFFSET $2`, []uint32{20, 20}},
 		{`SELECT doc FROM t WHERE doc = $1::JSONB`, []uint32{3802}},
 		{`SELECT doc FROM t WHERE doc = $1`, []uint32{3802}},
 		{`INSERT INTO t (id, name) VALUES ($1, $2)`, []uint32{23, 25}},
@@ -160,6 +165,44 @@ func TestPGXDefaultQueryModes(t *testing.T) {
 				t.Fatalf("ANY rows = %v, want [1 2]", ids)
 			}
 
+			var textIDs []int32
+			rows, err = conn.Query(ctx, `SELECT id FROM t WHERE name = ANY($1) ORDER BY id`, tc.mode, []string{"alpha", "beta"})
+			if err != nil {
+				t.Fatalf("text[] parameter: %v", err)
+			}
+			for rows.Next() {
+				var value int32
+				if err := rows.Scan(&value); err != nil {
+					t.Fatalf("scan text[] row: %v", err)
+				}
+				textIDs = append(textIDs, value)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("text[] rows: %v", err)
+			}
+			if len(textIDs) != 2 || textIDs[0] != 1 || textIDs[1] != 2 {
+				t.Fatalf("text[] rows = %v, want [1 2]", textIDs)
+			}
+
+			var numericIDs []int32
+			rows, err = conn.Query(ctx, `SELECT id FROM n WHERE amount = ANY($1) ORDER BY id`, tc.mode, []float64{1.5})
+			if err != nil {
+				t.Fatalf("numeric[] parameter: %v", err)
+			}
+			for rows.Next() {
+				var value int32
+				if err := rows.Scan(&value); err != nil {
+					t.Fatalf("scan numeric[] row: %v", err)
+				}
+				numericIDs = append(numericIDs, value)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("numeric[] rows: %v", err)
+			}
+			if len(numericIDs) != 1 || numericIDs[0] != 1 {
+				t.Fatalf("numeric[] rows = %v, want [1]", numericIDs)
+			}
+
 			tag, err := conn.Exec(ctx, `INSERT INTO t (id, name) VALUES ($1, $2)`, tc.mode, insertID, "inserted")
 			if err != nil {
 				t.Fatalf("insert parameter: %v", err)
@@ -212,6 +255,46 @@ func TestPGXExplicitParameterOIDWins(t *testing.T) {
 	}
 	if len(result.Rows) != 1 || len(result.Rows[0]) != 1 || string(result.Rows[0][0]) != "42" {
 		t.Fatalf("explicit OID rows = %v, want [[42]]", result.Rows)
+	}
+}
+
+// An explicit OID that contradicts the inferred one wins for that parameter
+// while the other parameters are still inferred; the base branch would have
+// described 0 for the unspecified parameter.
+func TestPGXExplicitParameterOIDConflict(t *testing.T) {
+	conn := connectPGX(t)
+	preparePGXSchema(t, conn)
+	ctx := context.Background()
+
+	sd, err := conn.PgConn().Prepare(ctx, "conflict_mixed", `SELECT $1::TEXT, id FROM t WHERE id = $2`, []uint32{0, 20})
+	if err != nil {
+		t.Fatalf("prepare mixed: %v", err)
+	}
+	if want := []uint32{25, 20}; !reflect.DeepEqual(sd.ParamOIDs, want) {
+		t.Fatalf("ParamOIDs = %v, want %v", sd.ParamOIDs, want)
+	}
+	result := conn.PgConn().ExecPrepared(ctx, "conflict_mixed", [][]byte{[]byte("x"), []byte("1")}, []int16{0, 0}, []int16{0}).Read()
+	if result.Err != nil {
+		t.Fatalf("execute mixed: %v", result.Err)
+	}
+	if len(result.Rows) != 1 || len(result.Rows[0]) != 2 || string(result.Rows[0][0]) != "x" || string(result.Rows[0][1]) != "1" {
+		t.Fatalf("mixed explicit rows = %v, want [[x 1]]", result.Rows)
+	}
+
+	// The client's OID beats the cast on the same parameter.
+	sd, err = conn.PgConn().Prepare(ctx, "conflict_cast", `SELECT $1::INTEGER`, []uint32{25})
+	if err != nil {
+		t.Fatalf("prepare cast: %v", err)
+	}
+	if want := []uint32{25}; !reflect.DeepEqual(sd.ParamOIDs, want) {
+		t.Fatalf("cast conflict ParamOIDs = %v, want %v", sd.ParamOIDs, want)
+	}
+	result = conn.PgConn().ExecPrepared(ctx, "conflict_cast", [][]byte{[]byte("41")}, []int16{0}, []int16{0}).Read()
+	if result.Err != nil {
+		t.Fatalf("execute cast: %v", result.Err)
+	}
+	if len(result.Rows) != 1 || len(result.Rows[0]) != 1 || string(result.Rows[0][0]) != "41" {
+		t.Fatalf("cast conflict rows = %v, want [[41]]", result.Rows)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -21,6 +22,16 @@ func paramTypeConnection(t *testing.T) *Connection {
 		}
 	}
 	return c
+}
+
+// negotiatedOIDs returns negotiateParameterOIDs or fails the test.
+func negotiatedOIDs(t *testing.T, c *Connection, query string, declared []int32) []int32 {
+	t.Helper()
+	got, err := c.negotiateParameterOIDs(query, declared)
+	if err != nil {
+		t.Fatalf("negotiateParameterOIDs(%q): %v", query, err)
+	}
+	return got
 }
 
 func TestNegotiatedParameterOIDs(t *testing.T) {
@@ -58,10 +69,18 @@ func TestNegotiatedParameterOIDs(t *testing.T) {
 		{"placeholder_in_comment", `SELECT id FROM t WHERE id = 1 -- $1`, nil, []int32{}},
 		{"first_occurrence_wins", `SELECT id FROM t WHERE id = $1 OR big = $1`, nil, []int32{23}},
 		{"array_column_any", `SELECT tags FROM arr WHERE tags = ANY($1)`, nil, []int32{1009}},
+		{"limit_bigint", `SELECT id FROM t LIMIT $1 OFFSET $2`, nil, []int32{20, 20}},
+		{"join_condition", `SELECT t.id FROM t JOIN arr ON t.big = $1`, nil, []int32{20}},
+		{"join_subquery_body", `SELECT t.id FROM t JOIN (SELECT id FROM arr WHERE nums[1] = $1) AS x ON x.id = t.id`, nil, []int32{23}},
+		{"derived_table_body", `SELECT x.id FROM (SELECT id FROM t WHERE big = $1) AS x`, nil, []int32{20}},
+		{"subscript_comparison", `SELECT id FROM arr WHERE nums[1] = $1`, nil, []int32{23}},
+		{"ten_parameters", `SELECT $10::BIGINT, $1::INTEGER`, nil, []int32{23, 25, 25, 25, 25, 25, 25, 25, 25, 20}},
+		{"declared_conflicts_with_cast", `SELECT $1::INTEGER, id FROM t WHERE id = $2`, []int32{25, 0}, []int32{25, 23}},
+		{"declared_conflicts_with_comparison", `SELECT name FROM t WHERE name = $1 AND id = $2`, []int32{23, 0}, []int32{23, 23}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := c.negotiateParameterOIDs(tc.query, tc.declared)
+			got := negotiatedOIDs(t, c, tc.query, tc.declared)
 			if len(got) != len(tc.want) {
 				t.Fatalf("negotiateParameterOIDs(%q) = %v, want %v", tc.query, got, tc.want)
 			}
@@ -81,7 +100,7 @@ func TestNegotiatedParameterOIDs(t *testing.T) {
 // placeholder scan, and every entry falls back to TEXT.
 func TestNegotiatedParameterOIDsUnparsableStatement(t *testing.T) {
 	c := paramTypeConnection(t)
-	got := c.negotiateParameterOIDs(`SELEC $1, $2`, nil)
+	got := negotiatedOIDs(t, c, `SELEC $1, $2`, nil)
 	if len(got) != 2 || got[0] != 25 || got[1] != 25 {
 		t.Fatalf("unparsable statement OIDs = %v, want [25 25]", got)
 	}
@@ -117,8 +136,9 @@ func findParameterDescription(t *testing.T, messages []*Message) []int32 {
 	return nil
 }
 
-// Describe reports the inferred types for a statement and for the portal bound
-// from it, so a driver that describes either one sees the same list.
+// Statement Describe reports the negotiated parameter types; portal Describe
+// must not, matching PostgreSQL, which sends ParameterDescription only for
+// Describe('S').
 func TestDescribeReportsInferredParameterOIDs(t *testing.T) {
 	c := paramTypeConnection(t)
 	conn := &countingConn{}
@@ -142,9 +162,13 @@ func TestDescribeReportsInferredParameterOIDs(t *testing.T) {
 	if err := c.writer.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	statementOIDs := findParameterDescription(t, readAllMessages(t, conn.bytes()))
+	statementMessages := readAllMessages(t, conn.bytes())
+	statementOIDs := findParameterDescription(t, statementMessages)
 	if len(statementOIDs) != 1 || statementOIDs[0] != 23 {
 		t.Fatalf("statement ParameterDescription = %v, want [23]", statementOIDs)
+	}
+	if !hasMessageType(statementMessages, MsgNoData) {
+		t.Fatal("statement Describe did not send NoData after ParameterDescription")
 	}
 
 	conn.reset()
@@ -168,10 +192,22 @@ func TestDescribeReportsInferredParameterOIDs(t *testing.T) {
 	if err := c.writer.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	portalOIDs := findParameterDescription(t, readAllMessages(t, conn.bytes()))
-	if len(portalOIDs) != 1 || portalOIDs[0] != 23 {
-		t.Fatalf("portal ParameterDescription = %v, want [23]", portalOIDs)
+	portalMessages := readAllMessages(t, conn.bytes())
+	if hasMessageType(portalMessages, MsgParameterDescription) {
+		t.Fatalf("portal Describe sent ParameterDescription: %v", portalMessages)
 	}
+	if !hasMessageType(portalMessages, MsgNoData) {
+		t.Fatal("portal Describe did not send NoData")
+	}
+}
+
+func hasMessageType(messages []*Message, messageType byte) bool {
+	for _, message := range messages {
+		if message.Type == messageType {
+			return true
+		}
+	}
+	return false
 }
 
 // The negotiated type is what Bind decodes with: a text-format parameter that
@@ -205,8 +241,118 @@ func TestNegotiatedParameterOIDsSeeStagedDDL(t *testing.T) {
 	if _, err := c.executor.Execute(parseStmt(t, `CREATE TABLE staged (id INTEGER PRIMARY KEY, flag BOOLEAN)`)); err != nil {
 		t.Fatal(err)
 	}
-	got := c.negotiateParameterOIDs(`SELECT id FROM staged WHERE id = $1 AND flag = $2`, nil)
+	got := negotiatedOIDs(t, c, `SELECT id FROM staged WHERE id = $1 AND flag = $2`, nil)
 	if want := []int32{23, 16}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("staged DDL parameter OIDs = %v, want %v", got, want)
+	}
+}
+
+// parseQuery sends Parse with the declared OID list, flushes, returns the
+// messages it produced, and closes the extended cycle with Sync so the next
+// case starts from an idle connection.
+func parseQuery(t *testing.T, c *Connection, conn *countingConn, name, query string, declared []int32) []*Message {
+	t.Helper()
+	conn.reset()
+	parse := NewMessageBuilder()
+	parse.WriteString(name)
+	parse.WriteString(query)
+	parse.WriteInt16(int16(len(declared)))
+	for _, oid := range declared {
+		parse.WriteInt32(oid)
+	}
+	if err := c.handleMessage(&Message{Type: MsgParse, Data: parse.Bytes()}); err != nil {
+		t.Fatalf("handle Parse %q: %v", query, err)
+	}
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush Parse %q: %v", query, err)
+	}
+	messages := readAllMessages(t, conn.bytes())
+	if err := c.handleMessage(&Message{Type: MsgSync}); err != nil {
+		t.Fatalf("handle Sync after %q: %v", query, err)
+	}
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush Sync after %q: %v", query, err)
+	}
+	conn.reset()
+	return messages
+}
+
+// A placeholder number above PostgreSQL's 65535-parameter protocol limit is
+// rejected before the type list is sized, so a hostile Parse cannot allocate
+// unbounded memory or overflow the int conversion.
+func TestParameterNumberAboveProtocolLimitRejected(t *testing.T) {
+	c := paramTypeConnection(t)
+	conn := &countingConn{}
+	c.conn = conn
+	c.writer = bufio.NewWriter(conn)
+
+	for _, query := range []string{
+		`SELECT $65536`,
+		`SELECT id FROM t WHERE id = $65536`,
+		`SELECT $9223372036854775807`,
+		`SELECT $99999999999999999999999999`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			messages := parseQuery(t, c, conn, "limit", query, nil)
+			errMsg := findError(messages)
+			if errMsg == nil {
+				t.Fatalf("%s was accepted", query)
+			}
+			if code := errorCode(errMsg); code != ErrCodeProgramLimitExceeded {
+				t.Fatalf("%s SQLSTATE = %q, want %q", query, code, ErrCodeProgramLimitExceeded)
+			}
+			if message := errorMessage(errMsg); !strings.Contains(message, "65535") {
+				t.Fatalf("%s message = %q, want the protocol limit", query, message)
+			}
+			if _, stored := c.statements["limit"]; stored {
+				t.Fatalf("%s stored a statement despite the rejection", query)
+			}
+		})
+	}
+}
+
+// A statement at the limit is accepted and its ParameterDescription is a
+// well-formed frame: the 16-bit count field holds 32768 and the payload is
+// exactly 2 + count*4 bytes.
+func TestParameterDescriptionAtProtocolLimit(t *testing.T) {
+	c := paramTypeConnection(t)
+	conn := &countingConn{}
+	c.conn = conn
+	c.writer = bufio.NewWriter(conn)
+
+	if messages := parseQuery(t, c, conn, "wide", `SELECT $32768`, nil); findError(messages) != nil {
+		t.Fatalf("Parse of $32768 failed: %s", errorCode(findError(messages)))
+	}
+	describe := NewMessageBuilder()
+	describe.WriteBytes([]byte("S"))
+	describe.WriteString("wide")
+	if err := c.handleMessage(&Message{Type: MsgDescribe, Data: describe.Bytes()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	messages := readAllMessages(t, conn.bytes())
+	var description *Message
+	for _, message := range messages {
+		if message.Type == MsgParameterDescription {
+			description = message
+		}
+	}
+	if description == nil {
+		t.Fatal("Describe did not send ParameterDescription")
+	}
+	count := int(binary.BigEndian.Uint16(description.Data[:2]))
+	if count != 32768 {
+		t.Fatalf("ParameterDescription count = %d, want 32768", count)
+	}
+	if len(description.Data) != 2+count*4 {
+		t.Fatalf("ParameterDescription payload = %d bytes, want %d", len(description.Data), 2+count*4)
+	}
+	if last := int32(binary.BigEndian.Uint32(description.Data[len(description.Data)-4:])); last != 25 {
+		t.Fatalf("last parameter OID = %d, want TEXT (25)", last)
+	}
+	if err := c.handleMessage(&Message{Type: MsgSync}); err != nil {
+		t.Fatal(err)
 	}
 }
