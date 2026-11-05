@@ -4131,33 +4131,23 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 		uniqueIndex = e.addColumnUniqueIndex(table, col.Name, uniqueConstraint)
 	}
 
-	// A required column with no default has no value for rows that already
-	// exist. Refusing before the rewrite leaves the table untouched instead of
-	// failing NOT NULL validation on a later read or write.
+	// The schema manager validates the new column against durable rows, rewrites
+	// them, and publishes the column together with its UNIQUE index while holding
+	// the table's exclusive gate, so a writer cannot slip a row in between the
+	// validation and the publication. Rows this session staged in an open
+	// transaction are invisible to that scan, so reject them here as well; the
+	// commit re-validates them against the schema that is current by then.
 	if !col.Nullable && col.Default == nil {
-		existingRows, err := e.session.CountFast(table)
+		stagedRows, err := e.session.CountFast(table)
 		if err != nil {
 			return nil, err
 		}
-		if existingRows > 0 {
+		if stagedRows > 0 {
 			return nil, &storage.NotNullViolationError{Table: table, Column: col.Name}
 		}
 	}
 
-	// Every existing row receives the same constant, so a non-NULL default
-	// duplicates immediately once the table holds more than one row. Check
-	// before rewriting so a rejected UNIQUE column leaves no durable changes.
-	if uniqueIndex != nil && col.Default != nil {
-		rows, err := e.session.CountFast(table)
-		if err != nil {
-			return nil, err
-		}
-		if rows > 1 {
-			return nil, &storage.UniqueViolationError{Constraint: uniqueIndex.Name}
-		}
-	}
-
-	if err := e.schema.AddColumn(table, col); err != nil {
+	if err := e.schema.AddColumn(table, col, uniqueIndex); err != nil {
 		if action.IfNotExists && strings.Contains(err.Error(), "column already exists") {
 			return NewResult("ALTER TABLE"), nil
 		}
@@ -4166,12 +4156,6 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 
 	// Update catalog
 	e.SyncCatalog()
-
-	if uniqueIndex != nil {
-		if err := e.createAddedColumnUniqueIndex(uniqueIndex); err != nil {
-			return nil, err
-		}
-	}
 
 	result := NewResult("ALTER TABLE")
 	return result, nil
@@ -4200,34 +4184,6 @@ func (e *Executor) addColumnUniqueIndex(table, column string, constraint *parser
 		index.OnConflict = conflictActionName(constraint.OnConflict)
 	}
 	return index
-}
-
-// createAddedColumnUniqueIndex registers and populates the unique index for an
-// ADD COLUMN. Uniqueness is validated after the backfill has written the new
-// values, so the check sees what later INSERTs and index scans will see. DDL is
-// not transactional, but a failure here drops the column again (best effort)
-// instead of leaving a half-applied ADD COLUMN that a retry would reject as an
-// existing column.
-func (e *Executor) createAddedColumnUniqueIndex(index *storage.Index) error {
-	if err := e.table.CreateUniqueIndex(index); err != nil {
-		e.rollbackAddedColumn(index.Table, index.Columns[0].Name)
-		return err
-	}
-	columns := []string{index.Columns[0].Name}
-	if err := e.session.BuildIndex(index.Name, index.Table, columns); err != nil {
-		e.schema.DropIndex(index.Name)
-		e.rollbackAddedColumn(index.Table, index.Columns[0].Name)
-		return fmt.Errorf("failed to build index: %w", err)
-	}
-	return nil
-}
-
-// rollbackAddedColumn removes a column whose unique index could not be built.
-func (e *Executor) rollbackAddedColumn(table, column string) {
-	if err := e.schema.DropColumn(table, column); err != nil {
-		return
-	}
-	e.SyncCatalog()
 }
 
 // executeAlterTableDropColumn drops a column from a table.

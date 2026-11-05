@@ -764,6 +764,12 @@ func (m *SchemaManager) DropIndex(name string) error {
 func (m *SchemaManager) IndexExists(name string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.indexExistsUnsafe(name)
+}
+
+// indexExistsUnsafe reports whether an index definition is durable (m.mu must be
+// held).
+func (m *SchemaManager) indexExistsUnsafe(name string) bool {
 	if _, ok := m.indexCache[strings.ToLower(name)]; ok {
 		return true
 	}
@@ -812,6 +818,12 @@ func (m *SchemaManager) GetIndex(name string) (*Index, error) {
 func (m *SchemaManager) ListIndexes() ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.indexListUnsafe()
+}
+
+// indexListUnsafe returns all index names, loading them from storage on first
+// use (m.mu must be held).
+func (m *SchemaManager) indexListUnsafe() ([]string, error) {
 	if m.indexListCached {
 		return append([]string(nil), m.indexListCache...), nil
 	}
@@ -930,7 +942,8 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 	return err
 }
 
-// AddColumn adds a new column to a table.
+// AddColumn adds a new column to a table. When unique is non-nil the column's
+// UNIQUE index is registered as part of the same statement.
 //
 // A constant DEFAULT is materialized into every existing row before the schema
 // is published. NOT NULL, UNIQUE, and index validation all read persisted row
@@ -938,28 +951,19 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 // them: a UNIQUE index over the new column could not see the duplicate values
 // every existing row shares, and an UPDATE to NULL would look non-null. The
 // rewrite is the same shape as DropColumn: the table's exclusive gate keeps
-// point writes and CAS commits out while rows are scanned and rewritten, the
-// transform is idempotent, and the schema is saved last so an interrupted
-// operation resumes against the old schema. A nullable column without a default
-// needs no rewrite because a missing row field already reads as NULL. Like
-// DROP COLUMN, the statement holds the catalog lock for the whole rewrite, so
-// the cost is one table scan and a table-wide stall per ADD COLUMN with a
-// default.
-func (m *SchemaManager) AddColumn(table string, column Column) error {
-	if column.Default == nil {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		schema, err := m.getSchemaUnsafe(table)
-		if err != nil {
-			return err
-		}
-		if err := checkColumnAbsent(schema, column.Name); err != nil {
-			return err
-		}
-		return m.publishAddedColumn(schema, column)
-	}
-
+// point writes and CAS commits out while rows are scanned, validated, and
+// rewritten, the transform is idempotent, and the schema is saved last so an
+// interrupted operation resumes against the old schema.
+//
+// The gate also makes the validation authoritative: NOT NULL without a default
+// and duplicate UNIQUE values are rejected before any row is touched, and the
+// column and its index are published together in one batch write, so a crash
+// cannot leave the column visible without the constraint that validates it.
+// A nullable column without a default needs no rewrite because a missing row
+// field already reads as NULL. Like DROP COLUMN, the statement holds the catalog
+// lock for the whole scan, so the cost is one table scan (two for UNIQUE) and a
+// table-wide stall per ADD COLUMN that has a default or an index.
+func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) error {
 	tableLock := m.tableLock(table)
 	tableLock.Lock()
 	defer tableLock.Unlock()
@@ -974,31 +978,96 @@ func (m *SchemaManager) AddColumn(table string, column Column) error {
 	if err := checkColumnAbsent(schema, column.Name); err != nil {
 		return err
 	}
-
-	if err := m.rewriteRows(table, func(row Row) bool {
-		for key := range row {
-			if strings.EqualFold(key, column.Name) {
-				return false
-			}
+	if unique != nil {
+		if !strings.EqualFold(unique.Table, schema.Name) {
+			return fmt.Errorf("index %s belongs to table %s, not %s", unique.Name, unique.Table, schema.Name)
 		}
-		row[column.Name] = column.Default
-		return true
-	}); err != nil {
-		return err
+		if m.indexExistsUnsafe(unique.Name) {
+			return fmt.Errorf("index already exists: %s", unique.Name)
+		}
+		if err := m.validateAddColumnUnique(table, column, unique); err != nil {
+			return err
+		}
 	}
 
-	return m.publishAddedColumn(schema, column)
+	// A required column with nothing to write into rows that already exist
+	// cannot be declared on a populated table.
+	if !column.Nullable && column.Default == nil {
+		hasRows, err := m.tableHasRows(table)
+		if err != nil {
+			return err
+		}
+		if hasRows {
+			return &NotNullViolationError{Table: schema.Name, Column: column.Name}
+		}
+	}
+
+	if column.Default != nil {
+		if err := m.rewriteRows(table, func(row Row) bool {
+			if _, ok := rowColumnValue(row, column.Name); ok {
+				return false
+			}
+			row[column.Name] = column.Default
+			return true
+		}); err != nil {
+			return err
+		}
+	}
+
+	return m.publishAddedColumn(schema, column, unique)
 }
 
-// publishAddedColumn appends an absent column to the published schema snapshot
-// (m.mu must be held).
-func (m *SchemaManager) publishAddedColumn(schema *Schema, column Column) error {
+// publishAddedColumn publishes a column and, when present, its unique index in
+// one atomic batch write (m.mu must be held): the schema snapshot, the index
+// definition, and the index list always become durable together or not at all.
+func (m *SchemaManager) publishAddedColumn(schema *Schema, column Column, unique *Index) error {
 	// Publish a fresh snapshot instead of mutating readers' shared pointer.
 	schema = cloneSchema(schema)
 	schema.Columns = append(schema.Columns, column)
+	schemaData, err := json.Marshal(schema)
+	if err != nil {
+		return fmt.Errorf("failed to serialize schema: %w", err)
+	}
+	ops := []BatchOp{{Op: batchPut, Key: []byte(m.schemaKey(schema.Name)), Value: schemaData}}
 
-	// Update schema
-	return m.updateSchemaUnsafe(schema)
+	var indexList []string
+	if unique != nil {
+		unique.CreatedAt = time.Now()
+		indexData, err := json.Marshal(unique)
+		if err != nil {
+			return fmt.Errorf("failed to serialize index: %w", err)
+		}
+		indexList, err = m.indexListUnsafe()
+		if err != nil {
+			return err
+		}
+		indexList = append(indexList, unique.Name)
+		listData, err := json.Marshal(indexList)
+		if err != nil {
+			return fmt.Errorf("failed to serialize index list: %w", err)
+		}
+		ops = append(ops,
+			BatchOp{Op: batchPut, Key: []byte(m.indexKey(unique.Name)), Value: indexData},
+			BatchOp{Op: batchPut, Key: []byte(m.indexListKey()), Value: listData},
+		)
+	}
+
+	if err := m.pool.WithClient(func(c *KVClient) error {
+		_, err := c.BatchWrite(ops, nil)
+		return err
+	}); err != nil {
+		return fmt.Errorf("failed to publish column %s: %w", column.Name, err)
+	}
+
+	// Publish in-memory state only after the durable write.
+	m.cache[strings.ToLower(schema.Name)] = schema
+	if unique != nil {
+		m.indexCache[strings.ToLower(unique.Name)] = cloneIndex(unique)
+		m.indexListCache = append([]string(nil), indexList...)
+		m.indexListCached = true
+	}
+	m.bumpVersionLocked()
+	return nil
 }
 
 func checkColumnAbsent(schema *Schema, name string) error {
@@ -1331,6 +1400,18 @@ func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 // batches. Column DDL updates the schema only after all rows are rewritten, so
 // an interrupted operation can safely resume against the old schema.
 func (m *SchemaManager) rewriteRows(table string, transform func(Row) bool) error {
+	return m.applyRows(table, func(row Row) (bool, error) {
+		return transform(row), nil
+	})
+}
+
+// applyRows scans a table once and applies transform to every row. Rows for
+// which transform reports a change are re-encoded and written in bounded
+// batches; an error from transform aborts the scan. Callers hold the table's
+// exclusive gate, so no writer can interleave between the scan and the schema
+// update that follows it. Aborting after a batch was flushed is safe only
+// because the DDL transforms are idempotent.
+func (m *SchemaManager) applyRows(table string, transform func(Row) (bool, error)) error {
 	prefix := []byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(table)))
 	return m.pool.WithClient(func(client *KVClient) (retErr error) {
 		cursor, err := client.Scan(prefix)
@@ -1367,7 +1448,11 @@ func (m *SchemaManager) rewriteRows(table string, transform func(Row) bool) erro
 				if err != nil {
 					return err
 				}
-				if !transform(row) {
+				changed, err := transform(row)
+				if err != nil {
+					return err
+				}
+				if !changed {
 					continue
 				}
 				value, err := encodeRow(row)
@@ -1388,6 +1473,56 @@ func (m *SchemaManager) rewriteRows(table string, transform func(Row) bool) erro
 			}
 		}
 	})
+}
+
+// validateAddColumnUnique rejects an ADD COLUMN ... UNIQUE whose backfilled
+// values would duplicate across existing rows. It reads rows as they will look
+// after the rewrite (a row that already carries the field from an interrupted
+// earlier attempt keeps its value) and mirrors ValidateUniqueIndex for a single
+// plain column: NULLs do not collide. The caller holds the table's exclusive
+// gate, so no writer can insert a conflicting row between this check and the
+// publication of the index.
+func (m *SchemaManager) validateAddColumnUnique(table string, column Column, index *Index) error {
+	seen := make(map[string]struct{})
+	return m.applyRows(table, func(row Row) (bool, error) {
+		value, ok := rowColumnValue(row, column.Name)
+		if !ok {
+			value = column.Default
+		}
+		if value == nil {
+			return false, nil
+		}
+		encoded := encodeUniqueScalar(value)
+		if _, duplicate := seen[encoded]; duplicate {
+			return false, &UniqueViolationError{Constraint: index.Name}
+		}
+		seen[encoded] = struct{}{}
+		return false, nil
+	})
+}
+
+// tableHasRows reports whether a table holds at least one durable row.
+func (m *SchemaManager) tableHasRows(table string) (bool, error) {
+	prefix := []byte(fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(table)))
+	found := false
+	err := m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.ScanWithLimit(prefix, 1)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if cerr := cursor.Close(); retErr == nil {
+				retErr = cerr
+			}
+		}()
+		entries, _, err := cursor.Next()
+		if err != nil {
+			return err
+		}
+		found = len(entries) > 0
+		return nil
+	})
+	return found, err
 }
 
 // getSchemaUnsafe gets a schema without locking (internal use).

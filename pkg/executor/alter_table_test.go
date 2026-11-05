@@ -180,7 +180,8 @@ func TestAlterTableAddColumnUniqueWithDefaultRejectsPopulatedTable(t *testing.T)
 }
 
 // A single-row table can take a UNIQUE column with a default, and the
-// constraint is enforced for every later INSERT that omits the column.
+// constraint is enforced for every later INSERT that omits the column. The
+// column and the index that validates it must be visible together.
 func TestAlterTableAddColumnUniqueWithDefaultEnforcesLaterInserts(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
@@ -189,7 +190,25 @@ func TestAlterTableAddColumnUniqueWithDefaultEnforcesLaterInserts(t *testing.T) 
 
 	execMust(t, e, "ALTER TABLE t ADD COLUMN code TEXT DEFAULT 'same' UNIQUE")
 
-	_, err := execSQL(e, "INSERT INTO t (id) VALUES (2)")
+	s, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if _, exists := s.GetColumn("code"); !exists {
+		t.Fatal("ADD COLUMN ... UNIQUE published no column")
+	}
+	indexes, err := schema.ListTableIndexes("t")
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	if len(indexes) != 1 {
+		t.Fatalf("indexes = %v, want the one unique index for column code", indexes)
+	}
+	if !indexes[0].Unique || len(indexes[0].Columns) != 1 || indexes[0].Columns[0].Name != "code" {
+		t.Fatalf("index = %+v, want a unique index over code", indexes[0])
+	}
+
+	_, err = execSQL(e, "INSERT INTO t (id) VALUES (2)")
 	var violation *storage.UniqueViolationError
 	if !errors.As(err, &violation) {
 		t.Fatalf("insert with duplicated default error = %v, want UniqueViolationError", err)
@@ -199,6 +218,52 @@ func TestAlterTableAddColumnUniqueWithDefaultEnforcesLaterInserts(t *testing.T) 
 	res := execMust(t, e, "SELECT code FROM t ORDER BY id")
 	if len(res.Rows) != 2 || res.Rows[0][0] != "same" || res.Rows[1][0] != "other" {
 		t.Fatalf("codes = %v, want [same other]", res.Rows)
+	}
+}
+
+// A transaction can stage a row image before a concurrent ADD COLUMN publishes
+// a required column. The commit must re-validate that row against the schema now
+// in effect instead of persisting a durable NOT NULL violation.
+func TestAlterTableAddColumnRejectsRowStagedBeforeDDL(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	writer := newExec(schema, table)
+	ddl := newExec(schema, table)
+	execMust(t, writer, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+
+	execMust(t, writer, "BEGIN")
+	execMust(t, writer, "INSERT INTO t (id) VALUES (1)")
+
+	// The table is durably empty, so the ALTER accepts the required column.
+	execMust(t, ddl, "ALTER TABLE t ADD COLUMN status TEXT NOT NULL")
+
+	_, err := execSQL(writer, "COMMIT")
+	var violation *storage.NotNullViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("commit error = %v, want NotNullViolationError", err)
+	}
+	if got := execMust(t, ddl, "SELECT id FROM t").RowCount; got != 0 {
+		t.Fatalf("rows after rejected commit = %d, want 0", got)
+	}
+}
+
+// The same race is harmless when the new column has a default: the commit
+// materializes it into the staged row, exactly as the backfill did for rows that
+// were already durable.
+func TestAlterTableAddColumnDefaultsRowStagedBeforeDDL(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	writer := newExec(schema, table)
+	ddl := newExec(schema, table)
+	execMust(t, writer, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+
+	execMust(t, writer, "BEGIN")
+	execMust(t, writer, "INSERT INTO t (id) VALUES (1)")
+
+	execMust(t, ddl, "ALTER TABLE t ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+	execMust(t, writer, "COMMIT")
+
+	res := execMust(t, ddl, "SELECT id, status FROM t")
+	if len(res.Rows) != 1 || res.Rows[0][1] != "pending" {
+		t.Fatalf("rows = %v, want [[1 pending]]", res.Rows)
 	}
 }
 

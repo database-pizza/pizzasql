@@ -178,6 +178,19 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 	}
 	defer unlockAll()
 
+	// A staged row was normalized against the schema as of its INSERT or UPDATE,
+	// which a concurrent ADD COLUMN can predate. Re-apply the schema that is
+	// current under the held gates before any derived state is computed: the CAS
+	// check cannot reject such a row (a new key is only checked for absence), so
+	// a NOT NULL column published after the row image was built would otherwise
+	// be violated durably, and a UNIQUE index would not see the default the row
+	// is about to receive. Run it before uniqueness and cache planning so both
+	// observe the final values.
+	if err := s.applyOverlaySchemaDefaults(); err != nil {
+		s.resetLocked()
+		return 0, err
+	}
+
 	// Validate scan generations for phantom detection.
 	for t, gen := range s.scanGens {
 		if s.table.generation(t) != gen {
@@ -397,6 +410,28 @@ func (s *Session) acquireCommitLocks() (locks []*sync.RWMutex, exclusive []bool,
 		unlockAll = func() { unlock(locks, exclusive) }
 		return locks, exclusive, unlockAll, uniqueTables, nil
 	}
+}
+
+// applyOverlaySchemaDefaults re-applies the current schema to every staged row
+// (the caller holds the per-table gates). Columns published after a row image
+// was built receive their catalog default, and required columns are validated,
+// so a commit cannot persist a row that violates the schema now in effect.
+func (s *Session) applyOverlaySchemaDefaults() error {
+	for table, entries := range s.overlay {
+		schema, err := s.schema.GetSchema(table)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.absent {
+				continue
+			}
+			if err := applySchemaDefaults(schema, entry.row); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Session) resetLocked() {
