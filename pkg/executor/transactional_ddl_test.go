@@ -605,3 +605,55 @@ func TestTransactionalDDLConcurrentWriteConflicts(t *testing.T) {
 		t.Fatal("failed commit published the staged column")
 	}
 }
+
+// transactional DDL: a rolled-back DROP INDEX and a committed re-creation both
+// leave the derived index usable, not stuck on a stale disabled marker.
+func TestTransactionalDDLIndexCachesSurviveRollback(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE docs (id INTEGER PRIMARY KEY, slug TEXT)")
+	execMust(t, e, "CREATE INDEX idx_docs_slug ON docs (slug)")
+	execMust(t, e, "INSERT INTO docs VALUES (1, 'a'), (2, 'b')")
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "DROP INDEX idx_docs_slug")
+	execMust(t, e, "ROLLBACK")
+	if _, err := e.session.SelectByIndex("docs", "idx_docs_slug", "b"); err != nil {
+		t.Fatalf("index unusable after rolling back DROP INDEX: %v", err)
+	}
+	// The rollback must not leave the shared derived caches describing the
+	// staged drop: the index still resolves, still has its entries, and is not
+	// stuck on the disabled marker ClearIndex sets.
+	index, err := e.session.GetIndex("idx_docs_slug")
+	if err != nil {
+		t.Fatalf("index missing after rolling back DROP INDEX: %v", err)
+	}
+	if rows, err := e.session.SelectByIndex("docs", index.Name, "a"); err != nil || len(rows) != 1 {
+		t.Fatalf("index entries after rolling back DROP INDEX: rows=%v err=%v", rows, err)
+	}
+
+	// A rolled-back CREATE INDEX must not leave derived entries or a cleared
+	// disabled marker behind either.
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "CREATE INDEX idx_docs_slug_rollback ON docs (slug)")
+	if !e.session.IndexExists("idx_docs_slug_rollback") {
+		t.Fatal("staged index missing from the transaction catalog")
+	}
+	execMust(t, e, "ROLLBACK")
+	if _, err := e.session.GetIndex("idx_docs_slug_rollback"); err == nil {
+		t.Fatal("rolled-back index definition survived")
+	}
+	if _, err := e.session.SelectByIndex("docs", "idx_docs_slug_rollback", "b"); err == nil {
+		t.Fatal("rolled-back index left usable derived entries")
+	}
+
+	// A committed drop followed by a transactional re-creation must rebuild the
+	// index rather than inherit the disabled marker.
+	execMust(t, e, "DROP INDEX idx_docs_slug")
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "CREATE INDEX idx_docs_slug ON docs (slug)")
+	execMust(t, e, "COMMIT")
+	if _, err := e.session.SelectByIndex("docs", "idx_docs_slug", "b"); err != nil {
+		t.Fatalf("index unusable after committing a re-created index: %v", err)
+	}
+}

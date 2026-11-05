@@ -255,6 +255,13 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 	// removes their durable rows.
 	hasDDL := s.schemaTx != nil && s.schemaTx.hasDDL()
 
+	// Lock order for every path that touches both a table and the catalog is
+	// session lock -> foreign-key write gate -> table gates (sorted by name) ->
+	// schema catalog mutex. Table gates are plain sync.RWMutex values and are
+	// NOT reentrant, so nothing that re-acquires a table gate may run while the
+	// commit still holds its validation gates; index cache maintenance is
+	// therefore deferred until after releaseGates below.
+	//
 	// Referential integrity spans tables: a commit must validate the final
 	// child rows against the final parent rows, including rows another table
 	// staged in this same transaction. Take the foreign-key write gate before
@@ -285,7 +292,14 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		s.resetLocked()
 		return 0, err
 	}
-	defer unlockAll()
+	gatesHeld := true
+	releaseGates := func() {
+		if gatesHeld {
+			unlockAll()
+			gatesHeld = false
+		}
+	}
+	defer releaseGates()
 
 	// Another session may have published DDL while this transaction was open.
 	// Re-read the committed catalog under the gates so the final row validation
@@ -471,25 +485,43 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		s.table.bumpGeneration(t)
 	}
 	if hasDDL {
-		s.publishCommittedDDL(touchedTables, touchedIndexes)
+		s.publishCommittedCatalog(touchedTables)
+	}
+
+	// Index cache maintenance needs the table gates itself (BuildIndex locks the
+	// table gate to rebuild entries), and that gate is not reentrant, so it runs
+	// only after this commit drops the gates it held for validation.
+	releaseGates()
+	if hasDDL {
+		s.publishCommittedIndexes(touchedIndexes)
 	}
 
 	s.resetLocked()
 	return commitLSN, nil
 }
 
-// publishCommittedDDL publishes a committed catalog change to the rest of the
-// process. The durable batch is already written, so this only drops the derived
-// state that described the previous catalog: the shared schema and index caches,
-// the row-derived caches of every touched table, and the index caches of every
-// touched index. Other sessions reload lazily from the committed records.
-func (s *Session) publishCommittedDDL(tables, indexes []string) {
+// publishCommittedCatalog publishes a committed catalog change to the rest of
+// the process. The durable batch is already written, so this only drops the
+// derived state that described the previous catalog: the shared schema catalog
+// caches and the row-derived caches of every touched table. Other sessions
+// reload lazily from the committed records. The caller still holds the table
+// gates, which is the documented lock order (table gate, then catalog mutex).
+func (s *Session) publishCommittedCatalog(tables []string) {
 	s.schema.invalidateCommittedDDL()
 	for _, table := range tables {
 		s.table.InvalidateCache(table)
 		s.table.bumpIndexPredicateWildcard(table)
 		s.table.bumpGeneration(table)
 	}
+}
+
+// publishCommittedIndexes resets the derived entries of every index the
+// transaction changed. A dropped index loses its cache and is marked disabled
+// for indexing until it is created again; a committed index (including a
+// re-created name a previous session dropped) is rebuilt so its entries and
+// disabled marker match the catalog. The caller must not hold the table gates:
+// BuildIndex acquires the table gate itself.
+func (s *Session) publishCommittedIndexes(indexes []string) {
 	committed, err := s.schema.ListIndexes()
 	if err != nil {
 		committed = nil
@@ -501,6 +533,13 @@ func (s *Session) publishCommittedDDL(tables, indexes []string) {
 	for _, index := range indexes {
 		if !known[index] {
 			s.table.ClearIndex(index, "", nil) //nolint:errcheck
+			continue
+		}
+		// A committed index may have reused a name this process dropped
+		// earlier; rebuild it so its derived entries and disabled marker match
+		// the catalog again.
+		if definition, err := s.schema.GetIndex(index); err == nil {
+			s.table.BuildIndex(definition.Name, definition.Table, nil) //nolint:errcheck
 		}
 	}
 }
@@ -1398,19 +1437,22 @@ func (s *Session) Delete(table string, filter func(Row) bool) (int, error) {
 // ClearIndex drops the in-memory entries of an index. Inside a transaction the
 // drop is staged in the catalog overlay instead: the committed index (and its
 // cache) stays intact for every other session, and the commit clears it once the
-// catalog change is durable.
+// catalog change is durable. This keeps the rollback invariant that a
+// transaction never mutates shared derived state, so ROLLBACK has nothing to
+// restore beyond the session's own schema snapshot and row overlay.
 func (s *Session) ClearIndex(indexName, tableName string, columns []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.schemaTx != nil && s.schemaTx.hasDDL() {
+	if s.schemaTx != nil {
 		return nil
 	}
 	return s.table.ClearIndex(indexName, tableName, columns)
 }
 
 // InvalidateCache drops the derived caches of a table. Inside a transaction the
-// durable rows are still current, so nothing is invalidated until the commit
-// publishes the catalog change.
+// durable rows and committed catalog are still current, so nothing is
+// invalidated until the commit publishes the catalog change; a rollback then
+// leaves every shared cache exactly as it was.
 func (s *Session) InvalidateCache(table string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1422,7 +1464,9 @@ func (s *Session) InvalidateCache(table string) {
 
 // BuildIndex builds index entries for every existing row. Inside a transaction
 // the index is only staged; its entries are derived lazily from durable rows
-// once the commit publishes it and the session is merged in afterwards.
+// once the commit publishes it and the session is merged in afterwards. Staging
+// instead of building keeps a rolled-back CREATE INDEX from leaving derived
+// entries or a cleared disabled marker behind.
 func (s *Session) BuildIndex(indexName, tableName string, columns []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
