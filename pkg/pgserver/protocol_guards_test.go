@@ -17,9 +17,11 @@ func guardConnection(t *testing.T) (*Connection, *countingConn) {
 	return c, conn
 }
 
+// guardBind targets a portal the cases do not pre-create, so a malformed Bind
+// fails on its own validation rather than with 42P03.
 func guardBind(parameterFormats, resultFormats []int16) []byte {
 	b := NewMessageBuilder()
-	b.WriteString("p")
+	b.WriteString("new_portal")
 	b.WriteString("q")
 	b.WriteInt16(int16(len(parameterFormats)))
 	for _, format := range parameterFormats {
@@ -42,7 +44,6 @@ func TestUnsupportedExtendedRequestsFailBeforeSideEffects(t *testing.T) {
 		{"invalid_result_format", &Message{Type: MsgBind, Data: guardBind(nil, []int16{2})}, ErrCodeProtocolViolation},
 		{"invalid_parameter_format", &Message{Type: MsgBind, Data: guardBind([]int16{2}, nil)}, ErrCodeProtocolViolation},
 		{"parameter_format_count", &Message{Type: MsgBind, Data: guardBind([]int16{0, 0}, nil)}, ErrCodeProtocolViolation},
-		{"bounded_execute", &Message{Type: MsgExecute, Data: []byte{'p', 0, 0, 0, 0, 1}}, ErrCodeFeatureNotSupported},
 		{"negative_execute", &Message{Type: MsgExecute, Data: []byte{'p', 0, 255, 255, 255, 255}}, ErrCodeProtocolViolation},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

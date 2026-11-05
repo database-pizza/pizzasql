@@ -75,12 +75,16 @@ func (c *Connection) resolveResultFormats(bindFormats []int16, columnTypes []str
 // connection sends an ErrorResponse, discards the rest of the cycle until Sync,
 // and marks an explicit transaction block as failed.
 func (c *Connection) failResultFormat(err error) error {
-	code := ErrCodeProtocolViolation
+	return c.failExtended(resultFormatSQLState(err), err)
+}
+
+// resultFormatSQLState reports the SQLSTATE a result-format rejection carries.
+func resultFormatSQLState(err error) string {
 	var formatErr *resultFormatError
 	if errors.As(err, &formatErr) {
-		code = formatErr.code
+		return formatErr.code
 	}
-	return c.failExtended(code, err)
+	return ErrCodeProtocolViolation
 }
 
 // typeNameAt returns the declared type name of a result column, or "" when the
