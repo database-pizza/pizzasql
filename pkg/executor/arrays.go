@@ -943,6 +943,112 @@ func (e *Executor) canonicalizeArrayComparison(leftExpr, rightExpr parser.Expr, 
 	return left, right, nil
 }
 
+// arrayContainmentType reports the array type used to compare @> and <@
+// operands. The left operand's declared type wins when both sides are arrays.
+func (e *Executor) arrayContainmentType(leftExpr, rightExpr parser.Expr) (string, bool) {
+	if typeName, ok := e.arrayTypeOf(leftExpr); ok {
+		return typeName, true
+	}
+	return e.arrayTypeOf(rightExpr)
+}
+
+// arrayContainment evaluates @> and <@ for one-dimensional arrays. Each element
+// of the contained array must match some element of the containing array, so
+// duplicates are irrelevant, as in PostgreSQL. A NULL operand yields NULL;
+// inside the arrays a NULL element only matches another NULL element.
+func (e *Executor) arrayContainment(op lexer.TokenType, arrayType string, leftExpr, rightExpr parser.Expr, left, right interface{}) (interface{}, error) {
+	if left == nil || right == nil {
+		return nil, nil
+	}
+	leftElements, err := e.parsedArray(leftExpr, left)
+	if err != nil {
+		return nil, fmt.Errorf("array containment requires an array value: %w", err)
+	}
+	rightElements, err := e.parsedArray(rightExpr, right)
+	if err != nil {
+		return nil, fmt.Errorf("array containment requires an array value: %w", err)
+	}
+	container, contained := leftElements, rightElements
+	if op == lexer.TokenLtAt {
+		container, contained = rightElements, leftElements
+	}
+	return arrayContainsElements(container, contained, arrayType)
+}
+
+// arrayContainsElements reports whether every element of contained matches some
+// element of container. Element equality follows the array's element type, and
+// a NULL element only matches another NULL element.
+func arrayContainsElements(container, contained []*string, arrayType string) (bool, error) {
+	kind, err := arrayElementKindOf(arrayType)
+	if err != nil {
+		return false, err
+	}
+	container, err = canonicalArrayElements(container, kind, arrayType)
+	if err != nil {
+		return false, err
+	}
+	contained, err = canonicalArrayElements(contained, kind, arrayType)
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range contained {
+		matched := false
+		for _, element := range container {
+			equal, err := arrayElementsEqual(element, candidate, kind, arrayType)
+			if err != nil {
+				return false, err
+			}
+			if equal {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// canonicalArrayElements canonicalizes each element so containment compares
+// equivalent spellings equally. NUMERIC elements keep their exact text and are
+// compared numerically instead.
+func canonicalArrayElements(elements []*string, kind arrayElementKind, arrayType string) ([]*string, error) {
+	if kind == arrayElementNumeric {
+		return elements, nil
+	}
+	canonical := make([]*string, len(elements))
+	for i, element := range elements {
+		value, err := canonicalArrayElement(element, kind, arrayType)
+		if err != nil {
+			return nil, err
+		}
+		canonical[i] = value
+	}
+	return canonical, nil
+}
+
+// arrayElementsEqual compares two canonical array elements. A nil element only
+// equals another nil element; NUMERIC elements compare exactly.
+func arrayElementsEqual(left, right *string, kind arrayElementKind, arrayType string) (bool, error) {
+	if left == nil || right == nil {
+		return left == nil && right == nil, nil
+	}
+	if kind != arrayElementNumeric {
+		return *left == *right, nil
+	}
+	leftRat, leftOK := numericValueRat(*left)
+	rightRat, rightOK := numericValueRat(*right)
+	if !leftOK || !rightOK {
+		invalid := *left
+		if !leftOK {
+			invalid = *right
+		}
+		return false, pgerror.InvalidText("invalid input syntax for type %s: %q", arrayType, invalid)
+	}
+	return leftRat.Cmp(rightRat) == 0, nil
+}
+
 // evalArrayCast converts a value to an array type. The input must already be
 // array text (a literal, a parameter, or another array value); every element is
 // validated and re-encoded canonically for the target element type.

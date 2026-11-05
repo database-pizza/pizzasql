@@ -199,7 +199,7 @@ func TestArraysAreAdvertised(t *testing.T) {
 	if types.Status != "one_dimensional" {
 		t.Fatalf("types.arrays status = %q, want one_dimensional", types.Status)
 	}
-	for _, want := range []string{"TEXT[]", "INTEGER[]", "BOOLEAN[]", "ARRAY[", "array_length", "unnest", "0A000", "22P02"} {
+	for _, want := range []string{"TEXT[]", "INTEGER[]", "BOOLEAN[]", "ARRAY[", "array_length", "unnest", "@>", "<@", "0A000", "22P02"} {
 		if !strings.Contains(types.Notes, want) {
 			t.Errorf("types.arrays notes do not mention %q", want)
 		}
@@ -272,7 +272,7 @@ func TestJSONBIsAdvertised(t *testing.T) {
 	if !jsonb.SetReturning.Supported || jsonb.SetReturning.Status != "single_from_item" {
 		t.Fatalf("json.jsonb.set_returning = %+v", jsonb.SetReturning)
 	}
-	for _, want := range []string{"jsonb_each", "jsonb_array_elements", "jsonb_object_keys", "0A000"} {
+	for _, want := range []string{"jsonb_each", "jsonb_array_elements", "jsonb_object_keys", "AS alias(col, ...)", "42P10", "0A000"} {
 		if !strings.Contains(jsonb.SetReturning.Notes, want) {
 			t.Errorf("json.jsonb.set_returning notes do not mention %q", want)
 		}

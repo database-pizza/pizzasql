@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -199,5 +200,54 @@ func TestHTTPForeignKeyViolationReturns23503(t *testing.T) {
 	}
 	if constraint, _ := resp.Error.Details["constraint"].(string); constraint != "child_parent" {
 		t.Fatalf("details.constraint = %q, want child_parent", constraint)
+	}
+}
+
+// Array containment and set-returning-function column aliases run through the
+// HTTP surface with the same values and SQLSTATEs as the wire protocol.
+func TestHTTPArrayContainmentAndSRFAlias(t *testing.T) {
+	server := setupKVTestServer(t)
+	queryHTTP(t, server, `CREATE TABLE items (id INTEGER PRIMARY KEY, nums INTEGER[])`)
+	queryHTTP(t, server, `INSERT INTO items (id, nums) VALUES (1, '{1,2,NULL}'), (2, '{3}')`)
+
+	resp := queryHTTP(t, server, `SELECT id FROM items WHERE nums @> ARRAY[2]`)
+	if len(resp.Rows) != 1 || resp.Rows[0][0].(float64) != 1 {
+		t.Fatalf("array containment rows = %#v", resp.Rows)
+	}
+	resp = queryHTTP(t, server, `SELECT id FROM items WHERE nums @> ARRAY[NULL]::INTEGER[]`)
+	if len(resp.Rows) != 1 || resp.Rows[0][0].(float64) != 1 {
+		t.Fatalf("NULL element containment rows = %#v", resp.Rows)
+	}
+
+	resp = queryHTTP(t, server, `SELECT n FROM unnest(ARRAY[5,6]) AS u(n) WHERE n = 6`)
+	if len(resp.Columns) != 1 || resp.Columns[0].Name != "n" || len(resp.Rows) != 1 || resp.Rows[0][0].(float64) != 6 {
+		t.Fatalf("alias list response = columns %#v rows %#v", resp.Columns, resp.Rows)
+	}
+
+	post := func(sql string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(QueryRequest{SQL: sql})
+		r := httptest.NewRequest(http.MethodPost, "/query", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		server.handleQuery(w, r)
+		return w
+	}
+	for _, tc := range []struct {
+		sql  string
+		code string
+	}{
+		{`SELECT * FROM unnest(ARRAY[1]) AS u(a, b)`, pgerror.CodeInvalidColumnReference},
+		{`SELECT * FROM items WHERE nums @> 1`, pgerror.CodeDatatypeMismatch},
+	} {
+		w := post(tc.sql)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400; body %s", tc.sql, w.Code, w.Body.String())
+		}
+		var resp httpErrorBody
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Error.Code != tc.code {
+			t.Fatalf("%s code = %q, want %s", tc.sql, resp.Error.Code, tc.code)
+		}
 	}
 }

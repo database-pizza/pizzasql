@@ -150,6 +150,15 @@ func TestCompatibilitySuite(t *testing.T) {
 	expectRows("arrays.length", `SELECT array_length(tags, 1) FROM array_values`, "2")
 	expectRows("arrays.any_parameter", `SELECT count(*) FROM array_values WHERE id = ANY('{1}')`, "1")
 	expectCode("arrays.multidim_0A000", `CREATE TABLE array_bad (v INTEGER[][])`, "0A000")
+	expectRows("arrays.contains", `SELECT count(*) FROM array_values WHERE nums @> ARRAY[1]`, "1")
+	expectRows("arrays.contains_missing", `SELECT count(*) FROM array_values WHERE nums @> ARRAY[9]`, "0")
+	expectRows("arrays.contained_by", `SELECT count(*) FROM array_values WHERE ARRAY[1] <@ nums`, "1")
+	expectRows("arrays.contains_null_element", `SELECT count(*) FROM array_values WHERE nums @> ARRAY[NULL]::INTEGER[]`, "1")
+	expectRows("arrays.contains_empty", `SELECT count(*) FROM array_values WHERE nums @> ARRAY[]::INTEGER[]`, "1")
+	expectRows("arrays.contains_null_operand", `SELECT count(*) FROM array_values WHERE nums @> NULL`, "0")
+	expectRows("srf.unnest_alias_list", `SELECT count(*) FROM unnest(ARRAY[1,2]) AS t(n) WHERE n > 1`, "1")
+	expectRows("srf.jsonb_each_alias_list", `SELECT count(*) FROM jsonb_each('{"a":1}') AS e(k, v) WHERE k = 'a'`, "1")
+	expectCode("srf.alias_list_arity_42P10", `SELECT * FROM jsonb_each('{"a":1}') AS e(k)`, "42P10")
 
 	// CHECK and FOREIGN KEY are accepted and enforced.
 	expectOK("ddl.check_accepted", `CREATE TABLE checked (n INTEGER CHECK (n > 0))`)
