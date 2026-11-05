@@ -1381,6 +1381,19 @@ func (p *Parser) isDataTypeKeyword() bool {
 func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 	constraint := &ColumnConstraint{}
 
+	// A column-level constraint can be named: `col TYPE CONSTRAINT name CHECK
+	// (...)` is the same constraint as the unnamed form.
+	named := false
+	if p.curTokenIs(lexer.TokenCONSTRAINT) {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenIdent) {
+			return nil, false, p.curError("expected constraint name")
+		}
+		constraint.Name = p.curToken.Literal
+		named = true
+		p.nextToken()
+	}
+
 	switch p.curToken.Type {
 	case lexer.TokenPRIMARY:
 		p.nextToken()
@@ -1474,10 +1487,16 @@ func (p *Parser) parseColumnConstraint() (*ColumnConstraint, bool, error) {
 		// explicit NULL declaration carries no constraint. Consume it so
 		// "col TYPE NULL" parses without inventing a fake nullable constraint.
 		// NOT NULL is applied whenever it appears, regardless of ordering.
+		if named {
+			return nil, false, p.curError("expected constraint type after constraint name")
+		}
 		p.nextToken()
 		return nil, true, nil
 
 	default:
+		if named {
+			return nil, false, p.curError("expected constraint type after constraint name")
+		}
 		return nil, false, nil
 	}
 

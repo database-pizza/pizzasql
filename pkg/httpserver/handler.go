@@ -293,6 +293,8 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			if _, err := exec.Execute(stmt); err != nil {
 				if errors.Is(err, storage.ErrSerialization) {
 					writeError(w, http.StatusConflict, "SERIALIZATION_FAILURE", err.Error(), nil)
+				} else if constraintErr := constraintViolationHTTPError(err); constraintErr != nil {
+					writeError(w, constraintErr.Status, constraintErr.Code, constraintErr.Message, constraintErr.Details)
 				} else {
 					writeError(w, http.StatusBadRequest, "TRANSACTION_ERROR", err.Error(), nil)
 				}
@@ -421,13 +423,59 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp, pretty)
 }
 
+// constraintViolationHTTPError maps a row-constraint violation onto the same
+// SQLSTATE response the PostgreSQL endpoint reports, and returns nil for any
+// other error. Transaction endpoints use it for a deferred unique, not-null, or
+// check failure at COMMIT while keeping their generic TRANSACTION_ERROR
+// fallback for errors that are not constraint violations.
+func constraintViolationHTTPError(err error) *HTTPError {
+	var checkErr *storage.CheckViolationError
+	var notNullErr *storage.NotNullViolationError
+	var uniqueErr *storage.UniqueViolationError
+	var primaryKeyErr *storage.PrimaryKeyViolationError
+	switch {
+	case errors.As(err, &checkErr):
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    "23514",
+			Message: err.Error(),
+			Details: map[string]interface{}{"constraint": checkErr.Constraint},
+		}
+	case errors.As(err, &notNullErr):
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    "23502",
+			Message: err.Error(),
+		}
+	case errors.As(err, &uniqueErr):
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    "23505",
+			Message: err.Error(),
+			Details: map[string]interface{}{"constraint": uniqueErr.Constraint},
+		}
+	case errors.As(err, &primaryKeyErr):
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    "23505",
+			Message: err.Error(),
+		}
+	default:
+		return nil
+	}
+}
+
 // sqlStateHTTPError maps engine errors onto the same SQLSTATE codes the
-// PostgreSQL endpoint reports. The executor returns plain errors on released
-// builds, so the unique-violation, not-null, and unsupported-feature markers are
-// matched on their stable message prefixes.
+// PostgreSQL endpoint reports. Typed constraint violations map first; the
+// executor also returns plain errors on released builds, so the
+// unique-violation, not-null, and unsupported-feature markers are matched on
+// their stable message prefixes as a fallback.
 func sqlStateHTTPError(err error) *HTTPError {
 	if err == nil {
 		return nil
+	}
+	if typed := constraintViolationHTTPError(err); typed != nil {
+		return typed
 	}
 	message := err.Error()
 	if strings.HasPrefix(message, "UNIQUE constraint failed: ") {
@@ -444,6 +492,15 @@ func sqlStateHTTPError(err error) *HTTPError {
 			Status:  http.StatusBadRequest,
 			Code:    "23502",
 			Message: message,
+		}
+	}
+	if strings.HasPrefix(message, "CHECK constraint failed: ") {
+		constraint := strings.TrimPrefix(message, "CHECK constraint failed: ")
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    "23514",
+			Message: message,
+			Details: map[string]interface{}{"constraint": constraint},
 		}
 	}
 	if errors.Is(err, storage.ErrSerialization) {
@@ -559,6 +616,8 @@ func (s *Server) handleTransactionCommit(w http.ResponseWriter, r *http.Request)
 	if _, err := tx.exec.Execute(stmt); err != nil {
 		if errors.Is(err, storage.ErrSerialization) {
 			writeError(w, http.StatusConflict, "SERIALIZATION_FAILURE", err.Error(), nil)
+		} else if constraintErr := constraintViolationHTTPError(err); constraintErr != nil {
+			writeError(w, constraintErr.Status, constraintErr.Code, constraintErr.Message, constraintErr.Details)
 		} else {
 			writeError(w, http.StatusBadRequest, "TRANSACTION_ERROR", err.Error(), nil)
 		}

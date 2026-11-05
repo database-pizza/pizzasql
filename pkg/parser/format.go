@@ -189,7 +189,10 @@ func quoteFormatIdent(name string) string {
 			break
 		}
 	}
-	if bare {
+	// Formatted text is persisted and re-parsed, so an identifier that lexes as
+	// a SQL keyword must be quoted even when it is otherwise bare: a column
+	// named "order" has to format as "order" to stay a column reference.
+	if bare && lexer.LookupKeyword(strings.ToUpper(name)) == lexer.TokenIdent {
 		return name
 	}
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`

@@ -170,15 +170,15 @@ func Current() *Document {
 			PrimaryKey:    Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "single-column only"},
 			CompositePK:   Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "declare a single-column primary key"},
 			ForeignKey:    Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level FOREIGN KEY are rejected; enforce referential integrity in the application, cascades are not implemented"},
-			Check:         Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level CHECK are rejected; enforce the rule in the application"},
+			Check:         Feature{Supported: true, Status: "enforced", SQLState: "23514", Notes: "inline and table-level CHECK are evaluated on INSERT, multi-row INSERT, UPDATE, and ON CONFLICT DO UPDATE; NULL/unknown results pass; predicates are restricted to deterministic, subquery-free expressions over unqualified columns; exposed in sqlite_master/sqlite_schema table SQL only (pg_constraint and information_schema.check_constraints are not emulated)"},
 			DefaultValues: Feature{Supported: true, Status: "evaluated_at_write_time", SQLState: "0A000", Notes: "constant defaults are stored as their evaluated value; CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, datetime('now'), date('now'), and time('now') are stored as SQL text and evaluated once per statement on write (per row for an ADD COLUMN backfill), so they are never frozen at DDL time; any other non-constant default is rejected with 0A000"},
 		},
 
 		DDL: DDL{
 			AddColumn:              Feature{Supported: true, Status: "materializes_defaults", Notes: "adds one nullable column; a constant DEFAULT is written into every existing row, and a whitelisted clock default is evaluated per rewritten row, so the rewrite cost is O(rows) and holds the table's exclusive gate"},
-			AddColumnBackfill:      Feature{Supported: true, Status: "rewrites_rows", Notes: "a DEFAULT is materialized into existing rows during the rewrite: constants as their stored value, whitelisted clock defaults evaluated per row; ADD COLUMN ... NOT NULL without a DEFAULT fails with 23502 on a non-empty table, ADD COLUMN ... UNIQUE conflicts with 23505 when backfilling a non-NULL default into more than one row (a constant default is predicted before the rewrite, a clock default is validated against the values the rewrite writes), and the column is published together with its UNIQUE index in one atomic schema write"},
-			DropColumn:             Feature{Supported: true, Status: "rewrites_rows"},
-			RenameColumn:           Feature{Supported: true, Status: "rewrites_rows"},
+			AddColumnBackfill:      Feature{Supported: true, Status: "rewrites_rows", Notes: "a DEFAULT is materialized into existing rows during the rewrite: constants as their stored value, whitelisted clock defaults evaluated per row; ADD COLUMN ... NOT NULL without a DEFAULT fails with 23502 on a non-empty table, ADD COLUMN ... UNIQUE conflicts with 23505 when backfilling a non-NULL default into more than one row (a constant default is predicted before the rewrite, a clock default is validated against the values the rewrite writes), ADD COLUMN ... CHECK fails with 23514 when an existing row or the backfilled default violates the predicate, and the column is published together with its CHECK constraints and UNIQUE index in one atomic schema write"},
+			DropColumn:             Feature{Supported: true, Status: "rewrites_rows", Notes: "rejected with 0A000 when a persisted CHECK constraint references the column; the stored predicate text cannot be rewritten"},
+			RenameColumn:           Feature{Supported: true, Status: "rewrites_rows", Notes: "rejected with 0A000 when a persisted CHECK constraint or expression index references the column; the stored expression text cannot be rewritten"},
 			RenameColumnIndexes:    Feature{Supported: true, Status: "rewrites_index_metadata", Notes: "column references in index definitions are rewritten in place, including composite and unique indexes; index names are unchanged; RENAME COLUMN is rejected when an expression index references the column (drop that index, rename, then recreate it)"},
 			CreateTableIfNotExists: true,
 			AddColumnIfNotExists:   true,
@@ -224,6 +224,7 @@ func Current() *Document {
 		ErrorCodes: map[string]string{
 			"23502": "not_null_violation",
 			"23505": "unique_violation",
+			"23514": "check_violation",
 			"40001": "serialization_failure",
 			"0A000": "feature_not_supported",
 			"42501": "insufficient_privilege (managed proxy)",

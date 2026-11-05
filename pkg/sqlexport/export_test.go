@@ -33,7 +33,7 @@ func TestExportPreservesDefaultExpression(t *testing.T) {
 		Type:        "TIMESTAMP",
 		Nullable:    true,
 		DefaultExpr: "CURRENT_TIMESTAMP",
-	}, nil); err != nil {
+	}, nil, nil); err != nil {
 		t.Fatalf("add column: %v", err)
 	}
 

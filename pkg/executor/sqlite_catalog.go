@@ -312,7 +312,7 @@ func (e *Executor) pragmaTableXInfo(table string) (*Result, error) {
 // implicit _rowid_ (and its aliases) are stripped, and identifiers are quoted so
 // xorm's IsColumnExist / GORM's HasColumn LIKE patterns match.
 func recreateCreateTableSQL(s *storage.Schema) string {
-	cols := make([]string, 0, len(s.Columns))
+	cols := make([]string, 0, len(s.Columns)+len(s.Checks))
 	for _, col := range s.Columns {
 		// Strip only the engine-injected hidden rowid column, never user
 		// columns that happen to be named oid/rowid/_rowid_.
@@ -320,6 +320,16 @@ func recreateCreateTableSQL(s *storage.Schema) string {
 			continue
 		}
 		cols = append(cols, recreateColumnDef(s, col))
+	}
+	// Inline and table-level CHECK declarations are stored uniformly, so they
+	// are all rendered as table-level constraints: `CREATE TABLE t (a INTEGER,
+	// CHECK (a > 0))` is equivalent SQL for either declaration.
+	for _, check := range s.Checks {
+		if check.Name != "" {
+			cols = append(cols, fmt.Sprintf("CONSTRAINT %s CHECK (%s)", quoteIdent(check.Name), check.Expression))
+			continue
+		}
+		cols = append(cols, fmt.Sprintf("CHECK (%s)", check.Expression))
 	}
 	return fmt.Sprintf("CREATE TABLE %s (%s)", quoteIdent(s.Name), strings.Join(cols, ", "))
 }

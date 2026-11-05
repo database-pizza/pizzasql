@@ -7,26 +7,6 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 )
 
-func TestCheckConstraintsRejectedAtDDL(t *testing.T) {
-	_, schema, table := newTestDB(t)
-	e := newExec(schema, table)
-
-	for _, sql := range []string{
-		"CREATE TABLE t1 (id INTEGER PRIMARY KEY, age INTEGER CHECK (age > 0))",
-		"CREATE TABLE t2 (id INTEGER PRIMARY KEY, age INTEGER, CHECK (age > 0))",
-		"CREATE TABLE t3 (id INTEGER PRIMARY KEY, age INTEGER, CONSTRAINT positive_age CHECK (age > 0))",
-	} {
-		if _, err := execSQL(e, sql); !errors.Is(err, pgerror.ErrFeatureNotSupported) {
-			t.Fatalf("%s: error = %v, want ErrFeatureNotSupported", sql, err)
-		}
-	}
-
-	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	if _, err := execSQL(e, "ALTER TABLE t ADD COLUMN age INTEGER CHECK (age > 0)"); !errors.Is(err, pgerror.ErrFeatureNotSupported) {
-		t.Fatalf("ALTER CHECK error = %v, want ErrFeatureNotSupported", err)
-	}
-}
-
 func TestForeignKeyConstraintsRejectedAtDDL(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)

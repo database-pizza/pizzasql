@@ -407,18 +407,31 @@ func (c *Connection) handleQuery(msg *Message) error {
 			}
 		}
 		result, err := c.executor.Execute(stmt)
+		if err != nil && isIdleRollback(stmt, c.txStatus, err) {
+			result, err = executor.NewResult("ROLLBACK"), nil
+		}
 		if err != nil {
 			code := ErrCodeInternalError
 			message := fmt.Sprintf("Execution error: %v", err)
 			var primaryKeyErr *storage.PrimaryKeyViolationError
 			var uniqueErr *storage.UniqueViolationError
 			var notNullErr *storage.NotNullViolationError
+			var checkErr *storage.CheckViolationError
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
 			} else if errors.As(err, &notNullErr) {
 				code = "23502"
-				if c.txStatus == TxStatusInBlock {
+				if _, commit := stmt.(*parser.CommitStmt); commit {
+					c.txStatus = TxStatusIdle
+				} else if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if errors.As(err, &checkErr) {
+				code = ErrCodeCheckViolation
+				if _, commit := stmt.(*parser.CommitStmt); commit {
+					c.txStatus = TxStatusIdle
+				} else if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
 			} else if errors.As(err, &uniqueErr) || errors.As(err, &primaryKeyErr) {
@@ -651,17 +664,30 @@ func (c *Connection) handleExecute(msg *Message) error {
 		return c.failExtended(code, fmt.Errorf("syntax error: %w", err))
 	}
 	result, err := c.executor.Execute(stmt)
+	if err != nil && isIdleRollback(stmt, c.txStatus, err) {
+		result, err = executor.NewResult("ROLLBACK"), nil
+	}
 	if err != nil {
 		code := ErrCodeInternalError
 		var primaryKeyErr *storage.PrimaryKeyViolationError
 		var uniqueErr *storage.UniqueViolationError
 		var notNullErr *storage.NotNullViolationError
+		var checkErr *storage.CheckViolationError
 		if errors.Is(err, storage.ErrSerialization) {
 			code = ErrCodeSerializationFailure
 			c.txStatus = TxStatusIdle
 		} else if errors.As(err, &notNullErr) {
 			code = "23502"
-			if c.txStatus == TxStatusInBlock {
+			if _, commit := stmt.(*parser.CommitStmt); commit {
+				c.txStatus = TxStatusIdle
+			} else if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.As(err, &checkErr) {
+			code = ErrCodeCheckViolation
+			if _, commit := stmt.(*parser.CommitStmt); commit {
+				c.txStatus = TxStatusIdle
+			} else if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
 		} else if errors.As(err, &uniqueErr) || errors.As(err, &primaryKeyErr) {
@@ -1262,6 +1288,18 @@ func (c *Connection) sendBackendKeyData(processID, secretKey int32) error {
 	mb.WriteInt32(processID)
 	mb.WriteInt32(secretKey)
 	return c.writeMessage(MsgBackendKeyData, mb.Bytes())
+}
+
+// isIdleRollback reports whether a bare ROLLBACK found no transaction to roll
+// back. A COMMIT rejected by storage has already ended the transaction, so the
+// client's cleanup ROLLBACK must complete (PostgreSQL reports a warning and
+// succeeds) instead of surfacing an internal error on an idle session.
+func isIdleRollback(stmt parser.Statement, status byte, err error) bool {
+	rollback, ok := stmt.(*parser.RollbackStmt)
+	if !ok || rollback.Savepoint != "" {
+		return false
+	}
+	return status == TxStatusIdle && errors.Is(err, executor.ErrNoTransaction)
 }
 
 // sendReadyForQuery sends ready for query message

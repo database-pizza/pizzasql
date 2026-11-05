@@ -559,7 +559,7 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 		normalizedRow["_rowid_"] = newRowID
 	}
 
-	if err := validateNotNull(schema, normalizedRow); err != nil {
+	if err := m.schema.validateRowConstraints(schema, normalizedRow); err != nil {
 		return nil, "", err
 	}
 	return normalizedRow, m.dataKey(table, pk), nil
@@ -603,6 +603,9 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	if err := m.schema.applySchemaDefaults(schema, nr); err != nil {
+		return 0, err
+	}
+	if err := m.schema.validateChecks(schema, nr); err != nil {
 		return 0, err
 	}
 	data, err := encodeRow(nr)
@@ -777,7 +780,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 			}
 		}
 		nr["_rowid_"] = rowid
-		if err := validateNotNull(schema, nr); err != nil {
+		if err := m.schema.validateRowConstraints(schema, nr); err != nil {
 			return 0, 0, err
 		}
 		if rowid > maxRowID {
@@ -1114,6 +1117,9 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 	}
 
 	if err := m.schema.applySchemaDefaults(schema, row); err != nil {
+		return nil, false, err
+	}
+	if err := m.schema.validateChecks(schema, row); err != nil {
 		return nil, false, err
 	}
 	data, err := encodeRow(row)

@@ -2,8 +2,10 @@ package capabilities
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
@@ -83,5 +85,38 @@ func TestNonConstantDefaultsAreAdvertisedAsEvaluatedAtWriteTime(t *testing.T) {
 	}
 	if defaults.SQLState != "0A000" {
 		t.Fatalf("default_values SQLSTATE = %q, want 0A000 for the remaining rejected forms", defaults.SQLState)
+	}
+}
+
+func TestCheckConstraintIsAdvertised(t *testing.T) {
+	doc := Current()
+	check := doc.Constraints.Check
+	if !check.Supported {
+		t.Fatalf("check = %+v, want supported", check)
+	}
+	if check.Status != "enforced" {
+		t.Fatalf("check status = %q, want enforced", check.Status)
+	}
+	if check.SQLState != pgerror.CodeCheckViolation {
+		t.Fatalf("check SQLSTATE = %q, want %q", check.SQLState, pgerror.CodeCheckViolation)
+	}
+	if check.Notes == "" {
+		t.Fatal("check notes must describe the enforcement surface")
+	}
+	if got := doc.ErrorCodes[pgerror.CodeCheckViolation]; got != "check_violation" {
+		t.Fatalf("23514 mapping = %q, want check_violation", got)
+	}
+}
+
+func TestDDLNotesDescribeCheckDependencies(t *testing.T) {
+	doc := Current()
+	if !strings.Contains(doc.DDL.DropColumn.Notes, "CHECK") || !strings.Contains(doc.DDL.DropColumn.Notes, "0A000") {
+		t.Fatalf("drop_column notes = %q, want the persisted CHECK restriction", doc.DDL.DropColumn.Notes)
+	}
+	if !strings.Contains(doc.DDL.RenameColumn.Notes, "CHECK") || !strings.Contains(doc.DDL.RenameColumn.Notes, "0A000") {
+		t.Fatalf("rename_column notes = %q, want the persisted CHECK restriction", doc.DDL.RenameColumn.Notes)
+	}
+	if !strings.Contains(doc.DDL.AddColumnBackfill.Notes, "23514") {
+		t.Fatalf("add_column_backfill notes = %q, want the CHECK backfill failure", doc.DDL.AddColumnBackfill.Notes)
 	}
 }

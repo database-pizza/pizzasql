@@ -896,7 +896,7 @@ func TestAddColumnPublishesUniqueIndexInOneWrite(t *testing.T) {
 
 	index := &Index{Name: "uniq_t_code", Table: "t", Unique: true, Columns: []IndexColumn{{Name: "code"}}}
 	schemaWritesBefore := kv.writeCount(":_schema:")
-	if err := schemas.AddColumn("t", Column{Name: "code", Type: "TEXT", Nullable: true, Default: "x"}, index); err != nil {
+	if err := schemas.AddColumn("t", Column{Name: "code", Type: "TEXT", Nullable: true, Default: "x"}, nil, index); err != nil {
 		t.Fatalf("add column: %v", err)
 	}
 
@@ -957,7 +957,7 @@ func TestAddColumnRejectsDuplicateIndexName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := schemas.AddColumn("t", Column{Name: "code", Type: "TEXT", Nullable: true, Default: "x"},
+	err := schemas.AddColumn("t", Column{Name: "code", Type: "TEXT", Nullable: true, Default: "x"}, nil,
 		&Index{Name: "uniq_t_code", Table: "t", Unique: true, Columns: []IndexColumn{{Name: "code"}}})
 	if err == nil {
 		t.Fatal("expected the existing index name to be rejected")

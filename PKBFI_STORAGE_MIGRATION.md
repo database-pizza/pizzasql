@@ -35,6 +35,10 @@ The migration command exits after writing and verifying the destination. It refu
   field, so rolling back to a pre-`default_expr` binary silently loses write-time
   defaults: nullable columns read as NULL and NOT NULL columns reject the insert.
   Constant defaults in the `default` field are unaffected.
+- `Schema.Checks` (CHECK constraints) is an additive, optional JSON field. A
+  pre-CHECK engine ignores it on read and drops it on the next schema write, so
+  rolling back to such an engine silently stops enforcing CHECK constraints;
+  restore the newer engine (or re-create the constraints) after a rollback.
 - Successful PKBFI writes are acknowledged only after PizzaKV's durability sync completes.
 - A `.pkvdb` file must have one PizzaSQL process owner. Optimistic scan and
   predicate conflict detection uses process-local generations and is not safe

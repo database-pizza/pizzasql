@@ -96,6 +96,7 @@ const (
 	ErrCodeTransactionAborted   = "25P02"
 	ErrCodeSerializationFailure = "40001"
 	ErrCodeUniqueViolation      = "23505"
+	ErrCodeCheckViolation       = "23514"
 )
 
 // Message represents a PostgreSQL protocol message
