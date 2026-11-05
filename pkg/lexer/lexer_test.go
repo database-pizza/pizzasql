@@ -564,3 +564,47 @@ func BenchmarkLexer(b *testing.B) {
 		}
 	}
 }
+
+func TestLexerArraySyntaxTokens(t *testing.T) {
+	tokens := New(`arr[1]::TEXT[]`).Tokenize()
+	want := []TokenType{
+		TokenIdent, // arr
+		TokenLBracket,
+		TokenNumber,
+		TokenRBracket,
+		TokenColonColon,
+		TokenTEXT,
+		TokenLBracket,
+		TokenRBracket,
+		TokenEOF,
+	}
+	if len(tokens) != len(want) {
+		t.Fatalf("got %d tokens, want %d: %v", len(tokens), len(want), tokens)
+	}
+	for i := range want {
+		if tokens[i].Type != want[i] {
+			t.Errorf("token[%d] = %v (%q), want %v", i, tokens[i].Type, tokens[i].Literal, want[i])
+		}
+	}
+}
+
+func TestLexerBracketIdentifierAfterKeyword(t *testing.T) {
+	for _, tc := range []struct {
+		input   string
+		literal string
+	}{
+		{"SELECT [column] FROM t", "column"},
+		{"SELECT t.[column] FROM t", "column"},
+	} {
+		tokens := New(tc.input).Tokenize()
+		found := false
+		for _, token := range tokens {
+			if token.Type == TokenIdent && token.Literal == tc.literal {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%q did not lex %q as an identifier: %v", tc.input, tc.literal, tokens)
+		}
+	}
+}

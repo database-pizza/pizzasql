@@ -48,7 +48,10 @@ func (t Type) String() string {
 // TypeFromName returns the Type for a SQL type name using SQLite affinity rules.
 // See: https://www.sqlite.org/datatype3.html
 func TypeFromName(name string) Type {
-	upper := strings.ToUpper(name)
+	upper := strings.ToUpper(strings.TrimSpace(name))
+	// Array types report their element type's affinity. The analyzer has no
+	// distinct array type; element storage stays a canonical text value.
+	upper = strings.TrimSuffix(upper, "[]")
 
 	// Rule 1: If the type contains "INT" -> INTEGER
 	if strings.Contains(upper, "INT") {
@@ -224,6 +227,10 @@ var builtinFunctions = map[string]FunctionSignature{
 	"IFNULL":   {Name: "IFNULL", MinArgs: 2, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeAny}, ReturnType: TypeAny, IsAggregate: false},
 	"IIF":      {Name: "IIF", MinArgs: 3, MaxArgs: 3, ArgTypes: []Type{TypeBoolean, TypeAny, TypeAny}, ReturnType: TypeAny, IsAggregate: false},
 
+	// Array functions
+	"ARRAY_LENGTH": {Name: "ARRAY_LENGTH", MinArgs: 2, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeInteger}, ReturnType: TypeInteger, IsAggregate: false},
+	"UNNEST":       {Name: "UNNEST", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+
 	// Type functions
 	"TYPEOF": {Name: "TYPEOF", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
 	"CAST":   {Name: "CAST", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
@@ -316,6 +323,9 @@ type ColumnInfo struct {
 	Default    interface{}
 	TableName  string // For qualified references
 	Generated  bool   // generated columns cannot be written by the user
+	// Array marks a one-dimensional array column. Type holds the element's
+	// affinity, so comparisons need this flag to accept a text array literal.
+	Array bool
 }
 
 // TableInfo describes a table schema.
@@ -347,4 +357,6 @@ type ExprInfo struct {
 	IsAggregate bool
 	IsConstant  bool
 	Nullable    bool
+	// Array marks an expression whose value is an array.
+	Array bool
 }

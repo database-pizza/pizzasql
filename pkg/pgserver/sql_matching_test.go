@@ -10,7 +10,8 @@ func TestBindQuerySkipsCommentsAndQuotedRegions(t *testing.T) {
 		{"SELECT $1 /* ' $99 */ + $2", "SELECT 1 /* ' $99 */ + 2"},
 		{"SELECT $1 -- '$99\n + $2", "SELECT 1 -- '$99\n + 2"},
 		{"SELECT $1 -- $99", "SELECT 1 -- $99"},
-		{"SELECT '$99''$88', \"$77\", `$66`, [$55], $1", "SELECT '$99''$88', \"$77\", `$66`, [$55], 1"},
+		// Brackets are not a quoted region: a subscript such as tags[$1] binds.
+		{"SELECT '$99''$88', \"$77\", `$66`, tags[$1]", "SELECT '$99''$88', \"$77\", `$66`, tags[1]"},
 		{"SELECT '$1 /* no comment */', $2", "SELECT '$1 /* no comment */', 2"},
 	} {
 		got, err := bindQuery(tc.query, []boundParameter{{value: []byte("1")}, {value: []byte("2")}})

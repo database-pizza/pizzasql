@@ -710,6 +710,7 @@ func (s *Schema) ToAnalyzerTableInfo() *analyzer.TableInfo {
 			PrimaryKey: col.PrimaryKey,
 			TableName:  s.Name,
 			Generated:  col.GeneratedExpr != "",
+			Array:      strings.HasSuffix(strings.ToUpper(strings.TrimSpace(col.Type)), "[]"),
 		})
 	}
 

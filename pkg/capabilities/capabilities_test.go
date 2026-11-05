@@ -189,3 +189,35 @@ func TestForeignKeyIsAdvertised(t *testing.T) {
 		t.Fatalf("23503 mapping = %q, want foreign_key_violation", got)
 	}
 }
+
+func TestArraysAreAdvertised(t *testing.T) {
+	doc := Current()
+	types := doc.Types.Arrays
+	if !types.Supported {
+		t.Fatalf("types.arrays = %+v, want supported", types)
+	}
+	if types.Status != "one_dimensional" {
+		t.Fatalf("types.arrays status = %q, want one_dimensional", types.Status)
+	}
+	for _, want := range []string{"TEXT[]", "INTEGER[]", "BOOLEAN[]", "ARRAY[", "array_length", "unnest", "0A000", "22P02"} {
+		if !strings.Contains(types.Notes, want) {
+			t.Errorf("types.arrays notes do not mention %q", want)
+		}
+	}
+
+	params := doc.Parameters.Arrays
+	if !params.Supported {
+		t.Fatalf("parameters.arrays = %+v, want supported", params)
+	}
+	if params.Status != "text_format" {
+		t.Fatalf("parameters.arrays status = %q, want text_format", params.Status)
+	}
+	for _, want := range []string{"1009", "1007", "1016", "1000", "1022", "1021", "1231", "1015", "0A000"} {
+		if !strings.Contains(params.Notes, want) {
+			t.Errorf("parameters.arrays notes do not mention %q", want)
+		}
+	}
+	if !strings.Contains(doc.Parameters.MaxOID, "text[]/varchar[]/int4[]") {
+		t.Fatalf("parameters.max_oid = %q, want the array OIDs listed", doc.Parameters.MaxOID)
+	}
+}

@@ -199,6 +199,11 @@ const (
 	TokenCONFLICT
 	TokenDO
 	TokenNOTHING
+
+	// PostgreSQL-style syntax
+	TokenColonColon // ::
+	TokenLBracket   // [ (only when it subscripts an expression)
+	TokenRBracket   // ]
 )
 
 var keywords = map[string]TokenType{
@@ -373,6 +378,10 @@ type Token struct {
 	Literal string
 	Line    int
 	Column  int
+	// Bracketed is set on an identifier that came from SQLite's [bracket]
+	// quoting, which lets the parser tell an identifier apart from a nested
+	// array literal in ARRAY[...] context.
+	Bracketed bool
 }
 
 func (t Token) String() string {
@@ -422,6 +431,9 @@ var tokenNames = map[TokenType]string{
 	TokenComma:      ",",
 	TokenSemicolon:  ";",
 	TokenDot:        ".",
+	TokenColonColon: "::",
+	TokenLBracket:   "[",
+	TokenRBracket:   "]",
 }
 
 func (t TokenType) String() string {

@@ -13,6 +13,170 @@ import (
 // type name declared in the schema.
 type columnTypeResolver func(table, column string) (string, bool)
 
+// snapshotTypeResolver builds a column-type resolver from the FROM clause. It
+// reads every table schema up front, before the statement takes the session lock
+// for its scan, so value-time lookups never re-enter the session lock (which
+// would deadlock the scan that is asking).
+func (e *Executor) snapshotTypeResolver(refs []parser.TableRef) columnTypeResolver {
+	type tableSnapshot struct {
+		name  string
+		alias string
+		types map[string]string
+	}
+	var tables []tableSnapshot
+	for _, ref := range collectAllTableRefs(refs) {
+		if ref.Subquery != nil || ref.Function != nil || ref.Name == "" {
+			continue
+		}
+		// A materialized CTE shadows a real table with the same name; never
+		// read the table's schema for a name the query resolves as a CTE.
+		if e.cteTableExists(ref.Name) {
+			continue
+		}
+		schema, err := e.session.GetSchema(ref.Name)
+		if err != nil {
+			continue
+		}
+		snapshot := tableSnapshot{name: ref.Name, alias: ref.Alias, types: make(map[string]string, len(schema.Columns))}
+		for _, column := range schema.Columns {
+			snapshot.types[strings.ToUpper(column.Name)] = column.Type
+		}
+		tables = append(tables, snapshot)
+	}
+	return func(table, column string) (string, bool) {
+		upper := strings.ToUpper(column)
+		for _, snapshot := range tables {
+			if table != "" && !strings.EqualFold(table, snapshot.alias) && !strings.EqualFold(table, snapshot.name) {
+				continue
+			}
+			if typeName, ok := snapshot.types[upper]; ok {
+				return typeName, true
+			}
+			if table != "" {
+				break
+			}
+		}
+		return "", false
+	}
+}
+
+// joinTypeScope collects the column types of relations materialized while
+// executing a join (derived tables and CTEs on the right side). The statement's
+// WHERE and projection resolve through it after the join rows are built, so
+// array subscripts and comparisons still decode their elements.
+type joinTypeScope struct {
+	qualified   map[string]string
+	unqualified map[string]string
+}
+
+func newJoinTypeScope() *joinTypeScope {
+	return &joinTypeScope{qualified: make(map[string]string), unqualified: make(map[string]string)}
+}
+
+// record stores one column's type. Unqualified lookups keep the first relation
+// that declared the name, matching how merged join rows keep the left value.
+func (s *joinTypeScope) record(qualifier, name, typeName string) {
+	if s == nil {
+		return
+	}
+	if qualifier != "" {
+		s.qualified[strings.ToUpper(qualifier+"."+name)] = typeName
+	}
+	key := strings.ToUpper(name)
+	if _, exists := s.unqualified[key]; !exists {
+		s.unqualified[key] = typeName
+	}
+}
+
+// resolve implements columnTypeResolver over the recorded join columns.
+func (s *joinTypeScope) resolve(table, column string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	if table != "" {
+		if typeName, ok := s.qualified[strings.ToUpper(table+"."+column)]; ok {
+			return typeName, true
+		}
+		return "", false
+	}
+	if typeName, ok := s.unqualified[strings.ToUpper(column)]; ok {
+		return typeName, true
+	}
+	return "", false
+}
+
+// recordJoinColumns adds a materialized right relation's columns to the current
+// statement's join scope.
+func (e *Executor) recordJoinColumns(qualifier string, columns, types []string) {
+	if len(e.joinTypeScopes) == 0 {
+		return
+	}
+	scope := e.joinTypeScopes[len(e.joinTypeScopes)-1]
+	for i, column := range columns {
+		scope.record(qualifier, column, typeAt(types, i))
+	}
+}
+
+// materializedTypeResolver builds a resolver over a materialized relation's
+// columns. columns and types are positionally aligned; qualifiers holds the
+// table name or alias each column can be referenced through (one entry per
+// column). A known column with no recorded type returns ("", true) so an outer
+// scope cannot supply a type for a name that is shadowed.
+func materializedTypeResolver(columns, types, qualifiers []string) columnTypeResolver {
+	if len(columns) == 0 {
+		return nil
+	}
+	return func(table, column string) (string, bool) {
+		for i, name := range columns {
+			if !strings.EqualFold(name, column) {
+				continue
+			}
+			qualifier := ""
+			if i < len(qualifiers) {
+				qualifier = qualifiers[i]
+			}
+			if table != "" && !strings.EqualFold(table, qualifier) {
+				continue
+			}
+			if i < len(types) && types[i] != "" {
+				return types[i], true
+			}
+			return "", true
+		}
+		return "", false
+	}
+}
+
+// pushTypeScope adds the column-type resolver of the SELECT or DML statement
+// being evaluated. Scopes nest: the innermost resolver wins, and an outer
+// query's resolver still answers for correlated references.
+func (e *Executor) pushTypeScope(resolve columnTypeResolver) {
+	e.typeScopes = append(e.typeScopes, resolve)
+}
+
+// popTypeScope removes the innermost resolver pushed by pushTypeScope.
+func (e *Executor) popTypeScope() {
+	if len(e.typeScopes) == 0 {
+		return
+	}
+	e.typeScopes = e.typeScopes[:len(e.typeScopes)-1]
+}
+
+// resolveColumnType resolves a column reference against the active statement
+// scopes, innermost first. It reports false when no scope declares the column,
+// which leaves the caller on the TEXT fallback.
+func (e *Executor) resolveColumnType(table, column string) (string, bool) {
+	for i := len(e.typeScopes) - 1; i >= 0; i-- {
+		if e.typeScopes[i] == nil {
+			continue
+		}
+		if typeName, ok := e.typeScopes[i](table, column); ok {
+			return typeName, true
+		}
+	}
+	return "", false
+}
+
 // schemaTypeResolver builds a resolver over a single table schema. The table
 // qualifier is ignored because the analyzer has already validated it.
 func schemaTypeResolver(schema *storage.Schema) columnTypeResolver {
@@ -149,10 +313,16 @@ func inferExprType(expr parser.Expr, resolve columnTypeResolver) string {
 	case *parser.LiteralExpr:
 		return literalType(e)
 	case *parser.CastExpr:
-		if typeName, ok := castResultType(e.Type.Name); ok {
+		if typeName, ok := castResultType(e.Type.SQLTypeName()); ok {
 			return typeName
 		}
 		return "TEXT"
+	case *parser.ArrayExpr:
+		return arrayConstructorType(e, resolve)
+	case *parser.SubscriptExpr:
+		return subscriptResultType(e, resolve)
+	case *parser.AnyAllExpr:
+		return "BOOLEAN"
 	case *parser.FunctionCall:
 		return functionResultType(e, resolve)
 	case *parser.BinaryExpr:
@@ -203,6 +373,9 @@ func literalType(lit *parser.LiteralExpr) string {
 // real targets, and it does not range-check them. A narrower advertised type
 // (int2/int4/float4) could otherwise fail to decode a value the engine accepted.
 func castResultType(name string) (string, bool) {
+	if element, isArray := arrayElementType(name); isArray {
+		return arrayResultTypeName(element), true
+	}
 	switch strings.ToUpper(strings.TrimSpace(name)) {
 	case "INTEGER", "INT", "SMALLINT", "TINYINT", "MEDIUMINT", "BIGINT":
 		return "BIGINT", true
@@ -214,6 +387,66 @@ func castResultType(name string) (string, bool) {
 		return "BLOB", true
 	default:
 		return "", false
+	}
+}
+
+// arrayConstructorType reports the array type of an ARRAY[...] constructor. The
+// element type follows the first non-NULL element; a constructor mixing element
+// types falls back to TEXT[].
+func arrayConstructorType(expr *parser.ArrayExpr, resolve columnTypeResolver) string {
+	elementType := ""
+	for _, element := range expr.Elements {
+		typeName := inferExprType(element, resolve)
+		if isUnknownTypeName(typeName) {
+			continue
+		}
+		if elementType == "" {
+			elementType = typeName
+			continue
+		}
+		if !strings.EqualFold(elementType, typeName) {
+			elementType = "TEXT"
+		}
+	}
+	if elementType == "" {
+		elementType = "TEXT"
+	}
+	return arrayResultTypeName(elementType)
+}
+
+// subscriptResultType reports the element type of an array subscript. A
+// subscript of a non-array expression keeps the TEXT fallback.
+func subscriptResultType(expr *parser.SubscriptExpr, resolve columnTypeResolver) string {
+	if element, ok := arrayElementType(inferExprType(expr.Expr, resolve)); ok {
+		return element
+	}
+	return "TEXT"
+}
+
+// arrayResultTypeName maps an element type name to the type name the wire layer
+// reports for the array. The mapping follows the element's carrier: INTEGER is
+// int4 and REAL is float4, matching the scalar mappings, and narrower integer
+// types report int8[] because values are not range-checked. NUMERIC/DECIMAL keep
+// their own array type: array elements are validated text, so their digits are
+// not rounded through float64.
+func arrayResultTypeName(elementType string) string {
+	switch strings.ToUpper(strings.TrimSpace(elementType)) {
+	case "INTEGER", "INT", "INT4":
+		return "INTEGER[]"
+	case "BIGINT", "INT8", "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+		return "BIGINT[]"
+	case "REAL", "FLOAT", "FLOAT4":
+		return "REAL[]"
+	case "DOUBLE", "FLOAT8":
+		return "DOUBLE[]"
+	case "NUMERIC", "DECIMAL":
+		return "NUMERIC[]"
+	case "BOOLEAN", "BOOL":
+		return "BOOLEAN[]"
+	case "VARCHAR", "NVARCHAR", "CHARACTER VARYING":
+		return "VARCHAR[]"
+	default:
+		return "TEXT[]"
 	}
 }
 
@@ -231,6 +464,8 @@ func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) str
 		return "DOUBLE"
 	case "AVG":
 		return "DOUBLE"
+	case "ARRAY_LENGTH":
+		return "INTEGER"
 	case "MIN", "MAX":
 		// MIN/MAX return one of the input values unchanged.
 		return firstArgType(fn, resolve)

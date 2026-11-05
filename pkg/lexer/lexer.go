@@ -14,6 +14,10 @@ type Lexer struct {
 	ch      byte // current char under examination
 	line    int  // current line number (1-based)
 	column  int  // current column number (1-based)
+	// prev is the type of the last non-comment token, used to disambiguate a
+	// leading bracket: after an expression it starts a subscript, otherwise it
+	// is a [bracket-quoted identifier] as in SQLite.
+	prev TokenType
 }
 
 // New creates a new Lexer for the given input.
@@ -194,7 +198,28 @@ func (l *Lexer) NextToken() Token {
 	case '`':
 		tok = l.readQuotedIdentifier('`')
 	case '[':
-		tok = l.readBracketIdentifier()
+		if l.afterExpression() {
+			tok.Type = TokenLBracket
+			tok.Literal = "["
+			l.readChar()
+		} else {
+			tok = l.readBracketIdentifier()
+		}
+	case ']':
+		tok.Type = TokenRBracket
+		tok.Literal = "]"
+		l.readChar()
+	case ':':
+		if l.peekChar() == ':' {
+			l.readChar()
+			tok.Type = TokenColonColon
+			tok.Literal = "::"
+			l.readChar()
+		} else {
+			tok.Type = TokenError
+			tok.Literal = "unexpected character: :"
+			l.readChar()
+		}
 	default:
 		if (l.ch == 'x' || l.ch == 'X') && l.peekChar() == '\'' {
 			tok = l.readBlob()
@@ -209,7 +234,33 @@ func (l *Lexer) NextToken() Token {
 		}
 	}
 
+	if tok.Type != TokenComment {
+		l.prev = tok.Type
+	}
 	return tok
+}
+
+// afterExpression reports whether a bracket at this position starts a subscript
+// rather than a bracket-quoted identifier. Only tokens that can end an
+// expression qualify; everything else keeps SQLite's [identifier] quoting (a
+// bracket-quoted alias or name directly after a keyword is still accepted).
+func (l *Lexer) afterExpression() bool {
+	switch l.prev {
+	case TokenIdent, TokenString, TokenNumber, TokenBlob,
+		TokenRParen, TokenRBracket, TokenTRUE, TokenFALSE, TokenNULL:
+		return true
+	}
+	// Type keywords accept a trailing [] and are therefore followed by a
+	// bracket that starts an array dimension, not an identifier.
+	switch l.prev {
+	case TokenINTEGER, TokenINT, TokenTINYINT, TokenSMALLINT, TokenMEDIUMINT, TokenBIGINT,
+		TokenREAL, TokenFLOAT, TokenDOUBLE, TokenNUMERIC, TokenDECIMAL,
+		TokenTEXT, TokenVARCHAR, TokenCHAR, TokenCHARACTER, TokenCLOB, TokenNCHAR, TokenNVARCHAR,
+		TokenBLOB, TokenBOOLEAN, TokenDATE, TokenTIME, TokenTIMESTAMP, TokenDATETIME,
+		TokenJSON, TokenJSONB:
+		return true
+	}
+	return false
 }
 
 // skipWhitespace skips spaces, tabs, and newlines.
@@ -327,9 +378,10 @@ func (l *Lexer) readQuotedIdentifier(quote byte) Token {
 // readBracketIdentifier reads a [bracket identifier] (SQL Server style).
 func (l *Lexer) readBracketIdentifier() Token {
 	tok := Token{
-		Type:   TokenIdent,
-		Line:   l.line,
-		Column: l.column,
+		Type:      TokenIdent,
+		Line:      l.line,
+		Column:    l.column,
+		Bracketed: true,
 	}
 
 	l.readChar() // skip [

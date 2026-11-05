@@ -11,12 +11,14 @@ import (
 
 	"github.com/goccy/go-json"
 
+	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/capabilities"
 	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
 	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqliteimport"
@@ -531,6 +533,21 @@ func sqlStateHTTPError(err error) *HTTPError {
 		return &HTTPError{
 			Status:  http.StatusBadRequest,
 			Code:    "0A000",
+			Message: message,
+		}
+	}
+	if errors.Is(err, pgerror.ErrInvalidText) {
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    pgerror.CodeInvalidText,
+			Message: message,
+		}
+	}
+	var analysisErr *analyzer.AnalysisError
+	if errors.Is(err, pgerror.ErrDatatypeMismatch) || (errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch) {
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    pgerror.CodeDatatypeMismatch,
 			Message: message,
 		}
 	}

@@ -12,9 +12,12 @@ import (
 // cycle cannot spin forever.
 const maxRecursiveCTEIterations = 1000
 
-// cteTable is a materialized common table expression.
+// cteTable is a materialized common table expression. types is positionally
+// aligned with columns and carries the result types the CTE's SELECT reported,
+// so array subscripts and comparisons in the outer query keep their typing.
 type cteTable struct {
 	columns []string
+	types   []string
 	rows    []storage.Row
 }
 
@@ -83,7 +86,7 @@ func (e *Executor) materializeCTE(cte *parser.CTE) error {
 	}
 
 	for i := 0; i < maxRecursiveCTEIterations; i++ {
-		e.cteTables[strings.ToLower(cte.Name)] = &cteTable{columns: cols, rows: working}
+		e.cteTables[strings.ToLower(cte.Name)] = &cteTable{columns: cols, types: anchor.ColumnTypes, rows: working}
 		recursive, err := e.executeSelect(compound.Right)
 		if err != nil {
 			return err
@@ -106,7 +109,7 @@ func (e *Executor) materializeCTE(cte *parser.CTE) error {
 		working = fresh
 	}
 
-	e.cteTables[strings.ToLower(cte.Name)] = &cteTable{columns: cols, rows: accumulated}
+	e.cteTables[strings.ToLower(cte.Name)] = &cteTable{columns: cols, types: anchor.ColumnTypes, rows: accumulated}
 	return nil
 }
 
@@ -117,7 +120,7 @@ func (e *Executor) registerCTEResult(name string, declared []string, res *Result
 	if len(cols) == 0 {
 		cols = res.Columns
 	}
-	e.cteTables[strings.ToLower(name)] = &cteTable{columns: cols, rows: resultToCTERows(res, cols)}
+	e.cteTables[strings.ToLower(name)] = &cteTable{columns: cols, types: res.ColumnTypes, rows: resultToCTERows(res, cols)}
 }
 
 // resultToCTERows maps each result row to a storage.Row keyed by cols
@@ -156,11 +159,11 @@ func (e *Executor) cteTableExists(name string) bool {
 }
 
 // materializeJoinSubquery runs a derived table used on the right side of a JOIN
-// and returns its rows and schema.
-func (e *Executor) materializeJoinSubquery(ref *parser.TableRef) ([]storage.Row, *storage.Schema, error) {
+// and returns its rows, schema, and the result column types.
+func (e *Executor) materializeJoinSubquery(ref *parser.TableRef) ([]storage.Row, *storage.Schema, []string, []string, error) {
 	res, err := e.executeSelect(ref.Subquery)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	rows := make([]storage.Row, 0, len(res.Rows))
 	for _, values := range res.Rows {
@@ -172,7 +175,11 @@ func (e *Executor) materializeJoinSubquery(ref *parser.TableRef) ([]storage.Row,
 		}
 		rows = append(rows, row)
 	}
-	return rows, schemaFromColumns(res.Columns), nil
+	schema := &storage.Schema{Name: "derived", Columns: make([]storage.Column, len(res.Columns))}
+	for i, col := range res.Columns {
+		schema.Columns[i] = storage.Column{Name: col, Type: typeAt(res.ColumnTypes, i)}
+	}
+	return rows, schema, res.Columns, res.ColumnTypes, nil
 }
 
 // cloneRows returns a shallow copy of each row so callers cannot mutate a

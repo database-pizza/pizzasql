@@ -419,3 +419,55 @@ func BenchmarkRowCodec(b *testing.B) {
 		}
 	})
 }
+
+// Array column values are canonical text, so the existing string encoding
+// carries them without a format change. NULL and the empty array stay distinct
+// through a reload, and identical arrays encode to identical bytes.
+func TestArrayTextRowsRoundTripWithoutFormatChange(t *testing.T) {
+	row := Row{"id": int64(1), "tags": "{a,b}", "nums": "{}"}
+	encoded, err := encodeRow(row)
+	if err != nil {
+		t.Fatalf("encodeRow: %v", err)
+	}
+	if !bytes.HasPrefix(encoded, []byte(rowMagic)) || encoded[len(rowMagic)] != rowVersion {
+		t.Fatal("array row should use the current binary encoding version")
+	}
+	decoded, err := decodeRow(encoded)
+	if err != nil {
+		t.Fatalf("decodeRow: %v", err)
+	}
+	if decoded["tags"] != "{a,b}" {
+		t.Fatalf("tags = %#v, want {a,b}", decoded["tags"])
+	}
+	if decoded["nums"] != "{}" {
+		t.Fatalf("empty array = %#v, want {}", decoded["nums"])
+	}
+
+	nullRow := Row{"v": nil}
+	emptyRow := Row{"v": "{}"}
+	encodedNull, err := encodeRow(nullRow)
+	if err != nil {
+		t.Fatalf("encodeRow NULL: %v", err)
+	}
+	encodedEmpty, err := encodeRow(emptyRow)
+	if err != nil {
+		t.Fatalf("encodeRow empty array: %v", err)
+	}
+	if bytes.Equal(encodedNull, encodedEmpty) {
+		t.Fatal("NULL and empty arrays must not share an encoding")
+	}
+	decodedNull, err := decodeRow(encodedNull)
+	if err != nil {
+		t.Fatalf("decodeRow NULL: %v", err)
+	}
+	if decodedNull["v"] != nil {
+		t.Fatalf("NULL array = %#v, want nil", decodedNull["v"])
+	}
+	decodedEmpty, err := decodeRow(encodedEmpty)
+	if err != nil {
+		t.Fatalf("decodeRow empty array: %v", err)
+	}
+	if decodedEmpty["v"] != "{}" {
+		t.Fatalf("empty array = %#v, want {}", decodedEmpty["v"])
+	}
+}

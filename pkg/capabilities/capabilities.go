@@ -205,14 +205,14 @@ func Current() *Document {
 			DateTime: true,
 			JSONText: true,
 			JSONB:    Feature{Supported: false, Status: "type_name_alias", Notes: "JSONB is accepted as a column type name with no native semantics; values are stored as text and reported as TEXT over the wire"},
-			Arrays:   Feature{Supported: false, Status: "rejected", SQLState: "0A000"},
+			Arrays:   Feature{Supported: true, Status: "one_dimensional", SQLState: "0A000", Notes: "column types TEXT[], VARCHAR(n)[], INTEGER[], BIGINT[], SMALLINT[], BOOLEAN[], REAL[], DOUBLE PRECISION[], and NUMERIC[] in CREATE TABLE and ALTER TABLE ADD COLUMN; values are PostgreSQL array text ({a,b},NULL) stored canonically, with NULL and the empty array distinct; literals, ARRAY[...], ::type[] and CAST(x AS type[]), 1-based arr[n], array_length(arr, 1), and unnest(array) as the single FROM table function are supported; multidimensional arrays, arrays of other element types, and ANY/ALL over subqueries are rejected with 0A000; malformed array input reports 22P02 and a non-integer subscript or array_length dimension reports 42804; NUMERIC[] and DECIMAL[] elements are validated but stored as their exact text, so digits above 2^53 and trailing zeros survive, and NUMERIC comparisons are exact (1.10 = 1.1, and digits above 2^53 are not rounded); column types survive derived tables, CTEs, and a derived table or CTE joined on the right for subscripts and comparisons (CHECK constraints and generated columns evaluate through the stateless evaluator without a table schema, so array subscripts there keep the element text); UNIQUE indexes and primary keys still use the canonical raw text, so 1.10 and 1.1 are distinct index keys even though they compare equal"},
 			RowID:    Feature{Supported: true, Status: "auto_assigned", Notes: "rowid/oid/_rowid_ are BIGINT over the wire; monotonic when the engine assigns the rowid, stable across UPDATE, not monotonic for client-assigned descending INTEGER PRIMARY KEY values"},
 		},
 
 		Parameters: Parameters{
 			Positional:    true,
-			MaxOID:        "int8/text/bool/bytea/float; arrays are rejected",
-			Arrays:        Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "id = ANY($1) is rejected; expand to IN (...) with individual parameters"},
+			MaxOID:        "int8/text/bool/bytea/float plus the array OIDs text[]/varchar[]/int4[]/int8[]/int2[]/bool[]/float4[]/float8[]/numeric[]",
+			Arrays:        Feature{Supported: true, Status: "text_format", SQLState: "0A000", Notes: "a text-format array parameter is bound as a typed array literal, so id = ANY($1) works with OIDs 1009 text[], 1015 varchar[], 1007 int4[], 1016 int8[], 1005 int2[], 1000 bool[], 1021 float4[], 1022 float8[], and 1231 numeric[]; elements are validated and canonicalized; binary-format array parameters are rejected with 0A000 instead of being misread"},
 			BinaryNumeric: true,
 		},
 

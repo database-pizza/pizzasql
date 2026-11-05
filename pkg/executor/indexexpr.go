@@ -125,6 +125,23 @@ func ValidateDeterministicExpr(expr parser.Expr) error {
 		return ValidateDeterministicExpr(e.Else)
 	case *parser.CastExpr:
 		return ValidateDeterministicExpr(e.Expr)
+	case *parser.ArrayExpr:
+		for _, element := range e.Elements {
+			if err := ValidateDeterministicExpr(element); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *parser.SubscriptExpr:
+		if err := ValidateDeterministicExpr(e.Expr); err != nil {
+			return err
+		}
+		return ValidateDeterministicExpr(e.Index)
+	case *parser.AnyAllExpr:
+		if err := ValidateDeterministicExpr(e.Left); err != nil {
+			return err
+		}
+		return ValidateDeterministicExpr(e.Array)
 	case *parser.InExpr:
 		if e.Subquery != nil {
 			return fmt.Errorf("subqueries are not allowed in index expressions")
@@ -188,6 +205,7 @@ var deterministicFunctions = map[string]bool{
 	"REPLACE": true, "PRINTF": true, "HEX": true, "UNHEX": true,
 	"ZEROBLOB": true, "INSTR": true, "GLOB": true, "ROUND": true,
 	"MAX": true, "MIN": true, "CONCAT": true, "PERCENT_DIFF": true,
+	"ARRAY_LENGTH": true,
 	// JSON1 scalar functions.
 	"JSON": true, "JSONB": true, "JSON_VALID": true, "JSONB_VALID": true,
 	"JSON_TYPE": true, "JSON_EXTRACT": true, "JSONB_EXTRACT": true,
@@ -266,6 +284,23 @@ func ValidateIndexColumns(expr parser.Expr, schema *storage.Schema) error {
 		return ValidateIndexColumns(e.Else, schema)
 	case *parser.CastExpr:
 		return ValidateIndexColumns(e.Expr, schema)
+	case *parser.ArrayExpr:
+		for _, element := range e.Elements {
+			if err := ValidateIndexColumns(element, schema); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *parser.SubscriptExpr:
+		if err := ValidateIndexColumns(e.Expr, schema); err != nil {
+			return err
+		}
+		return ValidateIndexColumns(e.Index, schema)
+	case *parser.AnyAllExpr:
+		if err := ValidateIndexColumns(e.Left, schema); err != nil {
+			return err
+		}
+		return ValidateIndexColumns(e.Array, schema)
 	case *parser.InExpr:
 		if err := ValidateIndexColumns(e.Left, schema); err != nil {
 			return err

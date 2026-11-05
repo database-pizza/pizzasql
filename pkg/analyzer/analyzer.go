@@ -294,6 +294,27 @@ func (a *Analyzer) resolveFromClause(tables []parser.TableRef) error {
 // defineTableRef adds a single FROM/JOIN table to scope. The reference may be a
 // derived table (subquery), a CTE, or a real catalog table.
 func (a *Analyzer) defineTableRef(ref parser.TableRef) error {
+	if ref.Function != nil {
+		for _, arg := range ref.Function.Args {
+			if _, err := a.analyzeExpr(arg); err != nil {
+				return err
+			}
+		}
+		// unnest() produces one column with the function's name, matching
+		// PostgreSQL's output column name.
+		a.scope.DefineTable(&TableInfo{
+			Name:  ref.Name,
+			Alias: ref.Alias,
+			Columns: []ColumnInfo{{
+				Name:      strings.ToLower(ref.Function.Name),
+				Type:      TypeAny,
+				Nullable:  true,
+				TableName: ref.Name,
+			}},
+		})
+		return nil
+	}
+
 	if ref.Subquery != nil {
 		if err := a.analyzeSelect(ref.Subquery); err != nil {
 			return err
@@ -342,11 +363,11 @@ func (a *Analyzer) derivedTableInfo(ref parser.TableRef) *TableInfo {
 			for _, tref := range collectAllTableRefs(leg.From) {
 				if t, ok := a.scope.LookupTable(tref.Name); ok {
 					for _, c := range t.Columns {
-						info.Columns = append(info.Columns, ColumnInfo{Name: c.Name, TableName: ref.Alias, Type: c.Type})
+						info.Columns = append(info.Columns, ColumnInfo{Name: c.Name, TableName: ref.Alias, Type: c.Type, Array: c.Array})
 					}
 				} else if t, ok := a.catalog.GetTable(tref.Name); ok {
 					for _, c := range t.Columns {
-						info.Columns = append(info.Columns, ColumnInfo{Name: c.Name, TableName: ref.Alias, Type: c.Type})
+						info.Columns = append(info.Columns, ColumnInfo{Name: c.Name, TableName: ref.Alias, Type: c.Type, Array: c.Array})
 					}
 				}
 			}
@@ -726,6 +747,7 @@ func (a *Analyzer) analyzeCreateTable(stmt *parser.CreateTableStmt) error {
 			Nullable:  true,
 			TableName: stmt.Table.Name,
 			Generated: colDef.GeneratedExpr != nil,
+			Array:     colDef.Type.Array,
 		}
 
 		// Process constraints
@@ -844,6 +866,12 @@ func (a *Analyzer) analyzeExpr(expr parser.Expr) (*ExprInfo, error) {
 		}, nil
 	case *parser.ExistsExpr:
 		return a.analyzeExistsExpr(e)
+	case *parser.ArrayExpr:
+		return a.analyzeArrayExpr(e)
+	case *parser.SubscriptExpr:
+		return a.analyzeSubscriptExpr(e)
+	case *parser.AnyAllExpr:
+		return a.analyzeAnyAllExpr(e)
 	case *parser.SubqueryExpr:
 		return a.analyzeSubqueryExpr(e)
 	case *parser.WindowExpr:
@@ -851,6 +879,67 @@ func (a *Analyzer) analyzeExpr(expr parser.Expr) (*ExprInfo, error) {
 	default:
 		return &ExprInfo{Type: TypeUnknown}, nil
 	}
+}
+
+// analyzeArrayExpr validates every element of an ARRAY[...] constructor.
+func (a *Analyzer) analyzeArrayExpr(e *parser.ArrayExpr) (*ExprInfo, error) {
+	info := &ExprInfo{Type: TypeUnknown, Array: true}
+	for _, element := range e.Elements {
+		elementInfo, err := a.analyzeExpr(element)
+		if err != nil {
+			return nil, err
+		}
+		if elementInfo.IsAggregate {
+			info.IsAggregate = true
+		}
+		if elementInfo.Nullable || element == nil {
+			info.Nullable = true
+		}
+		if elementInfo.Type != TypeNull {
+			info.Type = elementInfo.Type
+		}
+	}
+	return info, nil
+}
+
+// analyzeSubscriptExpr validates the array expression and the index of arr[idx].
+func (a *Analyzer) analyzeSubscriptExpr(e *parser.SubscriptExpr) (*ExprInfo, error) {
+	arrayInfo, err := a.analyzeExpr(e.Expr)
+	if err != nil {
+		return nil, err
+	}
+	indexInfo, err := a.analyzeExpr(e.Index)
+	if err != nil {
+		return nil, err
+	}
+	if indexInfo.Type != TypeUnknown && indexInfo.Type != TypeNull && !indexInfo.Type.IsNumeric() {
+		return nil, &AnalysisError{
+			Type:    ErrTypeMismatch,
+			Message: "array subscript must be an integer expression",
+		}
+	}
+	return &ExprInfo{
+		Type:        arrayInfo.Type,
+		IsAggregate: arrayInfo.IsAggregate || indexInfo.IsAggregate,
+		Nullable:    true,
+	}, nil
+}
+
+// analyzeAnyAllExpr validates both sides of a quantified comparison.
+func (a *Analyzer) analyzeAnyAllExpr(e *parser.AnyAllExpr) (*ExprInfo, error) {
+	leftInfo, err := a.analyzeExpr(e.Left)
+	if err != nil {
+		return nil, err
+	}
+	arrayInfo, err := a.analyzeExpr(e.Array)
+	if err != nil {
+		return nil, err
+	}
+	return &ExprInfo{
+		Type:        TypeBoolean,
+		IsAggregate: leftInfo.IsAggregate || arrayInfo.IsAggregate,
+		Nullable:    true,
+	}, nil
 }
 
 // analyzeWindowExpr analyzes a window function. Window functions are not
@@ -940,6 +1029,7 @@ func (a *Analyzer) analyzeColumnRef(e *parser.ColumnRef) (*ExprInfo, error) {
 	return &ExprInfo{
 		Type:     col.Type,
 		Nullable: col.Nullable,
+		Array:    col.Array,
 	}, nil
 }
 
@@ -989,9 +1079,12 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 			}
 		}
 	case lexer.TokenEq, lexer.TokenNeq, lexer.TokenLt, lexer.TokenLte, lexer.TokenGt, lexer.TokenGte:
-		// Comparison operators
+		// Comparison operators. A text literal is accepted against an array
+		// column: the runtime coerces and canonicalizes the literal to the
+		// column's array type, so `nums = '{3,4}'` compares arrays rather than
+		// INTEGER with TEXT.
 		info.Type = TypeBoolean
-		if !left.Type.IsComparable(right.Type) {
+		if !comparisonTypesCompatible(left, right) {
 			return nil, &AnalysisError{
 				Type:    ErrTypeMismatch,
 				Message: fmt.Sprintf("cannot compare %s with %s", left.Type, right.Type),
@@ -1023,6 +1116,30 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 	}
 
 	return info, nil
+}
+
+// comparisonTypesCompatible reports whether two comparison operands can be
+// compared. Arrays only compare with arrays or with text that can be read as
+// array text, so `nums = '{3,4}'` is accepted while `nums = 5` is not.
+func comparisonTypesCompatible(left, right *ExprInfo) bool {
+	if left.Array || right.Array {
+		return (left.Array && right.Array) || arrayLiteralComparison(left, right)
+	}
+	return left.Type.IsComparable(right.Type)
+}
+
+// arrayLiteralComparison reports whether one side is an array expression and the
+// other is a text expression that can be read as array text.
+func arrayLiteralComparison(left, right *ExprInfo) bool {
+	textCoercible := func(info *ExprInfo) bool {
+		switch info.Type {
+		case TypeText, TypeUnknown, TypeNull, TypeAny:
+			return true
+		default:
+			return false
+		}
+	}
+	return (left.Array && textCoercible(right)) || (right.Array && textCoercible(left))
 }
 
 func (a *Analyzer) analyzeUnaryExpr(e *parser.UnaryExpr) (*ExprInfo, error) {
@@ -1200,6 +1317,7 @@ func (a *Analyzer) analyzeCastExpr(e *parser.CastExpr) (*ExprInfo, error) {
 		IsAggregate: exprInfo.IsAggregate,
 		IsConstant:  exprInfo.IsConstant,
 		Nullable:    exprInfo.Nullable,
+		Array:       e.Type.Array,
 	}, nil
 }
 

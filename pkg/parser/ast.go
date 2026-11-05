@@ -87,6 +87,9 @@ type TableRef struct {
 	Alias    string
 	Subquery *SelectStmt // for derived tables (SELECT ... FROM (SELECT ...) AS alias)
 	Join     *JoinClause // for joined tables
+	// Function is set for a table function in FROM (currently only unnest()).
+	// Name holds the function name so ordinary table dispatch ignores it.
+	Function *FunctionCall
 }
 
 // JoinClause represents a JOIN clause.
@@ -208,8 +211,19 @@ type ColumnDef struct {
 // DataType represents a SQL data type.
 type DataType struct {
 	Name      string
-	Precision int // for VARCHAR(n), NUMERIC(p,s)
-	Scale     int // for NUMERIC(p,s)
+	Precision int  // for VARCHAR(n), NUMERIC(p,s)
+	Scale     int  // for NUMERIC(p,s)
+	Array     bool // trailing [] declares a one-dimensional array
+}
+
+// SQLTypeName returns the type name as it is persisted in the catalog: the
+// base name plus a [] suffix for arrays. Precision and scale are not part of
+// the catalog shape because the engine does not enforce them.
+func (d DataType) SQLTypeName() string {
+	if d.Array {
+		return d.Name + "[]"
+	}
+	return d.Name
 }
 
 // ColumnConstraint represents a column-level constraint.
@@ -672,6 +686,36 @@ type ExistsExpr struct {
 
 func (e *ExistsExpr) node()     {}
 func (e *ExistsExpr) exprNode() {}
+
+// ArrayExpr represents the ARRAY[...] constructor. Elements are evaluated as
+// ordinary expressions; NULL elements survive as NULL array elements.
+type ArrayExpr struct {
+	Elements []Expr
+}
+
+func (e *ArrayExpr) node()     {}
+func (e *ArrayExpr) exprNode() {}
+
+// SubscriptExpr represents a 1-based array element access, arr[index].
+type SubscriptExpr struct {
+	Expr  Expr
+	Index Expr
+}
+
+func (e *SubscriptExpr) node()     {}
+func (e *SubscriptExpr) exprNode() {}
+
+// AnyAllExpr represents `left op ANY(array)` (All=false) or
+// `left op ALL(array)` (All=true). It evaluates with SQL three-valued logic.
+type AnyAllExpr struct {
+	Left  Expr
+	Op    lexer.TokenType
+	All   bool
+	Array Expr
+}
+
+func (e *AnyAllExpr) node()     {}
+func (e *AnyAllExpr) exprNode() {}
 
 // ParenExpr represents a parenthesized expression.
 type ParenExpr struct {

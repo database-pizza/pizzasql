@@ -89,6 +89,8 @@ const (
 	ErrCodeDuplicateTable       = "42P07"
 	ErrCodeDuplicateColumn      = "42701"
 	ErrCodeInvalidParameter     = "22023"
+	ErrCodeInvalidText          = "22P02"
+	ErrCodeDatatypeMismatch     = "42804"
 	ErrCodeInternalError        = "XX000"
 	ErrCodeConnectionFailure    = "08006"
 	ErrCodeProtocolViolation    = "08P01"
