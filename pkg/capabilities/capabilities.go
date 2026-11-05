@@ -179,7 +179,7 @@ func Current() *Document {
 			AddColumnBackfill:      Feature{Supported: false, Status: "no_backfill", Notes: "existing rows read NULL; a DEFAULT applies to later INSERTs only"},
 			DropColumn:             Feature{Supported: true, Status: "rewrites_rows"},
 			RenameColumn:           Feature{Supported: true, Status: "rewrites_rows"},
-			RenameColumnIndexes:    Feature{Supported: false, Status: "stale_index_metadata", Notes: "drop and recreate indexes that reference a renamed column"},
+			RenameColumnIndexes:    Feature{Supported: true, Status: "rewrites_index_metadata", Notes: "column references in index definitions are rewritten in place, including composite and unique indexes; index names are unchanged; RENAME COLUMN is rejected when an expression index references the column (drop that index, rename, then recreate it)"},
 			CreateTableIfNotExists: true,
 			AddColumnIfNotExists:   true,
 		},

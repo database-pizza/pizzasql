@@ -1152,10 +1152,14 @@ func (m *SchemaManager) renameDataKeys(oldName, newName string) error {
 	})
 }
 
-// repointIndexesLocked updates indexes whose table was renamed. The caller holds
-// m.mu; it reads the durable index list directly rather than calling the
-// self-locking ListIndexes helper.
-func (m *SchemaManager) repointIndexesLocked(oldName, newName string) error {
+// updateIndexesOfTableLocked applies mutate to the durable definition of every
+// index on table and persists the definitions it changed. mutate reports
+// whether it modified the definition; unmodified indexes are left untouched.
+// The changed definitions are written in one batch, so a table's indexes never
+// split between the old and new shape. The caller holds m.mu; it reads the
+// durable index list directly rather than calling the self-locking ListIndexes
+// helper.
+func (m *SchemaManager) updateIndexesOfTableLocked(table string, mutate func(*Index) bool) error {
 	var names []string
 	if m.indexListCached {
 		names = append([]string(nil), m.indexListCache...)
@@ -1177,6 +1181,12 @@ func (m *SchemaManager) repointIndexesLocked(oldName, newName string) error {
 		}
 	}
 
+	type indexUpdate struct {
+		index Index
+		key   string
+		value []byte
+	}
+	var updates []indexUpdate
 	for _, name := range names {
 		key := m.indexKey(name)
 		var data string
@@ -1195,27 +1205,74 @@ func (m *SchemaManager) repointIndexesLocked(oldName, newName string) error {
 		if err := json.Unmarshal([]byte(data), &idx); err != nil {
 			return err
 		}
-		if !strings.EqualFold(idx.Table, oldName) {
+		if !strings.EqualFold(idx.Table, table) {
 			continue
 		}
-		idx.Table = newName
+		if !mutate(&idx) {
+			continue
+		}
 		updated, err := json.Marshal(&idx)
 		if err != nil {
 			return err
 		}
-		if err := m.pool.WithClient(func(c *KVClient) error {
-			return c.Write(key, string(updated))
-		}); err != nil {
-			return err
-		}
-		if cached, ok := m.indexCache[strings.ToLower(name)]; ok {
-			cached.Table = newName
+		updates = append(updates, indexUpdate{index: idx, key: key, value: updated})
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	ops := make([]BatchOp, 0, len(updates))
+	for _, update := range updates {
+		ops = append(ops, BatchOp{Op: batchPut, Key: []byte(update.key), Value: update.value})
+	}
+	if err := m.pool.WithClient(func(c *KVClient) error {
+		_, err := c.BatchWrite(ops, nil)
+		return err
+	}); err != nil {
+		return fmt.Errorf("update index definitions for table %s: %w", table, err)
+	}
+
+	for _, update := range updates {
+		if cached, ok := m.indexCache[strings.ToLower(update.index.Name)]; ok {
+			*cached = update.index
 		}
 	}
 	return nil
 }
 
-// RenameColumn renames a column in a table.
+// repointIndexesLocked updates indexes whose table was renamed.
+func (m *SchemaManager) repointIndexesLocked(oldName, newName string) error {
+	return m.updateIndexesOfTableLocked(oldName, func(idx *Index) bool {
+		idx.Table = newName
+		return true
+	})
+}
+
+// renameIndexColumnsLocked rewrites the stored definition of every index on
+// table so a reference to oldName becomes newName. Index names stay unchanged:
+// they are independent identifiers that SQLite does not derive from column
+// names, and callers may have chosen them explicitly. A rename to an existing
+// column name is rejected before this runs. Expression columns keep their SQL
+// text; callers must reject a rename that such an expression depends on,
+// because the text is not rewritten.
+func (m *SchemaManager) renameIndexColumnsLocked(table, oldName, newName string) error {
+	return m.updateIndexesOfTableLocked(table, func(idx *Index) bool {
+		changed := false
+		for i := range idx.Columns {
+			// Expression columns persist SQL text, not a column reference; their
+			// text is left for the caller to drop and recreate the index.
+			if idx.Columns[i].Expression == "" && strings.EqualFold(idx.Columns[i].Name, oldName) {
+				idx.Columns[i].Name = newName
+				changed = true
+			}
+		}
+		return changed
+	})
+}
+
+// RenameColumn renames a column in a table. Column references in index
+// definitions are rewritten; expression-index text is not, so a SQL caller must
+// reject a rename that an expression depends on.
 func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 	tableLock := m.tableLock(table)
 	tableLock.Lock()
@@ -1268,8 +1325,18 @@ func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 		return err
 	}
 
-	// Update schema
-	return m.updateSchemaUnsafe(schema)
+	// Publish the renamed schema before the index definitions: reads of the new
+	// column name resolve against rewritten rows as soon as the schema lands.
+	// Index DDL is not transactional (as elsewhere in this engine), so a failure
+	// here leaves stale index metadata for the caller to drop and recreate.
+	if err := m.updateSchemaUnsafe(schema); err != nil {
+		return err
+	}
+
+	// Index metadata drives secondary-index values, UNIQUE enforcement,
+	// ON CONFLICT target resolution, and catalog introspection, so it must name
+	// the renamed column before any later statement uses the table.
+	return m.renameIndexColumnsLocked(table, oldName, newName)
 }
 
 // rewriteRows applies an idempotent name-keyed row transformation in bounded

@@ -383,6 +383,7 @@ func TestAnalyzeInsertErrors(t *testing.T) {
 	}{
 		{"table not found", "INSERT INTO nonexistent VALUES (1)", ErrTableNotFound},
 		{"column not found", "INSERT INTO users (nonexistent) VALUES (1)", ErrColumnNotFound},
+		{"unknown on conflict target", "INSERT INTO users (id, name) VALUES (1, 'a') ON CONFLICT (nonexistent) DO NOTHING", ErrColumnNotFound},
 		{"wrong column count", "INSERT INTO users (id, name) VALUES (1)", ErrTypeMismatch},
 	}
 

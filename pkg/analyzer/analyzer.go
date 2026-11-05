@@ -522,6 +522,19 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 		}
 	}
 
+	// An ON CONFLICT target names columns of the target table. An unknown name
+	// must fail the statement rather than silently degrading to a scan. The
+	// hidden rowid aliases are valid targets unless a real column shadows them.
+	for _, colName := range stmt.ConflictTarget {
+		if _, ok := table.GetColumn(colName); ok || isRowIDAlias(colName) {
+			continue
+		}
+		return &AnalysisError{
+			Type:    ErrColumnNotFound,
+			Message: fmt.Sprintf("column not found: %s", colName),
+		}
+	}
+
 	// Validate VALUES
 	for _, row := range stmt.Values {
 		if len(row) != len(targetCols) {
