@@ -586,7 +586,7 @@ func (e *Executor) parsedArray(expr parser.Expr, value interface{}) ([]*string, 
 
 // isNumericExprType reports whether an expression's declared type is NUMERIC or
 // DECIMAL, which compares exactly instead of through float64. CAST(... AS
-// NUMERIC) is included even though its result metadata stays unchanged: the
+// NUMERIC) is included even though its result metadata advertises float8: the
 // cast leaves the value's carrier alone, but comparisons still mean decimal.
 func (e *Executor) isNumericExprType(expr parser.Expr) bool {
 	switch x := expr.(type) {

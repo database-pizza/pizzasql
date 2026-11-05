@@ -1600,7 +1600,12 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 		return arrayOIDForElement(element)
 	}
 	switch strings.ToUpper(typeName) {
-	case "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+	case "INT2":
+		// The executor's exact-width spelling for a SMALLINT cast whose
+		// constant value fits int2. A SMALLINT column is grouped below because
+		// its stored values are not range-checked.
+		return 21 // INT2OID
+	case "SMALLINT", "TINYINT", "MEDIUMINT":
 		// Carried as int64 and not range-checked, so int8 is the honest type.
 		return 20 // INT8OID
 	case "INTEGER", "INT", "INT4":
@@ -1653,7 +1658,9 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 		return -1 // arrays are variable length
 	}
 	switch strings.ToUpper(typeName) {
-	case "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+	case "INT2":
+		return 2 // Exact int2 cast result; see getOIDForType.
+	case "SMALLINT", "TINYINT", "MEDIUMINT":
 		return 8 // Reported as int8; see getOIDForType.
 	case "INTEGER", "INT", "INT4":
 		return 4

@@ -1598,8 +1598,13 @@ func (e *Executor) executeCompound(c *parser.CompoundSelect) (*Result, error) {
 		result.AddColumn(col)
 	}
 	// A compound SELECT reports the left branch's projection metadata, as
-	// PostgreSQL does: the set operation does not retype its columns.
+	// PostgreSQL does: the set operation does not retype its columns. A union
+	// also carries the right branch's values, so an exact-width type the left
+	// branch proved widens back to its carrier.
 	result.ColumnTypes = append([]string(nil), left.ColumnTypes...)
+	if c.Op == parser.SetOpUnion || c.Op == parser.SetOpUnionAll {
+		result.ColumnTypes = carrierColumnTypes(result.ColumnTypes)
+	}
 
 	switch c.Op {
 	case parser.SetOpUnion:

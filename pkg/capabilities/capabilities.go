@@ -105,6 +105,7 @@ type Types struct {
 	Integer  bool    `json:"integer"`
 	Bigint   bool    `json:"bigint"`
 	Real     bool    `json:"real"`
+	Numeric  Feature `json:"numeric"`
 	Text     bool    `json:"text"`
 	Blob     bool    `json:"blob"`
 	Boolean  bool    `json:"boolean"`
@@ -225,6 +226,7 @@ func Current() *Document {
 			Integer:  true,
 			Bigint:   true,
 			Real:     true,
+			Numeric:  Feature{Supported: true, Status: "float8_backed", Notes: "a scalar NUMERIC or DECIMAL value is carried as float64 and reported as float8 (OID 701), so a client scans it as float64: trailing zeros, scale beyond float64 precision, and magnitudes above 2^53 are not preserved; CAST(x AS NUMERIC/DECIMAL) reports the same float8 result; NUMERIC[] and DECIMAL[] keep their exact decimal text and report numeric[] (OID 1231), validated and canonicalized per element; NUMERIC-typed comparisons, including CAST(... AS NUMERIC), stay exact"},
 			Text:     true,
 			Blob:     true,
 			Boolean:  true,

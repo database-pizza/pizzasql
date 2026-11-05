@@ -507,6 +507,17 @@ curl -X POST "http://localhost:8080/import?format=sqlite" \
 
 **Data Types:** `INTEGER` (INT, BIGINT, BOOLEAN) · `REAL` (FLOAT, DOUBLE, DECIMAL) · `TEXT` (VARCHAR, CHAR) · `BLOB` · `NUMERIC`
 
+**Result type OIDs:** a scalar `NUMERIC`/`DECIMAL` value is carried as float64 and
+reported as `float8` (OID 701), so a client scans it as `float64`. Trailing zeros,
+scale beyond float64 precision, and magnitudes above 2^53 are not preserved for
+scalars; `CAST(x AS NUMERIC)` reports the same `float8` result. `NUMERIC[]` and
+`DECIMAL[]` keep exact decimal text and report `numeric[]` (OID 1231). A literal
+cast reports its declared type when the value fits the engine's carrier
+(`1::SMALLINT` → `int2`, `1::INTEGER` → `int4`, `1.5::REAL` → `float4`,
+`1.5::DOUBLE` → `float8`); a cast over a column or parameter, or a literal that
+does not fit, reports the `int8`/`float8` carrier instead. `INTEGER` and `REAL`
+columns keep their declared OIDs (23 and 700).
+
 **Joins:** INNER · LEFT · RIGHT · FULL OUTER · CROSS
 
 **Aggregates:** COUNT · COUNT(DISTINCT) · SUM · AVG · MIN · MAX

@@ -18,9 +18,10 @@ func TestGetOIDForTypeDatetime(t *testing.T) {
 		"TIMESTAMP": 1184,
 		"DATE":      1082,
 		// Integer types narrower than the int64 carrier report int8 because the
-		// engine does not range-check stored values.
+		// engine does not range-check stored values. INT2 is the executor's
+		// exact-width spelling for a constant SMALLINT cast that fits int2.
 		"SMALLINT":  20,
-		"INT2":      20,
+		"INT2":      21,
 		"TINYINT":   20,
 		"MEDIUMINT": 20,
 		"INTEGER":   23,
@@ -137,6 +138,7 @@ func TestGetTypeSizeForType(t *testing.T) {
 		"MEDIUMINT": 8,
 		"INTEGER":   4,
 		"BIGINT":    8,
+		"INT2":      2,
 		"REAL":      4,
 		"DOUBLE":    8,
 		"NUMERIC":   8,
