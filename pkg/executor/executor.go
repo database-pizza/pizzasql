@@ -638,13 +638,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// Optimize constant WHERE clauses
 	var constantWhereResult *bool
-	if stmt.Where != nil && !isMultiTable {
-		// Check if WHERE clause is a constant expression (doesn't reference any columns)
-		refs := collectColumnRefs(stmt.Where)
-		if len(refs) == 0 {
-			// Evaluate the constant expression
+	if stmt.Where != nil {
+		// A WHERE clause that references no column is constant: evaluate it once.
+		// A failure is a statement error, not a filter that drops every row;
+		// only the single-table shape short-circuits on the resulting value.
+		if refs := collectColumnRefs(stmt.Where); len(refs) == 0 {
 			val, err := e.evalExpr(stmt.Where, nil)
-			if err == nil {
+			if err != nil {
+				return nil, err
+			}
+			if !isMultiTable {
 				result := toBool(val)
 				constantWhereResult = &result
 			}
@@ -864,7 +867,12 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		if effectiveWhere != nil {
 			var filtered []storage.Row
 			for _, row := range rows {
-				val, _ := e.evalExpr(effectiveWhere, row)
+				val, ferr := e.evalExpr(effectiveWhere, row)
+				if ferr != nil {
+					// A failing predicate is a statement error, not a
+					// non-matching row.
+					return nil, ferr
+				}
 				if toBool(val) {
 					filtered = append(filtered, row)
 				}
@@ -1012,7 +1020,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		}
 
 		// Helper: inline cross-join two row-sets, applying a predicate.
-		inlineJoin := func(left, right []storage.Row, pred parser.Expr) []storage.Row {
+		inlineJoin := func(left, right []storage.Row, pred parser.Expr) ([]storage.Row, error) {
 			out := make([]storage.Row, 0, len(left))
 			for _, l := range left {
 				for _, r := range right {
@@ -1024,7 +1032,12 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 						m[k] = v
 					}
 					if pred != nil {
-						val, _ := e.evalExpr(pred, m)
+						val, perr := e.evalExpr(pred, m)
+						if perr != nil {
+							// A failing predicate is a statement error, not a
+							// non-matching row.
+							return nil, perr
+						}
 						if !toBool(val) {
 							continue
 						}
@@ -1032,7 +1045,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					out = append(out, m)
 				}
 			}
-			return out
+			return out, nil
 		}
 
 		// Pre-join connected components of "cross-only" tables (0 single-table filters,
@@ -1181,7 +1194,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if len(appl) > 0 {
 					pred = combineAND(appl)
 				}
-				seedRows = inlineJoin(seedRows, nextRows, pred)
+				seedRows, err = inlineJoin(seedRows, nextRows, pred)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			virtuals = append(virtuals, virtualUnit{tableIdxs: vSeen, rows: seedRows})
@@ -1263,7 +1279,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				pred := combineAND(tableFilters[first])
 				var filtered []storage.Row
 				for _, row := range rows {
-					val, _ := e.evalExpr(pred, row)
+					val, ferr := e.evalExpr(pred, row)
+					if ferr != nil {
+						return nil, ferr
+					}
 					if toBool(val) {
 						filtered = append(filtered, row)
 					}
@@ -1288,7 +1307,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					pred := combineAND(tableFilters[idx])
 					var filtered []storage.Row
 					for _, row := range rightRows {
-						val, _ := e.evalExpr(pred, row)
+						val, ferr := e.evalExpr(pred, row)
+						if ferr != nil {
+							return nil, ferr
+						}
 						if toBool(val) {
 							filtered = append(filtered, row)
 						}
@@ -1302,7 +1324,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if len(appl) > 0 {
 					pred = combineAND(appl)
 				}
-				rows = inlineJoin(rows, rightRows, pred)
+				rows, err = inlineJoin(rows, rightRows, pred)
+				if err != nil {
+					return nil, err
+				}
 			}
 		} else {
 			// All tables were pre-joined; start with empty placeholder.
@@ -1320,7 +1345,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			if len(appl) > 0 {
 				pred = combineAND(appl)
 			}
-			rows = inlineJoin(rows, vu.rows, pred)
+			rows, err = inlineJoin(rows, vu.rows, pred)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// Apply any remaining conditions (shouldn't normally happen).
@@ -1328,7 +1356,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			pred := combineAND(remaining)
 			var filtered []storage.Row
 			for _, row := range rows {
-				val, _ := e.evalExpr(pred, row)
+				val, ferr := e.evalExpr(pred, row)
+				if ferr != nil {
+					return nil, ferr
+				}
 				if toBool(val) {
 					filtered = append(filtered, row)
 				}

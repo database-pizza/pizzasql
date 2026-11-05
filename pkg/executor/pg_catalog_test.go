@@ -557,6 +557,22 @@ func TestPGCatalogUndefinedRelationError(t *testing.T) {
 		`SELECT 'missing_type'::regtype`,
 		`SELECT count(*) FROM pg_class WHERE oid = 'missing_relation'::regclass`,
 		`SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE a.attrelid = 'missing_relation'::regclass`,
+		// A constant predicate that fails is a statement error even when the
+		// table has no rows to evaluate it against.
+		`SELECT count(*) FROM orders WHERE 'missing_relation'::regclass IS NOT NULL`,
+	} {
+		_, err := execSQL(e, sql)
+		if !errors.Is(err, pgerror.ErrUndefinedTable) {
+			t.Fatalf("%s: err = %v, want an undefined_table error", sql, err)
+		}
+	}
+
+	// A failing predicate in a join is a statement error too, not a filter that
+	// silently returns 0 rows.
+	execMust(t, e, "INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'z')")
+	for _, sql := range []string{
+		`SELECT * FROM pairs p1 JOIN pairs p2 ON true WHERE 'missing_relation'::regclass IS NOT NULL`,
+		`SELECT * FROM pairs p1, pairs p2 WHERE 'missing_relation'::regclass IS NOT NULL`,
 	} {
 		_, err := execSQL(e, sql)
 		if !errors.Is(err, pgerror.ErrUndefinedTable) {
