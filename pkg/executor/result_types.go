@@ -33,6 +33,12 @@ func (e *Executor) snapshotTypeResolver(refs []parser.TableRef) columnTypeResolv
 		if e.cteTableExists(ref.Name) {
 			continue
 		}
+		// A virtual catalog relation has no durable schema: its columns come from
+		// catalog metadata, and asking the session for them from inside a locked
+		// scan would deadlock on the session lock the scan already holds.
+		if _, ok := e.catalogRelationFor(ref); ok {
+			continue
+		}
 		schema, err := e.session.GetSchema(ref.Name)
 		if err != nil {
 			continue
@@ -387,6 +393,14 @@ func castResultType(name string) (string, bool) {
 		return "BLOB", true
 	case "JSONB":
 		return "JSONB", true
+	case "REGCLASS":
+		return "REGCLASS", true
+	case "REGTYPE":
+		return "REGTYPE", true
+	case "OID":
+		return "OID", true
+	case "NAME":
+		return "NAME", true
 	default:
 		return "", false
 	}
@@ -477,6 +491,10 @@ func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) str
 		// These return one of the input values unchanged, so the result type
 		// follows the first argument (and therefore keeps JSONB).
 		return firstArgType(fn, resolve)
+	case "TO_REGCLASS":
+		return "REGCLASS"
+	case "TO_REGTYPE":
+		return "REGTYPE"
 	default:
 		return "TEXT"
 	}

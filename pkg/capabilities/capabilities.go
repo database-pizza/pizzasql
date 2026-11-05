@@ -41,6 +41,7 @@ type Document struct {
 	DDL           DDL               `json:"ddl"`
 	Transactions  Transactions      `json:"transactions"`
 	Types         Types             `json:"types"`
+	Catalog       Catalog           `json:"catalog"`
 	Parameters    Parameters        `json:"parameters"`
 	JSON          JSON              `json:"json"`
 	ErrorCodes    map[string]string `json:"error_codes"`
@@ -114,6 +115,18 @@ type Types struct {
 	RowID    Feature `json:"rowid"`
 }
 
+// Catalog describes the read-only PostgreSQL catalog emulation used by ORM and
+// migration introspection.
+type Catalog struct {
+	PgCatalog         Feature  `json:"pg_catalog"`
+	InformationSchema Feature  `json:"information_schema"`
+	Relations         []string `json:"relations"`
+	Functions         []string `json:"functions"`
+	OIDStrategy       string   `json:"oid_strategy"`
+	Writable          bool     `json:"writable"`
+	SetStatements     Feature  `json:"set_statements"`
+}
+
 type Parameters struct {
 	Positional    bool    `json:"positional"`
 	MaxOID        string  `json:"max_oid"`
@@ -183,8 +196,8 @@ func Current() *Document {
 			Unique:        Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "unique indexes, INLINE UNIQUE, and ON CONFLICT are enforced atomically"},
 			PrimaryKey:    Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "inline and table-level single-column keys; INTEGER PRIMARY KEY remains the rowid alias"},
 			CompositePK:   Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "table-level PRIMARY KEY (a, b) with ordered columns; key columns are implicitly NOT NULL (23502) and a composite key is never a rowid alias; two inline PRIMARY KEY declarations or an inline/table-level mix are rejected with 0A000; the key is durable under a length-prefixed encoding and reported by PRAGMA table_info pk ordinals and sqlite_master table SQL, but no implicit index is created for it; a conflict target that names the key columns matches them in any order, and ON CONFLICT DO UPDATE cannot assign a key column (0A000)"},
-			ForeignKey:    Feature{Supported: true, Status: "enforced", SQLState: "23503", Notes: "inline REFERENCES and table-level FOREIGN KEY (named or unnamed, single or multi-column) are accepted in CREATE TABLE; the parent table must already exist and the referenced columns must be its PRIMARY KEY or exactly the column set of a UNIQUE index, otherwise DDL fails with 0A000 (foreign key mismatch); a dangling reference is 23503 on INSERT, multi-row INSERT, UPDATE, and parent DELETE/UPDATE, and COMMIT re-validates the transaction's final state so a staged child insert and a staged parent delete cannot both land; MATCH SIMPLE (a NULL component skips the check) and self-references are supported; the MATCH keyword is not parsed, so MATCH SIMPLE is the only behavior; ON DELETE and ON UPDATE accept NO ACTION, RESTRICT, CASCADE, SET NULL, and SET DEFAULT; cascading actions are applied with the statement in autocommit and no later than COMMIT inside an explicit transaction: CASCADE deletes referencing rows or rewrites their foreign-key columns to the new parent key (transitively, including multi-level and self-referential graphs; a mutual cycle can only exist in a hand-authored catalog because DDL rejects forward references), SET NULL writes NULL and fails with 23502 when a child column is NOT NULL, and SET DEFAULT writes the child column defaults and still enforces NOT NULL, CHECK, UNIQUE, and FOREIGN KEY on the result; inside an explicit transaction a NO ACTION/RESTRICT violation is detected at COMMIT and the statement itself succeeds, while a cascade constraint failure rolls back to the statement savepoint; cascading point DML is O(FK component), not O(1): each cascaded parent row scans the referencing child tables and COMMIT materializes every row of every FK-connected table; DEFERRABLE is rejected with 0A000; foreign keys are always enforced, so PRAGMA foreign_keys reports 1 and rejects OFF (SQLite defaults it to OFF) and PRAGMA foreign_key_list is not emulated; ALTER TABLE DROP/RENAME COLUMN and RENAME TABLE are rejected with 0A000 when a constraint depends on the column or names the table as its parent, and DROP TABLE of a referenced parent (including a self-reference) is rejected with 0A000; writes touching a participating table serialize on one database-wide foreign-key write gate; the clause is reported in sqlite_master/sqlite_schema table SQL, including declared ON DELETE/ON UPDATE actions, but pg_constraint and information_schema foreign keys are not emulated"},
-			Check:         Feature{Supported: true, Status: "enforced", SQLState: "23514", Notes: "inline and table-level CHECK are evaluated on INSERT, multi-row INSERT, UPDATE, and ON CONFLICT DO UPDATE; NULL/unknown results pass; predicates are restricted to deterministic, subquery-free expressions over unqualified columns; exposed in sqlite_master/sqlite_schema table SQL only (pg_constraint and information_schema.check_constraints are not emulated)"},
+			ForeignKey:    Feature{Supported: true, Status: "enforced", SQLState: "23503", Notes: "inline REFERENCES and table-level FOREIGN KEY (named or unnamed, single or multi-column) are accepted in CREATE TABLE; the parent table must already exist and the referenced columns must be its PRIMARY KEY or exactly the column set of a UNIQUE index, otherwise DDL fails with 0A000 (foreign key mismatch); a dangling reference is 23503 on INSERT, multi-row INSERT, UPDATE, and parent DELETE/UPDATE, and COMMIT re-validates the transaction's final state so a staged child insert and a staged parent delete cannot both land; MATCH SIMPLE (a NULL component skips the check) and self-references are supported; the MATCH keyword is not parsed, so MATCH SIMPLE is the only behavior; ON DELETE and ON UPDATE accept NO ACTION, RESTRICT, CASCADE, SET NULL, and SET DEFAULT; cascading actions are applied with the statement in autocommit and no later than COMMIT inside an explicit transaction: CASCADE deletes referencing rows or rewrites their foreign-key columns to the new parent key (transitively, including multi-level and self-referential graphs; a mutual cycle can only exist in a hand-authored catalog because DDL rejects forward references), SET NULL writes NULL and fails with 23502 when a child column is NOT NULL, and SET DEFAULT writes the child column defaults and still enforces NOT NULL, CHECK, UNIQUE, and FOREIGN KEY on the result; inside an explicit transaction a NO ACTION/RESTRICT violation is detected at COMMIT and the statement itself succeeds, while a cascade constraint failure rolls back to the statement savepoint; cascading point DML is O(FK component), not O(1): each cascaded parent row scans the referencing child tables and COMMIT materializes every row of every FK-connected table; DEFERRABLE is rejected with 0A000; foreign keys are always enforced, so PRAGMA foreign_keys reports 1 and rejects OFF (SQLite defaults it to OFF) and PRAGMA foreign_key_list is not emulated; ALTER TABLE DROP/RENAME COLUMN and RENAME TABLE are rejected with 0A000 when a constraint depends on the column or names the table as its parent, and DROP TABLE of a referenced parent (including a self-reference) is rejected with 0A000; writes touching a participating table serialize on one database-wide foreign-key write gate; the clause is reported in sqlite_master/sqlite_schema table SQL, including declared ON DELETE/ON UPDATE actions, and pg_constraint (contype 'f') plus information_schema.referential_constraints/key_column_usage report the resolved reference"},
+			Check:         Feature{Supported: true, Status: "enforced", SQLState: "23514", Notes: "inline and table-level CHECK are evaluated on INSERT, multi-row INSERT, UPDATE, and ON CONFLICT DO UPDATE; NULL/unknown results pass; predicates are restricted to deterministic, subquery-free expressions over unqualified columns; exposed in sqlite_master/sqlite_schema table SQL, pg_constraint (contype 'c'), and information_schema.table_constraints/constraint_column_usage; information_schema.check_constraints is not emulated"},
 			DefaultValues: Feature{Supported: true, Status: "evaluated_at_write_time", SQLState: "0A000", Notes: "constant defaults are stored as their evaluated value; CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, datetime('now'), date('now'), and time('now') are stored as SQL text and evaluated once per statement on write (once per ALTER statement for an ADD COLUMN backfill), so they are never frozen at DDL time; any other non-constant default is rejected with 0A000"},
 		},
 
@@ -222,6 +235,32 @@ func Current() *Document {
 			RowID:    Feature{Supported: true, Status: "auto_assigned", Notes: "rowid/oid/_rowid_ are BIGINT over the wire; monotonic when the engine assigns the rowid, stable across UPDATE, not monotonic for client-assigned descending INTEGER PRIMARY KEY values"},
 		},
 
+		Catalog: Catalog{
+			PgCatalog:         Feature{Supported: true, Status: "virtual_relations", SQLState: "0A000", Notes: "read-only relations synthesized from the durable schema the connection's session observes, including DDL staged by an open transaction: pg_class, pg_namespace, pg_attribute, pg_type, pg_index, pg_constraint, pg_attrdef, pg_database, pg_tablespace, pg_proc (the builtins the engine answers), pg_am, pg_description, pg_tables, and pg_indexes; session views appear in pg_class with relkind 'v' plus their pg_attribute and information_schema.columns rows; SELECT supports WHERE, ORDER BY, LIMIT/OFFSET, projection, aggregates, and joins between catalog relations, with the emulated schemas pg_catalog (OID 11), public (OID 2200), and information_schema (OID 13207); a schema-qualified name only resolves in the schema named, so public.pg_class is an undefined table (42P01), and a CTE shadows a catalog relation of the same name; INSERT/UPDATE/DELETE against a catalog relation fails with 0A000, comments and sequences are honestly empty/NULL, pg_type function attributes are regproc 0 rather than invented function names, and a primary key gets a synthetic index so pg_index and pg_constraint agree; a unique index and a UNIQUE constraint are both reported as contype 'u' because the engine does not persist which declaration created the index"},
+			InformationSchema: Feature{Supported: true, Status: "virtual_views", Notes: "tables, columns, table_constraints, key_column_usage, referential_constraints, constraint_column_usage, schemata, sequences, and views; sequences is always empty because the engine has no sequence objects, and views lists exactly the session views pg_class reports as relkind 'v', with a NULL definition because the engine does not retain view SQL text; information_schema.check_constraints and domains are not emulated"},
+			Relations: []string{
+				"pg_catalog.pg_class", "pg_catalog.pg_namespace", "pg_catalog.pg_attribute",
+				"pg_catalog.pg_type", "pg_catalog.pg_index", "pg_catalog.pg_constraint",
+				"pg_catalog.pg_attrdef", "pg_catalog.pg_database", "pg_catalog.pg_tablespace",
+				"pg_catalog.pg_proc", "pg_catalog.pg_am", "pg_catalog.pg_description",
+				"pg_catalog.pg_tables", "pg_catalog.pg_indexes",
+				"information_schema.tables", "information_schema.columns",
+				"information_schema.table_constraints", "information_schema.key_column_usage",
+				"information_schema.referential_constraints",
+				"information_schema.constraint_column_usage", "information_schema.schemata",
+				"information_schema.sequences", "information_schema.views",
+			},
+			Functions: []string{
+				"current_schema", "current_database", "format_type", "pg_table_is_visible",
+				"pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr",
+				"pg_get_serial_sequence", "obj_description", "col_description",
+				"has_table_privilege", "pg_get_userbyid", "to_regclass", "to_regtype",
+			},
+			OIDStrategy:   "deterministic 32-bit FNV-1a of the schema-qualified name plus relkind, lifted into [16384, 2^31-1] and collision-probed in sorted order; relkind is part of the key so an index that shares its table's name keeps its own OID, and pg_class, pg_attribute, pg_type, pg_index, and pg_constraint share the same allocator so catalog joins agree",
+			Writable:      false,
+			SetStatements: Feature{Supported: true, Status: "search_path_only", Notes: "SET [SESSION|LOCAL] name { TO | = } value, SET NAMES, SET TIME ZONE, and SET SESSION CHARACTERISTICS are accepted so driver initialization succeeds; only search_path is retained and reported by SHOW search_path and current_schema(), which resolve the emulated public schema. SET LOCAL is transaction-scoped (no effect outside a transaction block, expires at COMMIT, undone by ROLLBACK TO SAVEPOINT), and a session SET inside an aborted transaction is undone by ROLLBACK, matching PostgreSQL. Other settings are accepted and ignored. SHOW reports honest constants for server_version, server_encoding, client_encoding, transaction_isolation, standard_conforming_strings, integer_datetimes, datestyle, timezone, application_name, and is_superuser, and rejects unknown names"},
+		},
+
 		Parameters: Parameters{
 			Positional:    true,
 			MaxOID:        "int8/text/bool/bytea/float plus OID 3802 jsonb and the array OIDs text[]/varchar[]/int4[]/int8[]/int2[]/bool[]/float4[]/float8[]/numeric[]",
@@ -255,6 +294,7 @@ func Current() *Document {
 			"22023": "invalid_parameter_value",
 			"42501": "insufficient_privilege (managed proxy)",
 			"42601": "syntax_error",
+			"42P01": "undefined_table",
 			"25P02": "in_failed_sql_transaction",
 			"08P01": "protocol_violation (managed proxy: TLS required)",
 			"53300": "too_many_connections (managed proxy: organization quota)",

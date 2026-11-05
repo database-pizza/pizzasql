@@ -270,14 +270,17 @@ func substituteTableRefCTEs(ref *TableRef, ctes []*cteDef) error {
 		if err := substituteSelectCTEs(ref.Subquery, ctes); err != nil {
 			return err
 		}
-	} else if cte := lookupCTE(ref.Name, ctes); cte != nil {
-		alias := ref.Alias
-		if alias == "" {
-			alias = cte.name
+	} else if ref.Schema == "" {
+		// A schema-qualified name names a real relation, never a CTE.
+		if cte := lookupCTE(ref.Name, ctes); cte != nil {
+			alias := ref.Alias
+			if alias == "" {
+				alias = cte.name
+			}
+			ref.Subquery = cte.query
+			ref.Name = ""
+			ref.Alias = alias
 		}
-		ref.Subquery = cte.query
-		ref.Name = ""
-		ref.Alias = alias
 	}
 	if ref.Join != nil {
 		return substituteJoinCTEs(ref.Join, ctes)

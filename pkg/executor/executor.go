@@ -40,14 +40,32 @@ type Executor struct {
 	// Last SchemaManager version reflected in catalog.
 	catalogVersion uint64
 
+	// pgCatalog caches the virtual PostgreSQL catalog snapshot for the current
+	// statement. It is discarded by Execute so each statement observes DDL
+	// committed (or staged) since the previous one. A statement that evaluates
+	// catalog-backed expressions primes it before scanning; lockedScanDepth then
+	// reports that the session lock is already held.
+	pgCatalog       *catalogSnapshot
+	lockedScanDepth int
+
+	// searchPath is the session search path used by current_schema() and SHOW
+	// search_path. Only public, pg_catalog, and information_schema are
+	// materialized; drivers may name other schemas. txSearchPath holds the session
+	// value captured at BEGIN so ROLLBACK restores it, and localSearchPath holds
+	// SET LOCAL, which expires at the end of the transaction.
+	searchPath      []string
+	txSearchPath    []string
+	localSearchPath []string
+
 	// Multi-database support
 	attachedDatabases map[string]*DatabaseConnection // alias -> connection
 	currentDatabase   string                         // current database alias (default is "main")
 
 	// Transaction state
-	inTransaction   bool
-	savepoints      []string                    // stack of savepoint names
-	savepointStates []*storage.SessionSavepoint // full session state (rows and staged DDL) per savepoint
+	inTransaction        bool
+	savepoints           []string                    // stack of savepoint names
+	savepointStates      []*storage.SessionSavepoint // full session state (rows and staged DDL) per savepoint
+	localSearchPathSaves [][]string                  // SET LOCAL value per savepoint
 
 	// LISTEN/NOTIFY state. The hub and subscriber are per database instance;
 	// listenOps and notifyQueue are staged until COMMIT so LISTEN and NOTIFY
@@ -96,8 +114,11 @@ type Executor struct {
 	// after the join rows are built.
 	joinTypeScopes []*joinTypeScope
 
-	// In-memory view registry: view name (lowercase) → SELECT AST.
-	views map[string]*parser.SelectStmt
+	// In-memory view registry: view name (lowercase) → SELECT AST, plus the
+	// column list each view exposes. The catalog reports both so pg_class,
+	// pg_attribute, and information_schema.columns agree on a view's shape.
+	views       map[string]*parser.SelectStmt
+	viewColumns map[string][]storage.Column
 
 	// Materialized common table expressions for the current query, keyed by
 	// lowercased CTE name. Recursive CTEs populate this during fixpoint
@@ -147,7 +168,9 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 		attachedDatabases: make(map[string]*DatabaseConnection),
 		currentDatabase:   "main",
 		views:             make(map[string]*parser.SelectStmt),
+		viewColumns:       make(map[string][]storage.Column),
 		listens:           make(map[string]bool),
+		searchPath:        []string{publicSchemaName},
 	}
 
 	// Expression indexes and CHECK predicates persist only SQL text, so the
@@ -222,8 +245,35 @@ func (e *Executor) SyncCatalog() error {
 		}
 	}
 
+	e.registerCatalogRelations()
 	e.catalogVersion = e.session.Version()
 	return nil
+}
+
+// registerCatalogRelations adds the read-only pg_catalog and information_schema
+// relations to the analyzer catalog. Qualified names are always registered;
+// a bare pg_catalog name is registered only when no durable table shadows it,
+// matching PostgreSQL's implicit pg_catalog search path.
+func (e *Executor) registerCatalogRelations() {
+	register := func(def catalogRelationDef, name string) {
+		if e.catalog.TableExists(name) {
+			return
+		}
+		entry := pgCatalogRelationIndex[def.schema+"."+strings.ToLower(def.name)]
+		info := entry.schema.ToAnalyzerTableInfo()
+		info.Name = name
+		info.IsView = true
+		_ = e.catalog.CreateTable(info)
+	}
+	for _, def := range pgCatalogRelationDefs {
+		register(def, def.schema+"."+def.name)
+	}
+	for _, def := range informationSchemaRelationDefs {
+		register(def, def.schema+"."+def.name)
+	}
+	for _, def := range pgCatalogRelationDefs {
+		register(def, def.name)
+	}
 }
 
 // Execute executes a SQL statement.
@@ -237,13 +287,26 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	e.arrayCache = make(map[parser.Expr]*arrayParseEntry)
 	e.arrayValueCache = make(map[parser.Expr]interface{})
 	e.arrayCanonicalCache = make(map[parser.Expr]*arrayCanonicalEntry)
+	// The virtual catalog snapshot is statement-scoped: DDL executed by this
+	// statement (or committed since the last one) must be visible to the next
+	// catalog read.
+	e.pgCatalog = nil
 	defer func() {
 		e.subqueryCache = nil
 		e.correlatedAggCache = nil
 		e.arrayCache = nil
 		e.arrayValueCache = nil
 		e.arrayCanonicalCache = nil
+		e.pgCatalog = nil
 	}()
+
+	// Catalog-backed expressions resolve names through a snapshot that reads the
+	// session catalog. That read must happen before a scan takes the session lock,
+	// so a statement using regclass/regtype or a catalog function primes the
+	// snapshot here.
+	if err := e.primeCatalogSnapshot(stmt); err != nil {
+		return nil, err
+	}
 
 	// PRAGMA doesn't need analysis. SQLite catalog-introspection pragmas
 	// (index_list, index_info, table_xinfo) are answered by the catalog agent
@@ -258,6 +321,22 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	// EXPLAIN doesn't need analysis
 	if explain, ok := stmt.(*parser.ExplainStmt); ok {
 		return e.executeExplain(explain)
+	}
+
+	// Session settings and SHOW are acknowledged without analysis. SET is
+	// accepted for driver/ORM compatibility; only search_path is retained.
+	switch s := stmt.(type) {
+	case *parser.SetStmt:
+		return e.executeSet(s)
+	case *parser.ShowStmt:
+		return e.executeShow(s)
+	}
+
+	// Catalog relations are read-only virtual relations. Reject writes with a
+	// clear feature-not-supported error instead of letting them fall through to
+	// a confusing table-not-found from storage.
+	if err := e.rejectCatalogWriteTarget(stmt); err != nil {
+		return nil, err
 	}
 
 	// Transaction statements don't need analysis
@@ -433,6 +512,23 @@ func isCountStarSingleTable(stmt *parser.SelectStmt) bool {
 
 // executeSelect executes a SELECT statement (or compound SELECT).
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	// A subquery evaluated inside a scan that already holds the session lock (a
+	// correlated predicate) cannot read the durable schema: doing so re-enters
+	// the session lock and deadlocks, leaking the table gate to every other
+	// session. Only a SELECT that resolves entirely from virtual catalog
+	// relations, materialized CTEs, or no FROM at all may run in that state.
+	if e.lockedScanDepth > 0 && !e.fromResolvesToCatalogRelations(stmt.From) {
+		return nil, pgerror.Unsupported("a correlated subquery cannot be evaluated inside a locked table scan; its predicate must not read the row being written")
+	}
+	// This SELECT may be a view or CTE body that the statement-level prime never
+	// saw, and its WHERE is pushed into the scan below, so resolve the catalog
+	// snapshot before the scan starts.
+	if e.pgCatalog == nil && catalogSnapshotSelectNeeded(stmt) {
+		if _, err := e.catalogSnapshotForQuery(); err != nil {
+			return nil, err
+		}
+	}
+
 	// The join scope is pushed below the snapshot so a real table's unqualified
 	// column keeps precedence; it answers for right-side derived tables and
 	// CTEs that the snapshot cannot read without materializing them again.
@@ -459,6 +555,13 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	if stmt.From[0].Function != nil {
 		return e.executeSelectFromTableFunction(stmt)
+	}
+
+	// PostgreSQL catalog relations are materialized virtual relations. Answer
+	// any SELECT whose FROM reads one of them before the storage path, which
+	// would otherwise reject the relation as unknown.
+	if e.fromReferencesCatalogRelation(stmt.From) {
+		return e.executeSelectOnCatalogRelations(stmt)
 	}
 
 	// Non-recursive CTEs are desugared to derived tables by the parser. Preserve
@@ -525,6 +628,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	schema, err := e.session.GetSchema(tableName)
 	if err != nil {
+		if !e.session.TableExists(tableName) {
+			// A qualified name the durable schema does not have, such as
+			// public.pg_class, is an undefined table in PostgreSQL; report it as
+			// 42P01 rather than an internal error.
+			qualified := tableName
+			if stmt.From[0].Schema != "" {
+				qualified = stmt.From[0].Schema + "." + tableName
+			}
+			return nil, pgerror.UndefinedTable("relation %q does not exist", qualified)
+		}
 		return nil, err
 	}
 
@@ -553,13 +666,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// Optimize constant WHERE clauses
 	var constantWhereResult *bool
-	if stmt.Where != nil && !isMultiTable {
-		// Check if WHERE clause is a constant expression (doesn't reference any columns)
-		refs := collectColumnRefs(stmt.Where)
-		if len(refs) == 0 {
-			// Evaluate the constant expression
+	if stmt.Where != nil {
+		// A WHERE clause that references no column is constant: evaluate it once.
+		// A failure is a statement error, not a filter that drops every row;
+		// only the single-table shape short-circuits on the resulting value.
+		if refs := collectColumnRefs(stmt.Where); len(refs) == 0 {
 			val, err := e.evalExpr(stmt.Where, nil)
-			if err == nil {
+			if err != nil {
+				return nil, err
+			}
+			if !isMultiTable {
 				result := toBool(val)
 				constantWhereResult = &result
 			}
@@ -673,6 +789,8 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		if canFilterInScan {
 			appliedInScan = true
 			filter = func(row storage.Row) bool {
+				e.enterLockedScan()
+				defer e.exitLockedScan()
 				val, ferr := e.evalExpr(effectiveWhere, row)
 				if ferr != nil {
 					filterErr = ferr
@@ -779,7 +897,12 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		if effectiveWhere != nil {
 			var filtered []storage.Row
 			for _, row := range rows {
-				val, _ := e.evalExpr(effectiveWhere, row)
+				val, ferr := e.evalExpr(effectiveWhere, row)
+				if ferr != nil {
+					// A failing predicate is a statement error, not a
+					// non-matching row.
+					return nil, ferr
+				}
 				if toBool(val) {
 					filtered = append(filtered, row)
 				}
@@ -927,7 +1050,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		}
 
 		// Helper: inline cross-join two row-sets, applying a predicate.
-		inlineJoin := func(left, right []storage.Row, pred parser.Expr) []storage.Row {
+		inlineJoin := func(left, right []storage.Row, pred parser.Expr) ([]storage.Row, error) {
 			out := make([]storage.Row, 0, len(left))
 			for _, l := range left {
 				for _, r := range right {
@@ -939,7 +1062,12 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 						m[k] = v
 					}
 					if pred != nil {
-						val, _ := e.evalExpr(pred, m)
+						val, perr := e.evalExpr(pred, m)
+						if perr != nil {
+							// A failing predicate is a statement error, not a
+							// non-matching row.
+							return nil, perr
+						}
 						if !toBool(val) {
 							continue
 						}
@@ -947,7 +1075,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					out = append(out, m)
 				}
 			}
-			return out
+			return out, nil
 		}
 
 		// Pre-join connected components of "cross-only" tables (0 single-table filters,
@@ -1096,7 +1224,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if len(appl) > 0 {
 					pred = combineAND(appl)
 				}
-				seedRows = inlineJoin(seedRows, nextRows, pred)
+				seedRows, err = inlineJoin(seedRows, nextRows, pred)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			virtuals = append(virtuals, virtualUnit{tableIdxs: vSeen, rows: seedRows})
@@ -1178,7 +1309,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				pred := combineAND(tableFilters[first])
 				var filtered []storage.Row
 				for _, row := range rows {
-					val, _ := e.evalExpr(pred, row)
+					val, ferr := e.evalExpr(pred, row)
+					if ferr != nil {
+						return nil, ferr
+					}
 					if toBool(val) {
 						filtered = append(filtered, row)
 					}
@@ -1203,7 +1337,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					pred := combineAND(tableFilters[idx])
 					var filtered []storage.Row
 					for _, row := range rightRows {
-						val, _ := e.evalExpr(pred, row)
+						val, ferr := e.evalExpr(pred, row)
+						if ferr != nil {
+							return nil, ferr
+						}
 						if toBool(val) {
 							filtered = append(filtered, row)
 						}
@@ -1217,7 +1354,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if len(appl) > 0 {
 					pred = combineAND(appl)
 				}
-				rows = inlineJoin(rows, rightRows, pred)
+				rows, err = inlineJoin(rows, rightRows, pred)
+				if err != nil {
+					return nil, err
+				}
 			}
 		} else {
 			// All tables were pre-joined; start with empty placeholder.
@@ -1235,7 +1375,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			if len(appl) > 0 {
 				pred = combineAND(appl)
 			}
-			rows = inlineJoin(rows, vu.rows, pred)
+			rows, err = inlineJoin(rows, vu.rows, pred)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// Apply any remaining conditions (shouldn't normally happen).
@@ -1243,7 +1386,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			pred := combineAND(remaining)
 			var filtered []storage.Row
 			for _, row := range rows {
-				val, _ := e.evalExpr(pred, row)
+				val, ferr := e.evalExpr(pred, row)
+				if ferr != nil {
+					return nil, ferr
+				}
 				if toBool(val) {
 					filtered = append(filtered, row)
 				}
@@ -1836,7 +1982,10 @@ func (e *Executor) executeSelectOnMaterializedRows(stmt *parser.SelectStmt, colu
 		for _, row := range derivedRows {
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
-				continue
+				// A failing predicate is a statement error, not a non-matching
+				// row: a typo'd regclass lookup must fail instead of filtering
+				// everything out and returning 0 rows.
+				return nil, err
 			}
 			if toBool(val) {
 				filteredRows = append(filteredRows, row)
@@ -2331,6 +2480,22 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 		rightSchema = schemaFromColumns(cte.columns)
 		e.recordJoinColumns(rightAlias, cte.columns, cte.types)
 	default:
+		if entry, ok := e.catalogRelationFor(*rightTableRef); ok {
+			rightSchema = entry.schema
+			snapshot, snapErr := e.catalogSnapshotForQuery()
+			if snapErr != nil {
+				return nil, snapErr
+			}
+			rightRows = cloneRows(snapshot.relationRows(entry.def.schema + "." + entry.def.name))
+			columns := make([]string, len(rightSchema.Columns))
+			types := make([]string, len(rightSchema.Columns))
+			for i, column := range rightSchema.Columns {
+				columns[i] = column.Name
+				types[i] = column.Type
+			}
+			e.recordJoinColumns(rightAlias, columns, types)
+			break
+		}
 		rightSchema, err = e.session.GetSchema(rightTable)
 		if err != nil {
 			return nil, err
@@ -2473,6 +2638,21 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 		rightRows = cloneRows(cte.rows)
 		e.recordJoinColumns(rightQualifier, cte.columns, cte.types)
 	default:
+		if entry, ok := e.catalogRelationFor(*join.Table); ok {
+			snapshot, snapErr := e.catalogSnapshotForQuery()
+			if snapErr != nil {
+				return nil, snapErr
+			}
+			rightRows = cloneRows(snapshot.relationRows(entry.def.schema + "." + entry.def.name))
+			columns := make([]string, len(entry.schema.Columns))
+			types := make([]string, len(entry.schema.Columns))
+			for i, column := range entry.schema.Columns {
+				columns[i] = column.Name
+				types[i] = column.Type
+			}
+			e.recordJoinColumns(rightQualifier, columns, types)
+			break
+		}
 		rightRows, err = e.session.Select(rightTable, nil)
 	}
 	if err != nil {
@@ -2657,6 +2837,10 @@ func makeNullRow(rightRows []storage.Row, rightTable string, e *Executor) storag
 		rightSchema, err := e.session.GetSchema(rightTable)
 		if err == nil {
 			for _, col := range rightSchema.Columns {
+				nullRight[col.Name] = nil
+			}
+		} else if schema, ok := e.catalogSchemaByName(rightTable); ok {
+			for _, col := range schema.Columns {
 				nullRight[col.Name] = nil
 			}
 		}
@@ -3533,6 +3717,8 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	var filter func(storage.Row) bool
 	if stmt.Where != nil {
 		filter = func(row storage.Row) bool {
+			e.enterLockedScan()
+			defer e.exitLockedScan()
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
 				filterErr = err
@@ -3544,7 +3730,9 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 
 	// Use UpdateFunc to evaluate expressions per-row (supports self-referencing like balance = balance + 100).
 	// Generated columns are recomputed from the post-assignment row and written
-	// back so STORED values stay consistent.
+	// back so STORED values stay consistent. The storage session releases its
+	// lock around this callback (runUpdateFn), so SET expressions may read the
+	// session (a scalar subquery) while the surrounding scan holds nothing.
 	updateFn := func(row storage.Row) (storage.Row, error) {
 		updates := make(storage.Row)
 		merged := make(storage.Row, len(row))
@@ -3932,6 +4120,8 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	var filter func(storage.Row) bool
 	if stmt.Where != nil {
 		filter = func(row storage.Row) bool {
+			e.enterLockedScan()
+			defer e.exitLockedScan()
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
 				filterErr = err
@@ -4453,9 +4643,22 @@ func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, erro
 
 	e.views[name] = stmt.Select
 
-	// Derive view columns from SELECT list for catalog registration.
+	// Derive view columns from SELECT list for catalog registration. The same
+	// pass records the typed column list the catalog reports, so a view's
+	// pg_attribute and information_schema.columns rows match SELECT * FROM view.
 	var viewCols []analyzer.ColumnInfo
+	var catalogColumns []storage.Column
 	hasStar := false
+	typeResolver := e.joinedTypeResolver(stmt.Select.From)
+	addColumn := func(name, typeName string) {
+		viewCols = append(viewCols, analyzer.ColumnInfo{
+			Name:      name,
+			TableName: stmt.View.Name,
+			Type:      analyzer.TypeAny,
+			Nullable:  true,
+		})
+		catalogColumns = append(catalogColumns, storage.Column{Name: name, Type: typeName, Nullable: true})
+	}
 	for _, col := range stmt.Select.Columns {
 		if col.Star {
 			hasStar = true
@@ -4469,24 +4672,14 @@ func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, erro
 				colName = fmt.Sprintf("col_%d", len(viewCols))
 			}
 		}
-		viewCols = append(viewCols, analyzer.ColumnInfo{
-			Name:      colName,
-			TableName: stmt.View.Name,
-			Type:      analyzer.TypeAny,
-			Nullable:  true,
-		})
+		addColumn(colName, inferExprType(col.Expr, typeResolver))
 	}
 	// For SELECT *, pull columns from the underlying table(s).
 	if hasStar && len(stmt.Select.From) > 0 {
 		baseName := stmt.Select.From[0].Name
 		if schema, err := e.session.GetSchema(baseName); err == nil {
-			for _, c := range schema.Columns {
-				viewCols = append(viewCols, analyzer.ColumnInfo{
-					Name:      c.Name,
-					TableName: stmt.View.Name,
-					Type:      analyzer.TypeAny,
-					Nullable:  true,
-				})
+			for _, c := range visibleCatalogColumns(schema) {
+				addColumn(c.Name, c.Type)
 			}
 		}
 	}
@@ -4497,6 +4690,7 @@ func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, erro
 		Columns: viewCols,
 		IsView:  true,
 	})
+	e.viewColumns[name] = catalogColumns
 
 	return NewResult("CREATE VIEW"), nil
 }
@@ -4511,6 +4705,7 @@ func (e *Executor) executeDropView(stmt *parser.DropViewStmt) (*Result, error) {
 			return nil, fmt.Errorf("view not found: %s", ref.Name)
 		}
 		delete(e.views, name)
+		delete(e.viewColumns, name)
 		e.catalog.DropTable(ref.Name) //nolint:errcheck
 	}
 	return NewResult("DROP VIEW"), nil
@@ -4769,6 +4964,8 @@ func (e *Executor) executeBegin(stmt *parser.BeginStmt) (*Result, error) {
 	e.inTransaction = true
 	e.savepoints = nil
 	e.savepointStates = nil
+	e.localSearchPathSaves = nil
+	e.beginSettingScope()
 	e.clearNotificationState()
 
 	result := NewResult("BEGIN")
@@ -4793,6 +4990,7 @@ func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 	e.inTransaction = false
 	e.savepoints = nil
 	e.savepointStates = nil
+	e.localSearchPathSaves = nil
 	e.finishCommit(lsn)
 
 	result := NewResult("COMMIT")
@@ -4817,6 +5015,7 @@ func (e *Executor) executeRollback(stmt *parser.RollbackStmt) (*Result, error) {
 	e.inTransaction = false
 	e.savepoints = nil
 	e.savepointStates = nil
+	e.localSearchPathSaves = nil
 	e.finishRollback()
 	// total_changes() is monotonic (SQLite semantics): it is NOT decremented on
 	// rollback. last_insert_rowid() and changes() also intentionally hold.
@@ -4842,6 +5041,7 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 	e.savepoints = append(e.savepoints, stmt.Name)
 	e.savepointStates = append(e.savepointStates, e.session.Savepoint())
 	e.notificationSaves = append(e.notificationSaves, e.notificationSnapshot())
+	e.localSearchPathSaves = append(e.localSearchPathSaves, e.localSearchPath)
 
 	result := NewResult("SAVEPOINT")
 	return result, nil
@@ -4861,6 +5061,9 @@ func (e *Executor) executeRelease(stmt *parser.ReleaseStmt) (*Result, error) {
 			e.savepointStates = e.savepointStates[:i]
 			if i <= len(e.notificationSaves) {
 				e.notificationSaves = e.notificationSaves[:i]
+			}
+			if i <= len(e.localSearchPathSaves) {
+				e.localSearchPathSaves = e.localSearchPathSaves[:i]
 			}
 			found = true
 			break
@@ -4961,6 +5164,12 @@ func (e *Executor) rollbackToSavepoint(name string) (*Result, error) {
 	if savepointIdx < len(e.notificationSaves) {
 		e.rollbackNotificationsTo(e.notificationSaves[savepointIdx])
 		e.notificationSaves = e.notificationSaves[:savepointIdx+1]
+	}
+	// SET LOCAL is undoable down to the savepoint, matching PostgreSQL.
+	if savepointIdx < len(e.localSearchPathSaves) {
+		e.localSearchPath = e.localSearchPathSaves[savepointIdx]
+		e.localSearchPathSaves = e.localSearchPathSaves[:savepointIdx+1]
+		e.pgCatalog = nil
 	}
 
 	// Remove savepoints after the target
@@ -5968,6 +6177,9 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 	if val, handled, err := evalJSONFunction(name, args); handled {
 		return val, err
 	}
+	if val, handled, err := e.evalCatalogFunction(name, fn, args); handled {
+		return val, err
+	}
 
 	switch name {
 	case "UPPER":
@@ -6245,6 +6457,8 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		return e.evalArrayLength(fn.Args[0], args)
 	case "UNNEST":
 		return nil, pgerror.Unsupported("unnest() is only supported as a table function in FROM, as in SELECT * FROM unnest(array)")
+	case "VERSION":
+		return "PostgreSQL " + version.PostgreSQLCompatVersion + " (PizzaSQL)", nil
 	case "PIZZASQL_VERSION":
 		return version.String(), nil
 	case "SQLITE_VERSION":
@@ -6566,6 +6780,9 @@ func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interfa
 	}
 	if expr.Type.Array {
 		return evalArrayCast(expr.Type, val)
+	}
+	if cast, handled, err := e.catalogCast(expr, val); handled {
+		return cast, err
 	}
 
 	typeName := strings.ToUpper(expr.Type.Name)
@@ -7905,7 +8122,7 @@ func (e *Executor) evalIntExpr(expr parser.Expr) int {
 
 func isIntVal(v interface{}) bool {
 	switch v.(type) {
-	case int64, int, bool:
+	case int64, int, bool, RegOID:
 		return true
 	default:
 		return false
@@ -7920,6 +8137,8 @@ func toInt64(v interface{}) int64 {
 		return int64(val)
 	case float64:
 		return int64(val)
+	case RegOID:
+		return val.oid
 	case bool:
 		if val {
 			return 1
@@ -7997,6 +8216,8 @@ func toString(v interface{}) string {
 		return string(t)
 	case jsonText:
 		return string(t)
+	case RegOID:
+		return t.name
 	case bool:
 		if t {
 			return "1"
@@ -8057,6 +8278,8 @@ func toNumeric(v interface{}) (float64, bool) {
 		return float64(val), true
 	case float64:
 		return val, true
+	case RegOID:
+		return float64(val.oid), true
 	case string:
 		f, err := strconv.ParseFloat(val, 64)
 		return f, err == nil

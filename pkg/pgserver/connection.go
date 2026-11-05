@@ -11,8 +11,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -414,17 +412,6 @@ func (c *Connection) handleQuery(msg *Message) error {
 			return c.handleShowCommand(strings.ToUpper(kind))
 		}
 	}
-	if result, handled, err := c.catalogResult(sql); handled {
-		if err != nil {
-			c.sendError("ERROR", ErrCodeInternalError, err.Error())
-			return c.sendReadyForQuery()
-		}
-		if err := c.sendTabularResult(result, "SELECT", nil); err != nil {
-			return err
-		}
-		return c.sendReadyForQuery()
-	}
-
 	// Parse the complete batch before executing its first statement. This keeps
 	// unsupported trailing clauses from turning into committed writes.
 	l := lexer.New(sql)
@@ -476,6 +463,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 				}
 			} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
 				code = ErrCodeDatatypeMismatch
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if errors.Is(err, pgerror.ErrUndefinedTable) || analysisUndefinedTable(err) {
+				code = ErrCodeUndefinedTable
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
@@ -754,37 +746,29 @@ type executeError struct {
 // means the portal is ready to stream.
 func (c *Connection) materializePortal(portal *portal) *executeError {
 	execution := &portalExecution{}
-	if result, handled, catalogErr := c.catalogResult(portal.query); handled {
-		if catalogErr != nil {
-			return &executeError{code: ErrCodeInternalError, err: catalogErr}
-		}
-		execution.result = result
-		execution.commandTag = fmt.Sprintf("SELECT %d", len(result.Rows))
-	} else {
-		stmt, err := parser.New(lexer.New(portal.query)).Parse()
-		if err != nil {
-			code := ErrCodeSyntaxError
-			if errors.Is(err, pgerror.ErrFeatureNotSupported) {
-				code = ErrCodeFeatureNotSupported
-				if c.txStatus == TxStatusInBlock {
-					c.txStatus = TxStatusFailed
-				}
+	stmt, err := parser.New(lexer.New(portal.query)).Parse()
+	if err != nil {
+		code := ErrCodeSyntaxError
+		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			code = ErrCodeFeatureNotSupported
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
 			}
-			return &executeError{code: code, err: fmt.Errorf("syntax error: %w", err)}
 		}
-		result, err := c.executor.Execute(stmt)
-		if err != nil && isIdleRollback(stmt, c.txStatus, err) {
-			result, err = executor.NewResult("ROLLBACK"), nil
-		}
-		if err != nil {
-			return c.classifyExecuteError(stmt, err)
-		}
-		execution.result = result
-		// getCommandTag applies the statement's transaction transition, so it
-		// belongs here: a repeated Execute must not replay BEGIN/COMMIT/ROLLBACK.
-		execution.commandTag = c.getCommandTag(stmt, result)
-		execution.clearsPortals = resetsPortals(stmt)
+		return &executeError{code: code, err: fmt.Errorf("syntax error: %w", err)}
 	}
+	result, err := c.executor.Execute(stmt)
+	if err != nil && isIdleRollback(stmt, c.txStatus, err) {
+		result, err = executor.NewResult("ROLLBACK"), nil
+	}
+	if err != nil {
+		return c.classifyExecuteError(stmt, err)
+	}
+	execution.result = result
+	// getCommandTag applies the statement's transaction transition, so it
+	// belongs here: a repeated Execute must not replay BEGIN/COMMIT/ROLLBACK.
+	execution.commandTag = c.getCommandTag(stmt, result)
+	execution.clearsPortals = resetsPortals(stmt)
 	columnTypes := wireColumnTypes(execution.result)
 	formats, formatErr := c.resolveResultFormats(portal.resultFormats, columnTypes, len(execution.result.Columns))
 	if formatErr != nil {
@@ -821,6 +805,11 @@ func (c *Connection) classifyExecuteError(stmt parser.Statement, err error) *exe
 		}
 	} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
 		code = ErrCodeDatatypeMismatch
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.Is(err, pgerror.ErrUndefinedTable) || analysisUndefinedTable(err) {
+		code = ErrCodeUndefinedTable
 		if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
 		}
@@ -919,203 +908,6 @@ func (c *Connection) sendPortalRows(portal *portal, maxRows int32) error {
 	return nil
 }
 
-// catalogSession is the catalog view this connection serves. The executor's
-// session is authoritative because it resolves against the transaction-scoped
-// DDL overlay, so catalog emulation inside a transaction sees staged tables,
-// columns, and indexes. The fallback only covers a connection that has not
-// completed startup yet.
-func (c *Connection) catalogSession() *storage.Session {
-	if c.executor != nil {
-		return c.executor.Session()
-	}
-	if c.schema == nil || c.table == nil {
-		return nil
-	}
-	if c.catalogFallback == nil {
-		c.catalogFallback = storage.NewSession(c.schema, c.table)
-	}
-	return c.catalogFallback
-}
-
-var catalogFilterPattern = regexp.MustCompile(`(?i)\b(table_name|tablename|table_schema|schemaname|constraint_name|indexname)\s*=\s*'((?:''|[^'])*)'`)
-
-func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
-	if !isSingleStatementSQL(sql) {
-		return nil, false, nil
-	}
-	source := catalogSource(sql)
-	if source == "" {
-		return nil, false, nil
-	}
-	session := c.catalogSession()
-	if session == nil {
-		return nil, false, nil
-	}
-
-	tables, err := session.ListTables()
-	if err != nil {
-		return nil, true, err
-	}
-	rows := make([]map[string]interface{}, 0)
-	switch source {
-	case "INFORMATION_SCHEMA.TABLES":
-		for _, table := range tables {
-			rows = append(rows, map[string]interface{}{
-				"table_catalog": c.database, "table_schema": "public", "table_name": table, "table_type": "BASE TABLE",
-			})
-		}
-	case "PG_TABLES":
-		for _, table := range tables {
-			indexes, _ := session.ListTableIndexes(table)
-			rows = append(rows, map[string]interface{}{
-				"schemaname": "public", "tablename": table, "tableowner": c.params["user"], "tablespace": nil,
-				"hasindexes": len(indexes) > 0, "hasrules": false, "hastriggers": false, "rowsecurity": false,
-			})
-		}
-	case "INFORMATION_SCHEMA.COLUMNS":
-		for _, table := range tables {
-			schema, schemaErr := session.GetSchema(table)
-			if schemaErr != nil {
-				continue
-			}
-			for i, column := range schema.Columns {
-				rows = append(rows, map[string]interface{}{
-					"table_catalog": c.database, "table_schema": "public", "table_name": table,
-					"column_name": column.Name, "ordinal_position": int64(i + 1), "column_default": column.DefaultLiteral(),
-					"is_nullable": yesNo(column.Nullable), "data_type": strings.ToLower(column.Type),
-				})
-			}
-		}
-	case "INFORMATION_SCHEMA.TABLE_CONSTRAINTS", "INFORMATION_SCHEMA.KEY_COLUMN_USAGE":
-		for _, table := range tables {
-			schema, schemaErr := session.GetSchema(table)
-			if schemaErr != nil || schema.UsesSyntheticRowID() {
-				continue
-			}
-			columns := schema.PrimaryKeyList()
-			if source == "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" {
-				rows = append(rows, map[string]interface{}{
-					"constraint_catalog": c.database, "constraint_schema": "public", "constraint_name": table + "_pkey",
-					"table_catalog": c.database, "table_schema": "public", "table_name": table,
-					"constraint_type": "PRIMARY KEY", "is_deferrable": "NO", "initially_deferred": "NO",
-				})
-				continue
-			}
-			// KEY_COLUMN_USAGE reports one row per key column, in key order.
-			for i, column := range columns {
-				rows = append(rows, map[string]interface{}{
-					"constraint_catalog": c.database, "constraint_schema": "public", "constraint_name": table + "_pkey",
-					"table_catalog": c.database, "table_schema": "public", "table_name": table,
-					"column_name": column, "ordinal_position": int64(i + 1),
-				})
-			}
-		}
-	case "PG_INDEXES":
-		for _, table := range tables {
-			indexes, _ := session.ListTableIndexes(table)
-			for _, index := range indexes {
-				columns := make([]string, len(index.Columns))
-				for i, column := range index.Columns {
-					columns[i] = column.Name
-				}
-				unique := ""
-				if index.Unique {
-					unique = "UNIQUE "
-				}
-				rows = append(rows, map[string]interface{}{
-					"schemaname": "public", "tablename": table, "indexname": index.Name, "tablespace": nil,
-					"indexdef": fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)", unique, index.Name, table, strings.Join(columns, ", ")),
-				})
-			}
-		}
-	}
-
-	for _, match := range catalogFilterPattern.FindAllStringSubmatch(sql, -1) {
-		column, expected := strings.ToLower(match[1]), strings.ReplaceAll(match[2], "''", "'")
-		filtered := rows[:0]
-		for _, row := range rows {
-			if value, ok := row[column]; ok && strings.EqualFold(fmt.Sprintf("%v", value), expected) {
-				filtered = append(filtered, row)
-			}
-		}
-		rows = filtered
-	}
-
-	columns := catalogProjection(sql, rows)
-	result := executor.NewResult("SELECT")
-	if len(columns) == 1 && columns[0] == "count(*)" {
-		result.AddColumnWithType("count", "INTEGER")
-		result.AddRow(int64(len(rows)))
-		return result, true, nil
-	}
-	for _, column := range columns {
-		columnType := "TEXT"
-		if column == "ordinal_position" {
-			columnType = "INTEGER"
-		} else if strings.HasPrefix(column, "has") || column == "rowsecurity" {
-			columnType = "BOOLEAN"
-		}
-		result.AddColumnWithType(column, columnType)
-	}
-	for _, row := range rows {
-		values := make([]interface{}, len(columns))
-		for i, column := range columns {
-			values[i] = row[column]
-		}
-		result.AddRow(values...)
-	}
-	return result, true, nil
-}
-
-// isRollbackStatement reports whether sql parses as a single ROLLBACK
-// statement, including ROLLBACK TO SAVEPOINT.
-func isRollbackStatement(sql string) bool {
-	stmt, err := parser.New(lexer.New(sql)).Parse()
-	if err != nil {
-		return false
-	}
-	_, ok := stmt.(*parser.RollbackStmt)
-	return ok
-}
-
-func catalogProjection(sql string, rows []map[string]interface{}) []string {
-	upper := strings.ToUpper(sql)
-	selectPos, fromPos := strings.Index(upper, "SELECT"), strings.Index(upper, " FROM ")
-	if selectPos < 0 || fromPos < 0 || fromPos <= selectPos+6 {
-		return nil
-	}
-	projection := strings.TrimSpace(sql[selectPos+6 : fromPos])
-	projection = strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(projection), "DISTINCT "))
-	if projection == "*" && len(rows) > 0 {
-		columns := make([]string, 0, len(rows[0]))
-		for column := range rows[0] {
-			columns = append(columns, column)
-		}
-		sort.Strings(columns)
-		return columns
-	}
-	parts := strings.Split(projection, ",")
-	columns := make([]string, 0, len(parts))
-	for _, part := range parts {
-		column := strings.TrimSpace(part)
-		if index := strings.Index(strings.ToUpper(column), " AS "); index >= 0 {
-			column = strings.TrimSpace(column[:index])
-		}
-		if index := strings.LastIndex(column, "."); index >= 0 {
-			column = column[index+1:]
-		}
-		columns = append(columns, strings.ToLower(strings.Trim(column, `"`)))
-	}
-	return columns
-}
-
-func yesNo(value bool) string {
-	if value {
-		return "YES"
-	}
-	return "NO"
-}
-
 func (c *Connection) sendTabularResult(result *executor.Result, tag string, bindFormats []int16) error {
 	formats, err := c.resolveResultFormats(bindFormats, result.ColumnTypes, len(result.Columns))
 	if err != nil {
@@ -1212,6 +1004,13 @@ func (c *Connection) handleProxyError(msg *Message) error {
 func analysisTypeMismatch(err error) bool {
 	var analysisErr *analyzer.AnalysisError
 	return errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch
+}
+
+// analysisUndefinedTable reports whether the error is the analyzer's
+// table-not-found, which PostgreSQL reports as 42P01 (undefined_table).
+func analysisUndefinedTable(err error) bool {
+	var analysisErr *analyzer.AnalysisError
+	return errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTableNotFound
 }
 
 type boundParameter struct {
@@ -1814,13 +1613,24 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 		return 701 // FLOAT8OID
 	case "JSONB":
 		return 3802 // JSONBOID
+	case "OID":
+		return 26 // OIDOID
+	case "REGCLASS":
+		return 2205 // REGCLASSOID
+	case "REGTYPE":
+		return 2206 // REGTYPEOID
+	case "REGPROC":
+		// pg_type.typinput and friends are regproc attributes.
+		return 24 // REGPROCOID
+	case "NAME":
+		return 19 // NAMEOID
 	case "TEXT", "VARCHAR", "CHAR", "UUID":
 		// UUID is stored as text (SQLite-style), so it reports TEXTOID rather
 		// than the native PG UUID OID.
 		return 25 // TEXTOID
-	case "REAL", "FLOAT":
+	case "REAL", "FLOAT", "FLOAT4":
 		return 700 // FLOAT4OID
-	case "DOUBLE":
+	case "DOUBLE", "FLOAT8":
 		return 701 // FLOAT8OID
 	case "BOOLEAN", "BOOL":
 		return 16 // BOOLOID
@@ -1851,9 +1661,9 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 		return 8
 	case "NUMERIC", "DECIMAL":
 		return 8 // Reported as float8; see getOIDForType.
-	case "REAL", "FLOAT":
+	case "REAL", "FLOAT", "FLOAT4":
 		return 4
-	case "DOUBLE":
+	case "DOUBLE", "FLOAT8":
 		return 8
 	case "BOOLEAN", "BOOL":
 		return 1
@@ -1861,6 +1671,10 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 		return 8
 	case "DATE":
 		return 4
+	case "OID", "REGCLASS", "REGTYPE", "REGPROC":
+		return 4
+	case "NAME":
+		return 64
 	default:
 		return -1 // Variable length
 	}
@@ -1970,4 +1784,15 @@ func (c *Connection) handleShowCommand(sqlUpper string) error {
 	}
 
 	return c.sendReadyForQuery()
+}
+
+// isRollbackStatement reports whether sql parses as a single ROLLBACK
+// statement, including ROLLBACK TO SAVEPOINT.
+func isRollbackStatement(sql string) bool {
+	stmt, err := parser.New(lexer.New(sql)).Parse()
+	if err != nil {
+		return false
+	}
+	_, ok := stmt.(*parser.RollbackStmt)
+	return ok
 }

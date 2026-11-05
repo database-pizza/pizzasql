@@ -34,10 +34,15 @@ func canEncodeBinaryResult(oid int32) bool {
 		21,   // int2
 		23,   // int4
 		25,   // text
+		19,   // name
+		26,   // oid
 		700,  // float4
 		701,  // float8
 		1043, // varchar
 		1700, // numeric
+		24,   // regproc
+		2205, // regclass
+		2206, // regtype
 		3802: // jsonb
 		return true
 	}
@@ -135,6 +140,17 @@ func appendBinaryResultValue(dst []byte, oid int32, value interface{}) ([]byte, 
 		default:
 			return appendUint64(dst, uint64(n)), nil
 		}
+	case 19: // name
+		if reg, ok := value.(executor.RegOID); ok {
+			return append(dst, reg.String()...), nil
+		}
+		return append(dst, textValueString(value)...), nil
+	case 26, 24, 2205, 2206: // oid, regproc, regclass, regtype
+		n, err := catalogOIDBinaryValue(value)
+		if err != nil {
+			return dst, err
+		}
+		return append(dst, byte(n>>24), byte(n>>16), byte(n>>8), byte(n)), nil
 	case 25, 1043: // text, varchar
 		return append(dst, textValueString(value)...), nil
 	case 700: // float4
@@ -227,6 +243,15 @@ func appendUint64(dst []byte, n uint64) []byte {
 // Text is accepted because SQLite affinity can leave a text value in an integer
 // column; a value that does not fit the reported OID is an encoding error
 // instead of a silently truncated one.
+// catalogOIDBinaryValue encodes an oid/regclass/regtype value. A RegOID carries
+// its numeric OID separately from its display name.
+func catalogOIDBinaryValue(value interface{}) (int64, error) {
+	if reg, ok := value.(executor.RegOID); ok {
+		return binaryInt64(reg.OID(), 23)
+	}
+	return binaryInt64(value, 23)
+}
+
 func binaryInt64(value interface{}, oid int32) (int64, error) {
 	var n int64
 	switch v := value.(type) {

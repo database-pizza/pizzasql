@@ -865,7 +865,9 @@ func TestBinaryResultsRejectAfterDMLExecution(t *testing.T) {
 // results: their text and boolean columns encode as binary.
 func TestBinaryResultsCatalogQuery(t *testing.T) {
 	c, conn := extendedResultConnection(t)
-	if _, err := c.executor.Execute(parseStmt(t, `CREATE TABLE t (id INTEGER PRIMARY KEY)`)); err != nil {
+	// A table without a primary key or explicit index has no indexes; the
+	// synthetic primary-key index is covered by the catalog tests.
+	if _, err := c.executor.Execute(parseStmt(t, `CREATE TABLE t (id INTEGER)`)); err != nil {
 		t.Fatal(err)
 	}
 	sendExtended(t, c,

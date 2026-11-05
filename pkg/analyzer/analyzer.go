@@ -326,15 +326,23 @@ func (a *Analyzer) defineTableRef(ref parser.TableRef) error {
 		return nil
 	}
 
-	table, ok := a.catalog.GetTable(ref.Name)
+	// A non-public schema qualifier selects a schema-qualified catalog entry.
+	// Public tables are registered by bare name, so `public.t` resolves to `t`.
+	catalogName := ref.Name
+	if ref.Schema != "" && !strings.EqualFold(ref.Schema, "public") {
+		// Qualified catalog relations are registered under their lowercase
+		// schema-qualified name; schema names are case-insensitive here.
+		catalogName = strings.ToLower(ref.Schema) + "." + strings.ToLower(ref.Name)
+	}
+	table, ok := a.catalog.GetTable(catalogName)
 	if !ok {
 		return &AnalysisError{
 			Type:    ErrTableNotFound,
-			Message: fmt.Sprintf("table not found: %s", ref.Name),
+			Message: fmt.Sprintf("table not found: %s", catalogName),
 		}
 	}
 	a.scope.DefineTable(&TableInfo{
-		Name:    table.Name,
+		Name:    ref.Name,
 		Columns: table.Columns,
 		Alias:   ref.Alias,
 		IsView:  table.IsView,

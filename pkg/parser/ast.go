@@ -532,6 +532,28 @@ type NotifyStmt struct {
 func (s *NotifyStmt) node()     {}
 func (s *NotifyStmt) stmtNode() {}
 
+// SetStmt represents a PostgreSQL SET statement. Drivers and ORMs issue these
+// for session configuration; PizzaSQL accepts them for compatibility and only
+// gives search_path observable behavior. Name is the normalized setting name
+// (for example "search_path" or "time zone") and Values holds the unquoted
+// value tokens in declaration order.
+type SetStmt struct {
+	Name   string
+	Values []string
+	Local  bool
+}
+
+func (s *SetStmt) node()     {}
+func (s *SetStmt) stmtNode() {}
+
+// ShowStmt represents a PostgreSQL SHOW statement for a single setting.
+type ShowStmt struct {
+	Name string
+}
+
+func (s *ShowStmt) node()     {}
+func (s *ShowStmt) stmtNode() {}
+
 // Expression types
 
 // BinaryExpr represents a binary expression.

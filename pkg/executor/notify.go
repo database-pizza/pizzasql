@@ -174,11 +174,14 @@ func (e *Executor) finishCommit(lsn uint64) {
 		e.publish(n)
 	}
 	e.clearNotificationState()
+	e.commitSettingScope()
 }
 
-// finishRollback discards staged subscription changes and notifications.
+// finishRollback discards staged subscription changes and notifications, and
+// restores the transaction-scoped session settings.
 func (e *Executor) finishRollback() {
 	e.clearNotificationState()
+	e.rollbackSettingScope()
 }
 
 func (e *Executor) clearNotificationState() {

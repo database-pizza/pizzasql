@@ -347,3 +347,77 @@ func TestBoundedExecuteIsAdvertised(t *testing.T) {
 		}
 	}
 }
+
+// The catalog document advertises the read-only introspection surface an ORM
+// uses: the relation and function matrix, the deterministic OID scheme, and the
+// SET/SHOW compatibility surface. pkg/executor covers each relation.
+func TestCatalogIntrospectionIsAdvertised(t *testing.T) {
+	doc := Current()
+	catalog := doc.Catalog
+	if !catalog.PgCatalog.Supported || !catalog.InformationSchema.Supported {
+		t.Fatalf("catalog = %+v, want both schemas supported", catalog)
+	}
+	if catalog.PgCatalog.SQLState != pgerror.CodeFeatureNotSupported {
+		t.Fatalf("pg_catalog SQLSTATE = %q, want 0A000 for writes", catalog.PgCatalog.SQLState)
+	}
+	if catalog.Writable {
+		t.Fatal("catalog relations are read-only")
+	}
+	for _, want := range []string{
+		"pg_catalog.pg_class", "pg_catalog.pg_namespace", "pg_catalog.pg_attribute",
+		"pg_catalog.pg_type", "pg_catalog.pg_index", "pg_catalog.pg_constraint",
+		"pg_catalog.pg_attrdef", "pg_catalog.pg_database", "pg_catalog.pg_tablespace",
+		"pg_catalog.pg_proc", "pg_catalog.pg_am", "pg_catalog.pg_description",
+		"information_schema.tables", "information_schema.columns",
+		"information_schema.table_constraints", "information_schema.key_column_usage",
+		"information_schema.referential_constraints",
+		"information_schema.constraint_column_usage", "information_schema.schemata",
+		"information_schema.sequences", "information_schema.views",
+	} {
+		found := false
+		for _, relation := range catalog.Relations {
+			if relation == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("catalog.relations does not list %q", want)
+		}
+	}
+	for _, want := range []string{
+		"current_schema", "current_database", "format_type", "pg_table_is_visible",
+		"pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr", "pg_get_serial_sequence",
+		"obj_description", "col_description", "has_table_privilege", "to_regclass", "to_regtype",
+	} {
+		found := false
+		for _, function := range catalog.Functions {
+			if function == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("catalog.functions does not list %q", want)
+		}
+	}
+	if !strings.Contains(catalog.OIDStrategy, "FNV-1a") || !strings.Contains(catalog.OIDStrategy, "deterministic") {
+		t.Fatalf("oid_strategy = %q", catalog.OIDStrategy)
+	}
+	if !catalog.SetStatements.Supported || catalog.SetStatements.Status != "search_path_only" {
+		t.Fatalf("set_statements = %+v", catalog.SetStatements)
+	}
+	for _, want := range []string{"search_path", "SHOW", "current_schema", "SET LOCAL"} {
+		if !strings.Contains(catalog.SetStatements.Notes, want) {
+			t.Errorf("set_statements notes do not mention %q", want)
+		}
+	}
+
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"writable":false`) {
+		t.Fatalf("document does not advertise the catalog as read-only: %s", body)
+	}
+}
