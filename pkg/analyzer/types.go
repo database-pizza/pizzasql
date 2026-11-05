@@ -18,6 +18,7 @@ const (
 	TypeNumeric             // NUMERIC affinity (flexible)
 	TypeBoolean             // Boolean (stored as INTEGER in SQLite)
 	TypeAny                 // Any type (for polymorphic functions)
+	TypeJSONB               // Native JSONB (canonical JSON text, compared as jsonb)
 )
 
 func (t Type) String() string {
@@ -40,6 +41,8 @@ func (t Type) String() string {
 		return "BOOLEAN"
 	case TypeAny:
 		return "ANY"
+	case TypeJSONB:
+		return "JSONB"
 	default:
 		return "UNKNOWN"
 	}
@@ -52,6 +55,12 @@ func TypeFromName(name string) Type {
 	// Array types report their element type's affinity. The analyzer has no
 	// distinct array type; element storage stays a canonical text value.
 	upper = strings.TrimSuffix(upper, "[]")
+
+	// JSONB is a native type: values are canonical JSON text but compare, order,
+	// and report as jsonb rather than as text or numeric affinity.
+	if upper == "JSONB" {
+		return TypeJSONB
+	}
 
 	// Rule 1: If the type contains "INT" -> INTEGER
 	if strings.Contains(upper, "INT") {
@@ -124,6 +133,13 @@ func (t Type) IsComparable(other Type) bool {
 	if (t == TypeText || t == TypeBlob) && (other == TypeText || other == TypeBlob) {
 		return true
 	}
+	// JSONB compares with jsonb or with text that is read as a jsonb document.
+	if t == TypeJSONB || other == TypeJSONB {
+		textLike := func(x Type) bool {
+			return x == TypeJSONB || x == TypeText || x == TypeBlob || x == TypeNull || x == TypeAny
+		}
+		return textLike(t) && textLike(other)
+	}
 	// NUMERIC/BOOLEAN accepts TEXT (SQLite-compatible: dates stored as text in numeric columns)
 	if (t == TypeNumeric || t == TypeBoolean) && (other == TypeText || other == TypeBlob) {
 		return true
@@ -172,6 +188,15 @@ func CommonType(a, b Type) Type {
 	// Text/Blob coercion
 	if (a == TypeText || a == TypeBlob) && (b == TypeText || b == TypeBlob) {
 		return TypeText
+	}
+
+	// JSONB wins over text: a CASE or COALESCE branch that produces jsonb keeps
+	// its native semantics.
+	if a == TypeJSONB && (b == TypeText || b == TypeBlob) {
+		return TypeJSONB
+	}
+	if b == TypeJSONB && (a == TypeText || a == TypeBlob) {
+		return TypeJSONB
 	}
 
 	return TypeText // Default to TEXT for mixed types
@@ -270,13 +295,13 @@ var builtinFunctions = map[string]FunctionSignature{
 	"JSON_EXTRACT":      {Name: "JSON_EXTRACT", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeAny, IsAggregate: false},
 	"JSONB_EXTRACT":     {Name: "JSONB_EXTRACT", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeAny, IsAggregate: false},
 	"JSON_SET":          {Name: "JSON_SET", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
-	"JSONB_SET":         {Name: "JSONB_SET", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_SET":         {Name: "JSONB_SET", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeJSONB, IsAggregate: false},
 	"JSON_INSERT":       {Name: "JSON_INSERT", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
-	"JSONB_INSERT":      {Name: "JSONB_INSERT", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_INSERT":      {Name: "JSONB_INSERT", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeJSONB, IsAggregate: false},
 	"JSON_REPLACE":      {Name: "JSON_REPLACE", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
-	"JSONB_REPLACE":     {Name: "JSONB_REPLACE", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_REPLACE":     {Name: "JSONB_REPLACE", MinArgs: 3, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText, TypeAny}, ReturnType: TypeJSONB, IsAggregate: false},
 	"JSON_REMOVE":       {Name: "JSON_REMOVE", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeText, IsAggregate: false},
-	"JSONB_REMOVE":      {Name: "JSONB_REMOVE", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_REMOVE":      {Name: "JSONB_REMOVE", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeJSONB, IsAggregate: false},
 	"JSON_ARRAY":        {Name: "JSON_ARRAY", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
 	"JSON_ARRAY_LENGTH": {Name: "JSON_ARRAY_LENGTH", MinArgs: 1, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeText}, ReturnType: TypeInteger, IsAggregate: false},
 	"JSONB_ARRAY":       {Name: "JSONB_ARRAY", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
@@ -288,6 +313,37 @@ var builtinFunctions = map[string]FunctionSignature{
 	// JSON1 aggregate.
 	"JSON_GROUP_ARRAY":  {Name: "JSON_GROUP_ARRAY", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: true},
 	"JSONB_GROUP_ARRAY": {Name: "JSONB_GROUP_ARRAY", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: true},
+
+	// Native JSONB scalar functions.
+	"TO_JSONB":           {Name: "TO_JSONB", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeJSONB, IsAggregate: false},
+	"JSONB_TYPEOF":       {Name: "JSONB_TYPEOF", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_ARRAY_LENGTH": {Name: "JSONB_ARRAY_LENGTH", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeInteger, IsAggregate: false},
+	"JSONB_STRIP_NULLS":  {Name: "JSONB_STRIP_NULLS", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeJSONB, IsAggregate: false},
+	"JSONB_PRETTY":       {Name: "JSONB_PRETTY", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JSONB_BUILD_OBJECT": {Name: "JSONB_BUILD_OBJECT", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeJSONB, IsAggregate: false},
+	"JSONB_BUILD_ARRAY":  {Name: "JSONB_BUILD_ARRAY", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeJSONB, IsAggregate: false},
+
+	// Native JSONB set-returning functions. They are only executable as the
+	// single FROM table function; a projection call is rejected with 0A000.
+	"JSONB_EACH":                {Name: "JSONB_EACH", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_EACH_TEXT":           {Name: "JSONB_EACH_TEXT", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_ARRAY_ELEMENTS":      {Name: "JSONB_ARRAY_ELEMENTS", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_ARRAY_ELEMENTS_TEXT": {Name: "JSONB_ARRAY_ELEMENTS_TEXT", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_OBJECT_KEYS":         {Name: "JSONB_OBJECT_KEYS", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+
+	// jsonpath is not implemented. The names are registered so the executor can
+	// reject them with SQLSTATE 0A000 instead of the analyzer reporting an
+	// unknown function.
+	"JSONB_PATH_EXISTS":         {Name: "JSONB_PATH_EXISTS", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeBoolean, IsAggregate: false},
+	"JSONB_PATH_EXISTS_TZ":      {Name: "JSONB_PATH_EXISTS_TZ", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeBoolean, IsAggregate: false},
+	"JSONB_PATH_MATCH":          {Name: "JSONB_PATH_MATCH", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeBoolean, IsAggregate: false},
+	"JSONB_PATH_MATCH_TZ":       {Name: "JSONB_PATH_MATCH_TZ", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeBoolean, IsAggregate: false},
+	"JSONB_PATH_QUERY":          {Name: "JSONB_PATH_QUERY", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_PATH_QUERY_TZ":       {Name: "JSONB_PATH_QUERY_TZ", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_PATH_QUERY_ARRAY":    {Name: "JSONB_PATH_QUERY_ARRAY", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_PATH_QUERY_ARRAY_TZ": {Name: "JSONB_PATH_QUERY_ARRAY_TZ", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_PATH_QUERY_FIRST":    {Name: "JSONB_PATH_QUERY_FIRST", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
+	"JSONB_PATH_QUERY_FIRST_TZ": {Name: "JSONB_PATH_QUERY_FIRST_TZ", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
 }
 
 // LookupFunction returns the function signature for a function name.

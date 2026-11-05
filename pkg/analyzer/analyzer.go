@@ -300,17 +300,10 @@ func (a *Analyzer) defineTableRef(ref parser.TableRef) error {
 				return err
 			}
 		}
-		// unnest() produces one column with the function's name, matching
-		// PostgreSQL's output column name.
 		a.scope.DefineTable(&TableInfo{
-			Name:  ref.Name,
-			Alias: ref.Alias,
-			Columns: []ColumnInfo{{
-				Name:      strings.ToLower(ref.Function.Name),
-				Type:      TypeAny,
-				Nullable:  true,
-				TableName: ref.Name,
-			}},
+			Name:    ref.Name,
+			Alias:   ref.Alias,
+			Columns: tableFunctionColumns(ref.Function.Name),
 		})
 		return nil
 	}
@@ -1068,7 +1061,28 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 	}
 
 	switch e.Op {
-	case lexer.TokenPlus, lexer.TokenMinus, lexer.TokenStar, lexer.TokenSlash, lexer.TokenPercent:
+	case lexer.TokenMinus:
+		// `jsonb - text`, `jsonb - integer`, and `jsonb - text[]` delete a key or
+		// array element instead of subtracting. A jsonb right operand with any
+		// other arithmetic operator stays a type error.
+		if left.Type == TypeJSONB {
+			if right.Type == TypeJSONB {
+				return nil, &AnalysisError{
+					Type:    ErrTypeMismatch,
+					Message: "jsonb deletion requires a text key, integer index, or text[] path, not a jsonb operand",
+				}
+			}
+			info.Type = TypeJSONB
+			return info, nil
+		}
+		if right.Type == TypeJSONB {
+			return nil, &AnalysisError{
+				Type:    ErrTypeMismatch,
+				Message: "cannot subtract JSONB from a non-jsonb value",
+			}
+		}
+		fallthrough
+	case lexer.TokenPlus, lexer.TokenStar, lexer.TokenSlash, lexer.TokenPercent:
 		// Arithmetic operators. TypeAny comes from derived tables and CTEs whose
 		// column types are not tracked, so it is allowed rather than rejected.
 		info.Type = CommonType(left.Type, right.Type)
@@ -1105,12 +1119,57 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 		// Logical operators
 		info.Type = TypeBoolean
 	case lexer.TokenConcat:
-		// String concatenation
+		// String concatenation, or jsonb merge when either side is jsonb.
+		if left.Type == TypeJSONB || right.Type == TypeJSONB {
+			other := left.Type
+			if left.Type == TypeJSONB {
+				other = right.Type
+			}
+			if !jsonbTextOperand(other) {
+				return nil, &AnalysisError{
+					Type:    ErrTypeMismatch,
+					Message: fmt.Sprintf("jsonb concatenation requires a jsonb or text operand, got %s", other),
+				}
+			}
+			info.Type = TypeJSONB
+			return info, nil
+		}
 		info.Type = TypeText
-	case lexer.TokenArrow, lexer.TokenArrowText:
-		// JSON extraction. Like json_extract, the result follows the JSON value
-		// and is not a fixed SQL type (a JSON number extracts as a number).
+	case lexer.TokenArrow:
+		// JSON extraction. A jsonb document extracts as jsonb, so a later
+		// comparison cannot silently reinterpret the result as SQL text.
 		info.Type = TypeAny
+		if left.Type == TypeJSONB {
+			info.Type = TypeJSONB
+		}
+	case lexer.TokenArrowText:
+		// ->> returns the SQL value or text; it is not jsonb.
+		info.Type = TypeAny
+	case lexer.TokenHashArrow:
+		// JSONB path extraction returns a JSONB value.
+		info.Type = TypeAny
+		if left.Type == TypeJSONB {
+			info.Type = TypeJSONB
+		}
+	case lexer.TokenHashArrowText:
+		info.Type = TypeText
+	case lexer.TokenHashMinus:
+		info.Type = TypeAny
+		if left.Type == TypeJSONB {
+			info.Type = TypeJSONB
+		}
+	case lexer.TokenAtArrow, lexer.TokenLtAt:
+		// Containment needs a jsonb operand (or text read as a jsonb document)
+		// on both sides; a number is not silently reinterpreted as JSON.
+		if !jsonbTextOperand(left.Type) || !jsonbTextOperand(right.Type) {
+			return nil, &AnalysisError{
+				Type:    ErrTypeMismatch,
+				Message: fmt.Sprintf("jsonb containment requires jsonb or text operands, got %s and %s", left.Type, right.Type),
+			}
+		}
+		info.Type = TypeBoolean
+	case lexer.TokenQuestion, lexer.TokenQuestionPipe, lexer.TokenQuestionAmp:
+		info.Type = TypeBoolean
 	default:
 		info.Type = TypeUnknown
 	}
@@ -1140,6 +1199,17 @@ func arrayLiteralComparison(left, right *ExprInfo) bool {
 		}
 	}
 	return (left.Array && textCoercible(right)) || (right.Array && textCoercible(left))
+}
+
+// jsonbTextOperand reports whether a type can stand on the other side of a
+// jsonb operator: a jsonb value or text that is read as a jsonb document.
+func jsonbTextOperand(t Type) bool {
+	switch t {
+	case TypeJSONB, TypeText, TypeBlob, TypeNull, TypeUnknown, TypeAny:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *Analyzer) analyzeUnaryExpr(e *parser.UnaryExpr) (*ExprInfo, error) {
@@ -1175,6 +1245,32 @@ func (a *Analyzer) analyzeUnaryExpr(e *parser.UnaryExpr) (*ExprInfo, error) {
 	}
 
 	return info, nil
+}
+
+// tableFunctionColumns reports the output columns of a set-returning function
+// used as the single FROM item, using PostgreSQL's column names.
+func tableFunctionColumns(name string) []ColumnInfo {
+	switch strings.ToLower(name) {
+	case "jsonb_each", "jsonb_each_text":
+		valueType := TypeJSONB
+		if strings.EqualFold(name, "jsonb_each_text") {
+			valueType = TypeText
+		}
+		return []ColumnInfo{
+			{Name: "key", Type: TypeText, Nullable: true, TableName: name},
+			{Name: "value", Type: valueType, Nullable: true, TableName: name},
+		}
+	case "jsonb_array_elements":
+		return []ColumnInfo{{Name: "value", Type: TypeJSONB, Nullable: true, TableName: name}}
+	case "jsonb_array_elements_text":
+		return []ColumnInfo{{Name: "value", Type: TypeText, Nullable: true, TableName: name}}
+	case "jsonb_object_keys":
+		return []ColumnInfo{{Name: "jsonb_object_keys", Type: TypeText, Nullable: true, TableName: name}}
+	default:
+		// unnest() produces one column with the function's name, matching
+		// PostgreSQL's output column name.
+		return []ColumnInfo{{Name: strings.ToLower(name), Type: TypeAny, Nullable: true, TableName: name}}
+	}
 }
 
 func (a *Analyzer) analyzeFunctionCall(e *parser.FunctionCall) (*ExprInfo, error) {

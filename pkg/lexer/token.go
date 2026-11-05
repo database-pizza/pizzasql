@@ -37,6 +37,19 @@ const (
 	TokenShiftLeft  // <<
 	TokenShiftRight // >>
 
+	// JSONB operators. They are PostgreSQL operators, not SQLite ones, and the
+	// parser restricts them to jsonb operands.
+	TokenHashArrow     // #>
+	TokenHashArrowText // #>>
+	TokenHashMinus     // #-
+	TokenAtArrow       // @>
+	TokenAtAt          // @@
+	TokenAtQuestion    // @?
+	TokenLtAt          // <@
+	TokenQuestion      // ?
+	TokenQuestionPipe  // ?|
+	TokenQuestionAmp   // ?&
+
 	// Punctuation
 	TokenLParen    // (
 	TokenRParen    // )
@@ -400,40 +413,50 @@ func (t Token) IsOperator() bool {
 }
 
 var tokenNames = map[TokenType]string{
-	TokenEOF:        "EOF",
-	TokenError:      "ERROR",
-	TokenComment:    "COMMENT",
-	TokenIdent:      "IDENT",
-	TokenNumber:     "NUMBER",
-	TokenString:     "STRING",
-	TokenBlob:       "BLOB",
-	TokenPlus:       "+",
-	TokenMinus:      "-",
-	TokenStar:       "*",
-	TokenSlash:      "/",
-	TokenPercent:    "%",
-	TokenConcat:     "||",
-	TokenArrow:      "->",
-	TokenArrowText:  "->>",
-	TokenEq:         "=",
-	TokenNeq:        "<>",
-	TokenLt:         "<",
-	TokenLte:        "<=",
-	TokenGt:         ">",
-	TokenGte:        ">=",
-	TokenBitAnd:     "&",
-	TokenBitOr:      "|",
-	TokenBitNot:     "~",
-	TokenShiftLeft:  "<<",
-	TokenShiftRight: ">>",
-	TokenLParen:     "(",
-	TokenRParen:     ")",
-	TokenComma:      ",",
-	TokenSemicolon:  ";",
-	TokenDot:        ".",
-	TokenColonColon: "::",
-	TokenLBracket:   "[",
-	TokenRBracket:   "]",
+	TokenEOF:           "EOF",
+	TokenError:         "ERROR",
+	TokenComment:       "COMMENT",
+	TokenIdent:         "IDENT",
+	TokenNumber:        "NUMBER",
+	TokenString:        "STRING",
+	TokenBlob:          "BLOB",
+	TokenPlus:          "+",
+	TokenMinus:         "-",
+	TokenStar:          "*",
+	TokenSlash:         "/",
+	TokenPercent:       "%",
+	TokenConcat:        "||",
+	TokenArrow:         "->",
+	TokenArrowText:     "->>",
+	TokenEq:            "=",
+	TokenNeq:           "<>",
+	TokenLt:            "<",
+	TokenLte:           "<=",
+	TokenGt:            ">",
+	TokenGte:           ">=",
+	TokenBitAnd:        "&",
+	TokenBitOr:         "|",
+	TokenBitNot:        "~",
+	TokenShiftLeft:     "<<",
+	TokenShiftRight:    ">>",
+	TokenHashArrow:     "#>",
+	TokenHashArrowText: "#>>",
+	TokenHashMinus:     "#-",
+	TokenAtArrow:       "@>",
+	TokenAtAt:          "@@",
+	TokenAtQuestion:    "@?",
+	TokenLtAt:          "<@",
+	TokenQuestion:      "?",
+	TokenQuestionPipe:  "?|",
+	TokenQuestionAmp:   "?&",
+	TokenLParen:        "(",
+	TokenRParen:        ")",
+	TokenComma:         ",",
+	TokenSemicolon:     ";",
+	TokenDot:           ".",
+	TokenColonColon:    "::",
+	TokenLBracket:      "[",
+	TokenRBracket:      "]",
 }
 
 func (t TokenType) String() string {

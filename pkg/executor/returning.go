@@ -68,11 +68,19 @@ func (e *Executor) returningResult(cols []parser.SelectColumn, schema *storage.S
 			switch {
 			case col.Star:
 				for _, c := range schema.Columns {
-					values = append(values, e.lookupRowColumn(row, c.Name))
+					canonical, err := canonicalizeJSONBReadValue(c.Type, e.lookupRowColumn(row, c.Name))
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, canonical)
 				}
 			case col.TableStar != "":
 				for _, c := range schema.Columns {
-					values = append(values, e.lookupRowColumn(row, c.Name))
+					canonical, err := canonicalizeJSONBReadValue(c.Type, e.lookupRowColumn(row, c.Name))
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, canonical)
 				}
 			default:
 				val, err := e.evalExpr(col.Expr, row)

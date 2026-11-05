@@ -1365,7 +1365,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 								if !ok {
 									val = row[c.Name]
 								}
-								values = append(values, val)
+								canonical, canonErr := canonicalizeJSONBReadValue(c.Type, val)
+								if canonErr != nil {
+									return nil, canonErr
+								}
+								values = append(values, canonical)
 							}
 						}
 					}
@@ -1374,7 +1378,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					// oid/rowid/_rowid_ is an ordinary column here, not the hidden
 					// rowid alias, so use its own value key.
 					for _, c := range schema.Columns {
-						values = append(values, row[c.Name])
+						canonical, canonErr := canonicalizeJSONBReadValue(c.Type, row[c.Name])
+						if canonErr != nil {
+							return nil, canonErr
+						}
+						values = append(values, canonical)
 					}
 				}
 			} else if col.TableStar != "" {
@@ -1387,7 +1395,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					if !ok {
 						val = row[c.Name]
 					}
-					values = append(values, val)
+					canonical, canonErr := canonicalizeJSONBReadValue(c.Type, val)
+					if canonErr != nil {
+						return nil, canonErr
+					}
+					values = append(values, canonical)
 				}
 			} else if we, ok := col.Expr.(*parser.WindowExpr); ok {
 				values = append(values, windowValues[we][rowIdx])
@@ -1558,13 +1570,13 @@ func (e *Executor) executeSelectExpr(stmt *parser.SelectStmt) (*Result, error) {
 	return result, nil
 }
 
-// executeSelectFromTableFunction materializes unnest(array) as a one-column
+// executeSelectFromTableFunction materializes a set-returning function as a
 // relation and runs the rest of the SELECT over it. The parser restricts this
 // form to a single FROM entry with no joins.
 func (e *Executor) executeSelectFromTableFunction(stmt *parser.SelectStmt) (*Result, error) {
 	ref := stmt.From[0]
 	if !strings.EqualFold(ref.Function.Name, "unnest") {
-		return nil, pgerror.Unsupported("table function %s() is not supported", ref.Function.Name)
+		return e.executeSelectFromJSONBTableFunction(stmt, ref)
 	}
 	if len(ref.Function.Args) != 1 {
 		return nil, fmt.Errorf("unnest() requires exactly one array argument")
@@ -1614,6 +1626,50 @@ func (e *Executor) executeSelectFromTableFunction(stmt *parser.SelectStmt) (*Res
 		}
 		result.ColumnTypes = types
 	}
+	return result, nil
+}
+
+// executeSelectFromJSONBTableFunction materializes one of the jsonb
+// set-returning functions (jsonb_each, jsonb_array_elements, and their _text
+// forms) as a typed relation.
+func (e *Executor) executeSelectFromJSONBTableFunction(stmt *parser.SelectStmt, ref parser.TableRef) (*Result, error) {
+	name := strings.ToLower(ref.Function.Name)
+	if len(ref.Function.Args) != 1 {
+		return nil, pgerror.InvalidParameter("%s() requires exactly one jsonb argument", name)
+	}
+	value, err := e.evalExpr(ref.Function.Args[0], nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s argument: %w", name, err)
+	}
+	columns, types, rows, err := jsonbTableFunction(name, value)
+	if err != nil {
+		return nil, err
+	}
+	qualifier := ref.Alias
+	if qualifier == "" {
+		qualifier = ref.Name
+	}
+	result, err := e.executeSelectOnMaterializedTyped(stmt, columns, types, rows, qualifier)
+	if err != nil {
+		return nil, err
+	}
+	resolved := make([]string, 0, len(result.Columns))
+	resolve := func(_, column string) (string, bool) {
+		for i, candidate := range columns {
+			if strings.EqualFold(candidate, column) {
+				return typeAt(types, i), true
+			}
+		}
+		return "", false
+	}
+	for _, projection := range stmt.Columns {
+		if projection.Star || projection.TableStar != "" {
+			resolved = append(resolved, types...)
+			continue
+		}
+		resolved = append(resolved, inferExprType(projection.Expr, resolve))
+	}
+	result.ColumnTypes = resolved
 	return result, nil
 }
 
@@ -2904,6 +2960,9 @@ func (e *Executor) applyUpsert(table string, schema *storage.Schema, existing, r
 		if normalizeErr := e.normalizeArrayRow(schema, updates); normalizeErr != nil {
 			return nil, normalizeErr
 		}
+		if normalizeErr := e.normalizeJSONBRow(schema, updates); normalizeErr != nil {
+			return nil, normalizeErr
+		}
 		// Recompute STORED generated columns so an upsert keeps them current.
 		if err := e.applyGeneratedColumns(schema, merged); err != nil {
 			return nil, err
@@ -3115,9 +3174,12 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 // RETURNING. An ON CONFLICT DO UPDATE returns the merged existing row, not the
 // candidate, so RETURNING and unique-target upserts observe the real row.
 func (e *Executor) insertOneRow(tableName string, schema *storage.Schema, row storage.Row, stmt *parser.InsertStmt, wantStored bool) (int64, bool, bool, storage.Row, error) {
-	// Canonicalize array column values once, before conflict matching reads
-	// them and before storage encodes them.
+	// Canonicalize array and jsonb column values once, before conflict matching
+	// reads them and before storage encodes them.
 	if err := e.normalizeArrayRow(schema, row); err != nil {
+		return 0, false, false, nil, err
+	}
+	if err := e.normalizeJSONBRow(schema, row); err != nil {
 		return 0, false, false, nil, err
 	}
 	if stmt.OnConflict == parser.ConflictIgnore || (stmt.ConflictDoNothing && len(stmt.ConflictTarget) == 0) {
@@ -3500,6 +3562,9 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		if err := e.normalizeArrayRow(schema, updates); err != nil {
 			return nil, err
 		}
+		if err := e.normalizeJSONBRow(schema, updates); err != nil {
+			return nil, err
+		}
 		if err := e.applyGeneratedColumns(schema, merged); err != nil {
 			return nil, err
 		}
@@ -3686,6 +3751,9 @@ func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Sc
 			row[assign.Column] = val
 		}
 		if err := e.normalizeArrayRow(schema, row); err != nil {
+			return nil, err
+		}
+		if err := e.normalizeJSONBRow(schema, row); err != nil {
 			return nil, err
 		}
 		if err := e.applyGeneratedColumns(schema, row); err != nil {
@@ -3989,6 +4057,10 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 					if err != nil {
 						return nil, err
 					}
+					val, exprText, err = canonicalJSONBDefault(col.Type, val, exprText)
+					if err != nil {
+						return nil, err
+					}
 					col.Default = val
 					col.DefaultExpr = exprText
 				}
@@ -4288,6 +4360,9 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 			if err := ValidateIndexColumns(col.Expr, schema); err != nil {
 				return nil, err
 			}
+			if strings.EqualFold(inferExprType(col.Expr, schemaTypeResolver(schema)), "JSONB") {
+				return nil, pgerror.Unsupported("expression indexes over jsonb are not supported; index a scalar extraction such as (doc ->> 'key') instead")
+			}
 			continue
 		}
 		if _, found := schema.GetColumn(col.Name); !found {
@@ -4503,6 +4578,10 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 					return nil, err
 				}
 				val, exprText, err = canonicalArrayDefault(col.Type, val, exprText)
+				if err != nil {
+					return nil, err
+				}
+				val, exprText, err = canonicalJSONBDefault(col.Type, val, exprText)
 				if err != nil {
 					return nil, err
 				}
@@ -5369,22 +5448,22 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 		if e.outerRow != nil {
 			// Step 1-2: qualified lookup in outer row
 			if val, ok := e.outerRow[ref.Table+"."+ref.Column]; ok {
-				return val, nil
+				return e.canonicalizeJSONBColumnValue(ref, val)
 			}
 			for k, v := range e.outerRow {
 				if strings.EqualFold(k, ref.Table+"."+ref.Column) {
-					return v, nil
+					return e.canonicalizeJSONBColumnValue(ref, v)
 				}
 			}
 		}
 
 		// Step 3-4: qualified lookup in current row
 		if val, ok := row[ref.Table+"."+ref.Column]; ok {
-			return val, nil
+			return e.canonicalizeJSONBColumnValue(ref, val)
 		}
 		for k, v := range row {
 			if strings.EqualFold(k, ref.Table+"."+ref.Column) {
-				return v, nil
+				return e.canonicalizeJSONBColumnValue(ref, v)
 			}
 		}
 
@@ -5394,11 +5473,11 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 		// but no "t1.b").
 		if e.outerRow != nil {
 			if val, ok := e.outerRow[ref.Column]; ok {
-				return val, nil
+				return e.canonicalizeJSONBColumnValue(ref, val)
 			}
 			for k, v := range e.outerRow {
 				if strings.EqualFold(k, ref.Column) {
-					return v, nil
+					return e.canonicalizeJSONBColumnValue(ref, v)
 				}
 			}
 		}
@@ -5407,22 +5486,22 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 	// Step 6: unqualified fallback in current row (handles unqualified refs and
 	// single-table queries like "SELECT t1.a FROM t1" where rows have plain keys).
 	if val, ok := row[ref.Column]; ok {
-		return val, nil
+		return e.canonicalizeJSONBColumnValue(ref, val)
 	}
 	for k, v := range row {
 		if strings.EqualFold(k, ref.Column) {
-			return v, nil
+			return e.canonicalizeJSONBColumnValue(ref, v)
 		}
 	}
 
 	// For unqualified refs with an outer row context (ref.Table == "").
 	if e.outerRow != nil && ref.Table == "" {
 		if val, ok := e.outerRow[ref.Column]; ok {
-			return val, nil
+			return e.canonicalizeJSONBColumnValue(ref, val)
 		}
 		for k, v := range e.outerRow {
 			if strings.EqualFold(k, ref.Column) {
-				return v, nil
+				return e.canonicalizeJSONBColumnValue(ref, v)
 			}
 		}
 	}
@@ -5433,7 +5512,7 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 	// runs last.
 	if storage.IsRowIDColumn(ref.Column) {
 		if val, ok := row["_rowid_"]; ok {
-			return val, nil
+			return e.canonicalizeJSONBColumnValue(ref, val)
 		}
 	}
 
@@ -5448,6 +5527,10 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 	right, err := e.evalExpr(expr.Right, row)
 	if err != nil {
 		return nil, err
+	}
+
+	if value, handled, jsonbErr := e.evalJSONBBinary(expr.Op, expr.Left, expr.Right, left, right); handled {
+		return value, jsonbErr
 	}
 
 	if isComparisonOp(expr.Op) {
@@ -5877,7 +5960,11 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		args[i] = val
 	}
 
-	// JSON1 scalar functions are dispatched separately to keep this switch tidy.
+	// Native jsonb functions and JSON1 scalar functions are dispatched
+	// separately to keep this switch tidy.
+	if val, handled, err := e.evalJSONBFunction(name, fn, args); handled {
+		return val, err
+	}
 	if val, handled, err := evalJSONFunction(name, args); handled {
 		return val, err
 	}
@@ -6197,7 +6284,11 @@ func (e *Executor) evalCaseExpr(expr *parser.CaseExpr, row storage.Row) (interfa
 			if operand == nil {
 				continue
 			}
-			match = compare(operand, cond) == 0
+			equal, cmpErr := e.compareExprValues(lexer.TokenEq, expr.Operand, when.Condition, operand, cond)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			match = equal
 		} else {
 			// Searched CASE: CASE WHEN cond THEN ... — NULL condition is falsy
 			match = toBool(cond)
@@ -6478,6 +6569,17 @@ func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interfa
 	}
 
 	typeName := strings.ToUpper(expr.Type.Name)
+	if typeName == "JSONB" {
+		text, ok := val.(string)
+		if !ok {
+			if jsonValue, isJSON := val.(jsonText); isJSON {
+				text = string(jsonValue)
+			} else {
+				return nil, pgerror.InvalidText("cannot cast %T to JSONB", val)
+			}
+		}
+		return CanonicalizeJSONB(text)
+	}
 	switch {
 	case strings.Contains(typeName, "INT"):
 		return int64(toFloat(val)), nil
@@ -6977,6 +7079,9 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if err != nil {
 			return nil, err
 		}
+		if value, handled, jsonbErr := e.evalJSONBBinary(ex.Op, ex.Left, ex.Right, left, right); handled {
+			return value, jsonbErr
+		}
 		if isComparisonOp(ex.Op) {
 			left, right, err = e.canonicalizeArrayComparison(ex.Left, ex.Right, left, right)
 			if err != nil {
@@ -7003,6 +7108,12 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 				return nil, err
 			}
 			args[i] = v
+		}
+		// Keep the real argument expressions for jsonb: to_jsonb and the build
+		// functions need expression types to embed a jsonb document instead of
+		// quoting it as text.
+		if val, handled, err := e.evalJSONBFunction(name, ex, args); handled {
+			return val, err
 		}
 		return e.evalBuiltinFunction(name, args)
 	case *parser.ParenExpr:
@@ -7043,6 +7154,17 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if ex.Type.Array {
 			return evalArrayCast(ex.Type, val)
 		}
+		if strings.EqualFold(ex.Type.Name, "JSONB") {
+			text, ok := val.(string)
+			if !ok {
+				if jsonValue, isJSON := val.(jsonText); isJSON {
+					text = string(jsonValue)
+				} else {
+					return nil, pgerror.InvalidText("cannot cast %T to JSONB", val)
+				}
+			}
+			return CanonicalizeJSONB(text)
+		}
 		switch strings.ToUpper(ex.Type.Name) {
 		case "INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT", "SIGNED":
 			if isIntVal(val) {
@@ -7064,7 +7186,13 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			condVal, _ := e.evalExprWithAggregates(when.Condition, rows)
 			var matched bool
 			if ex.Operand != nil {
-				matched = operand != nil && condVal != nil && compare(operand, condVal) == 0
+				if operand != nil && condVal != nil {
+					equal, cmpErr := e.compareExprValues(lexer.TokenEq, ex.Operand, when.Condition, operand, condVal)
+					if cmpErr != nil {
+						return nil, cmpErr
+					}
+					matched = equal
+				}
 			} else {
 				matched = toBool(condVal)
 			}
@@ -7095,6 +7223,10 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if err != nil {
 			return nil, err
 		}
+		left, right, err = e.canonicalizeArrayComparison(ex.Left, ex.Right, left, right)
+		if err != nil {
+			return nil, err
+		}
 		distinct := false
 		switch {
 		case left == nil && right == nil:
@@ -7102,7 +7234,11 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		case left == nil || right == nil:
 			distinct = true
 		default:
-			distinct = compare(left, right) != 0
+			equal, cmpErr := e.compareExprValues(lexer.TokenEq, ex.Left, ex.Right, left, right)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			distinct = !equal
 		}
 		if ex.Not {
 			return !distinct, nil

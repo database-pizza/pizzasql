@@ -385,6 +385,8 @@ func castResultType(name string) (string, bool) {
 		return "TEXT", true
 	case "BLOB":
 		return "BLOB", true
+	case "JSONB":
+		return "JSONB", true
 	default:
 		return "", false
 	}
@@ -464,10 +466,16 @@ func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) str
 		return "DOUBLE"
 	case "AVG":
 		return "DOUBLE"
-	case "ARRAY_LENGTH":
+	case "ARRAY_LENGTH", "JSONB_ARRAY_LENGTH":
 		return "INTEGER"
-	case "MIN", "MAX":
-		// MIN/MAX return one of the input values unchanged.
+	case "JSONB_TYPEOF", "JSONB_PRETTY":
+		return "TEXT"
+	case "TO_JSONB", "JSONB_SET", "JSONB_INSERT", "JSONB_REPLACE", "JSONB_REMOVE",
+		"JSONB_STRIP_NULLS", "JSONB_BUILD_OBJECT", "JSONB_BUILD_ARRAY":
+		return "JSONB"
+	case "MIN", "MAX", "COALESCE", "IFNULL", "NVL", "NULLIF":
+		// These return one of the input values unchanged, so the result type
+		// follows the first argument (and therefore keeps JSONB).
 		return firstArgType(fn, resolve)
 	default:
 		return "TEXT"
@@ -500,13 +508,34 @@ func sumResultType(argType string) string {
 func binaryResultType(e *parser.BinaryExpr, resolve columnTypeResolver) string {
 	switch e.Op {
 	case lexer.TokenEq, lexer.TokenNeq, lexer.TokenLt, lexer.TokenLte, lexer.TokenGt, lexer.TokenGte,
-		lexer.TokenAND, lexer.TokenOR:
+		lexer.TokenAND, lexer.TokenOR,
+		lexer.TokenAtArrow, lexer.TokenLtAt,
+		lexer.TokenQuestion, lexer.TokenQuestionPipe, lexer.TokenQuestionAmp:
 		return "BOOLEAN"
 	case lexer.TokenConcat:
+		// jsonb || jsonb merges or concatenates; text || text concatenates.
+		if strings.EqualFold(inferExprType(e.Left, resolve), "JSONB") ||
+			strings.EqualFold(inferExprType(e.Right, resolve), "JSONB") {
+			return "JSONB"
+		}
+		return "TEXT"
+	case lexer.TokenArrow, lexer.TokenHashArrow, lexer.TokenHashMinus:
+		// ->, #>, and #- keep the jsonb type when the document is jsonb; JSON1
+		// text extraction reports text.
+		if strings.EqualFold(inferExprType(e.Left, resolve), "JSONB") {
+			return "JSONB"
+		}
+		return "TEXT"
+	case lexer.TokenArrowText, lexer.TokenHashArrowText:
 		return "TEXT"
 	case lexer.TokenBitAnd, lexer.TokenBitOr, lexer.TokenShiftLeft, lexer.TokenShiftRight:
 		return "BIGINT"
-	case lexer.TokenPlus, lexer.TokenMinus, lexer.TokenStar, lexer.TokenSlash, lexer.TokenPercent:
+	case lexer.TokenMinus:
+		if strings.EqualFold(inferExprType(e.Left, resolve), "JSONB") {
+			return "JSONB"
+		}
+		fallthrough
+	case lexer.TokenPlus, lexer.TokenStar, lexer.TokenSlash, lexer.TokenPercent:
 		left := inferExprType(e.Left, resolve)
 		right := inferExprType(e.Right, resolve)
 		switch {

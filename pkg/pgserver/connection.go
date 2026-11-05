@@ -432,6 +432,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
+			} else if errors.Is(err, pgerror.ErrInvalidParameter) {
+				code = ErrCodeInvalidParameter
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
 				code = ErrCodeDatatypeMismatch
 				if c.txStatus == TxStatusInBlock {
@@ -604,6 +609,9 @@ func (c *Connection) handleBind(msg *Message) error {
 		if errors.Is(err, pgerror.ErrInvalidText) {
 			code = ErrCodeInvalidText
 		}
+		if errors.Is(err, pgerror.ErrInvalidParameter) {
+			code = ErrCodeInvalidParameter
+		}
 		return c.failExtended(code, err)
 	}
 	c.portals[portalName] = &portal{query: query}
@@ -711,6 +719,11 @@ func (c *Connection) handleExecute(msg *Message) error {
 			c.txStatus = TxStatusIdle
 		} else if errors.Is(err, pgerror.ErrInvalidText) {
 			code = ErrCodeInvalidText
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.Is(err, pgerror.ErrInvalidParameter) {
+			code = ErrCodeInvalidParameter
 			if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
@@ -1172,6 +1185,21 @@ func parameterLiteral(param boundParameter) (string, error) {
 		if _, isArray := arrayParamElementType(param.oid); isArray {
 			return "", fmt.Errorf("%w: binary array parameter format for OID %d; send arrays in text format", pgerror.ErrFeatureNotSupported, param.oid)
 		}
+		if param.oid == 3802 {
+			// PostgreSQL's binary jsonb format is a version byte followed by the
+			// document text. pgx sends this form by default.
+			if len(param.value) == 0 {
+				return "", pgerror.InvalidText("jsonb binary parameter is empty")
+			}
+			if param.value[0] != 1 {
+				return "", pgerror.InvalidText("unsupported jsonb binary format version %d", param.value[0])
+			}
+			canonical, err := executor.CanonicalizeJSONB(string(param.value[1:]))
+			if err != nil {
+				return "", err
+			}
+			return "'" + strings.ReplaceAll(canonical, "'", "''") + "'::jsonb", nil
+		}
 		switch param.oid {
 		case 16:
 			if len(param.value) != 1 {
@@ -1201,6 +1229,16 @@ func parameterLiteral(param boundParameter) (string, error) {
 		}
 	}
 	value := string(param.value)
+	if param.oid == 3802 {
+		// A text-format jsonb parameter is canonicalized at Bind, so the executor
+		// receives the same bytes a jsonb column stores and an invalid document
+		// fails before execution.
+		canonical, err := executor.CanonicalizeJSONB(value)
+		if err != nil {
+			return "", err
+		}
+		return "'" + strings.ReplaceAll(canonical, "'", "''") + "'::jsonb", nil
+	}
 	if element, isArray := arrayParamElementType(param.oid); isArray {
 		// The bound value is PostgreSQL array text. Validate and canonicalize it
 		// now so a malformed array fails at Bind instead of during row
@@ -1590,6 +1628,8 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 		// Values round-trip through JSON as float64; there is no exact decimal
 		// carrier, so NUMERIC is not advertised.
 		return 701 // FLOAT8OID
+	case "JSONB":
+		return 3802 // JSONBOID
 	case "TEXT", "VARCHAR", "CHAR", "UUID":
 		// UUID is stored as text (SQLite-style), so it reports TEXTOID rather
 		// than the native PG UUID OID.

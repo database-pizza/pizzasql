@@ -32,9 +32,10 @@ func jsonErrorField(t *testing.T, msg *Message, want byte) string {
 	return ""
 }
 
-// The supported JSON contract is TEXT storage plus the JSON1 function surface
-// and the -> / ->> operators. JSON/JSONB type names are accepted as
-// text-affinity aliases; there is no native binary jsonb type.
+// The JSON (text) contract is TEXT storage plus the JSON1 function surface and
+// the -> / ->> operators. The JSONB type is native: it stores canonical JSON
+// text and reports OID 3802 (see jsonb_contract_test.go), while JSON keeps the
+// text-backed JSON1 behavior exercised here.
 func TestJSONTextContractOverSimpleQuery(t *testing.T) {
 	c, client := newDataConnection(t)
 	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE settings (id INTEGER PRIMARY KEY, body TEXT)"), 0)})
@@ -55,7 +56,8 @@ func TestJSONTextContractOverSimpleQuery(t *testing.T) {
 		t.Fatalf("json partial update = %v, want [light 2]", values)
 	}
 
-	// JSON and JSONB column type names are text-affinity aliases.
+	// A JSON column keeps the text-backed JSON1 behavior (native JSONB is
+	// covered separately).
 	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE docs (id INTEGER PRIMARY KEY, body JSON)"), 0)})
 	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(`INSERT INTO docs (id, body) VALUES (1, '{"a":1}')`), 0)})
 	msgs = runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(`SELECT json_extract(body, '$.a') FROM docs`), 0)})

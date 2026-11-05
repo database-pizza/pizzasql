@@ -130,6 +130,10 @@ func (l *Lexer) NextToken() Token {
 			l.readChar()
 			tok.Type = TokenShiftLeft
 			tok.Literal = "<<"
+		} else if l.peekChar() == '@' {
+			l.readChar()
+			tok.Type = TokenLtAt
+			tok.Literal = "<@"
 		} else {
 			tok.Type = TokenLt
 			tok.Literal = "<"
@@ -171,6 +175,64 @@ func (l *Lexer) NextToken() Token {
 			tok.Literal = "|"
 			l.readChar()
 		}
+	case '#':
+		// JSONB path and delete operators: #>, #>>, #-.
+		if l.peekChar() == '>' {
+			l.readChar()
+			if l.peekChar() == '>' {
+				l.readChar()
+				tok.Type = TokenHashArrowText
+				tok.Literal = "#>>"
+			} else {
+				tok.Type = TokenHashArrow
+				tok.Literal = "#>"
+			}
+			l.readChar()
+		} else if l.peekChar() == '-' {
+			l.readChar()
+			tok.Type = TokenHashMinus
+			tok.Literal = "#-"
+			l.readChar()
+		} else {
+			tok.Type = TokenError
+			tok.Literal = "unexpected character: #"
+			l.readChar()
+		}
+	case '@':
+		// JSONB containment and jsonpath operators: @>, @@, @?.
+		switch l.peekChar() {
+		case '>':
+			l.readChar()
+			tok.Type = TokenAtArrow
+			tok.Literal = "@>"
+		case '@':
+			l.readChar()
+			tok.Type = TokenAtAt
+			tok.Literal = "@@"
+		case '?':
+			l.readChar()
+			tok.Type = TokenAtQuestion
+			tok.Literal = "@?"
+		default:
+			tok.Type = TokenError
+			tok.Literal = "unexpected character: @"
+		}
+		l.readChar()
+	case '?':
+		switch l.peekChar() {
+		case '|':
+			l.readChar()
+			tok.Type = TokenQuestionPipe
+			tok.Literal = "?|"
+		case '&':
+			l.readChar()
+			tok.Type = TokenQuestionAmp
+			tok.Literal = "?&"
+		default:
+			tok.Type = TokenQuestion
+			tok.Literal = "?"
+		}
+		l.readChar()
 	case '-':
 		if l.peekChar() == '-' {
 			// Line comment
