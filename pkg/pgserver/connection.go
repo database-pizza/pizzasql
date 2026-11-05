@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
@@ -431,6 +432,16 @@ func (c *Connection) handleQuery(msg *Message) error {
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
+			} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
+				code = ErrCodeDatatypeMismatch
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if analysisErr := analysisTypeMismatch(err); analysisErr {
+				code = ErrCodeDatatypeMismatch
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if errors.As(err, &notNullErr) {
 				code = "23502"
 				if _, commit := stmt.(*parser.CommitStmt); commit {
@@ -700,6 +711,16 @@ func (c *Connection) handleExecute(msg *Message) error {
 			c.txStatus = TxStatusIdle
 		} else if errors.Is(err, pgerror.ErrInvalidText) {
 			code = ErrCodeInvalidText
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
+			code = ErrCodeDatatypeMismatch
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if analysisTypeMismatch(err) {
+			code = ErrCodeDatatypeMismatch
 			if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
@@ -1015,6 +1036,13 @@ func (c *Connection) handleProxyError(msg *Message) error {
 	return c.sendReadyForQuery()
 }
 
+// analysisTypeMismatch reports whether the error is an analyzer type-mismatch,
+// which is reported with SQLSTATE 42804 instead of a generic internal error.
+func analysisTypeMismatch(err error) bool {
+	var analysisErr *analyzer.AnalysisError
+	return errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch
+}
+
 type boundParameter struct {
 	value  []byte
 	oid    int32
@@ -1105,11 +1133,10 @@ func bindQuery(query string, params []boundParameter) (string, error) {
 			i += end + 4
 			continue
 		}
-		if ch == '\'' || ch == '"' || ch == '`' || ch == '[' {
+		// Only string literals and quoted identifiers are skipped. Brackets are
+		// not a quoted region: a subscript such as tags[$1] must bind $1.
+		if ch == '\'' || ch == '"' || ch == '`' {
 			quote = ch
-			if ch == '[' {
-				quote = ']'
-			}
 			result.WriteByte(ch)
 			i++
 			continue

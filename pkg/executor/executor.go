@@ -71,6 +71,21 @@ type Executor struct {
 	// Keyed by subquery AST pointer; valid for one top-level Execute call.
 	correlatedAggCache map[*parser.SelectStmt]*correlatedAggCache
 
+	// Per-query cache of parsed array literals, keyed by the array expression's
+	// AST pointer. The evaluated text is compared before a hit is used so a
+	// value that changes between rows or executions is re-parsed.
+	arrayCache map[parser.Expr]*arrayParseEntry
+
+	// Per-query cache of evaluated constant array operands, keyed by AST
+	// pointer. It keeps `= ANY($1)` from rebuilding the same canonical array
+	// text for every row of a scan.
+	arrayValueCache map[parser.Expr]interface{}
+
+	// typeScopes holds the column-type resolvers of the SELECT statements being
+	// evaluated, innermost last. Value-time consumers (array subscripts) use
+	// them to recover a column's declared type.
+	typeScopes []columnTypeResolver
+
 	// In-memory view registry: view name (lowercase) → SELECT AST.
 	views map[string]*parser.SelectStmt
 
@@ -209,9 +224,13 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	}
 	e.subqueryCache = make(map[*parser.SelectStmt]*Result)
 	e.correlatedAggCache = make(map[*parser.SelectStmt]*correlatedAggCache)
+	e.arrayCache = make(map[parser.Expr]*arrayParseEntry)
+	e.arrayValueCache = make(map[parser.Expr]interface{})
 	defer func() {
 		e.subqueryCache = nil
 		e.correlatedAggCache = nil
+		e.arrayCache = nil
+		e.arrayValueCache = nil
 	}()
 
 	// PRAGMA doesn't need analysis. SQLite catalog-introspection pragmas
@@ -402,6 +421,9 @@ func isCountStarSingleTable(stmt *parser.SelectStmt) bool {
 
 // executeSelect executes a SELECT statement (or compound SELECT).
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	e.pushTypeScope(e.snapshotTypeResolver(stmt.From))
+	defer e.popTypeScope()
+
 	if len(stmt.With) > 0 {
 		return e.executeWith(stmt)
 	}
@@ -2836,6 +2858,9 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// RETURNING and conflict-clause expressions may subscript array columns.
+	e.pushTypeScope(schemaTypeResolver(schema))
+	defer e.popTypeScope()
 
 	generated := generatedColumnSet(schema)
 	if len(stmt.Columns) > 0 {
@@ -3349,6 +3374,10 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SET and WHERE expressions may subscript array columns; expose the target
+	// table's declared types for the duration of the statement.
+	e.pushTypeScope(schemaTypeResolver(schema))
+	defer e.popTypeScope()
 
 	generated := generatedColumnSet(schema)
 	for _, assign := range stmt.Set {
@@ -3531,6 +3560,8 @@ func applyUpdateRow(updateFn func(storage.Row) (storage.Row, error), row storage
 // the combined context, and applies the changes atomically.
 func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Schema) (*Result, error) {
 	tableName := stmt.Table.Name
+	e.pushTypeScope(e.snapshotTypeResolver(stmt.From))
+	defer e.popTypeScope()
 
 	sources, err := e.materializeFrom(stmt.From)
 	if err != nil {
@@ -3753,6 +3784,8 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	e.pushTypeScope(schemaTypeResolver(schema))
+	defer e.popTypeScope()
 
 	var filterErr error
 	var filter func(storage.Row) bool
@@ -5344,6 +5377,13 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 		return nil, err
 	}
 
+	if isComparisonOp(expr.Op) {
+		left, right, err = e.canonicalizeArrayComparison(expr.Left, expr.Right, left, right)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if isBitwiseOp(expr.Op) {
 		if left == nil || right == nil {
 			return nil, nil
@@ -5591,6 +5631,15 @@ func (e *Executor) applyBinaryOp(op lexer.TokenType, left, right interface{}) (i
 	default:
 		return nil, fmt.Errorf("unsupported operator: %v", op)
 	}
+}
+
+// isComparisonOp reports whether op compares two values.
+func isComparisonOp(op lexer.TokenType) bool {
+	switch op {
+	case lexer.TokenEq, lexer.TokenNeq, lexer.TokenLt, lexer.TokenLte, lexer.TokenGt, lexer.TokenGte:
+		return true
+	}
+	return false
 }
 
 // isBitwiseOp reports whether op is a SQLite bitwise operator.
@@ -6026,7 +6075,10 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 	case "PERCENT_DIFF":
 		return evalPercentDiff(args)
 	case "ARRAY_LENGTH":
-		return evalArrayLength(args)
+		if len(fn.Args) != 2 {
+			return nil, fmt.Errorf("array_length requires two arguments")
+		}
+		return e.evalArrayLength(fn.Args[0], args)
 	case "UNNEST":
 		return nil, pgerror.Unsupported("unnest() is only supported as a table function in FROM, as in SELECT * FROM unnest(array)")
 	case "PIZZASQL_VERSION":
@@ -6130,6 +6182,10 @@ func (e *Executor) evalInExpr(expr *parser.InExpr, row storage.Row) (interface{}
 				sawNull = true
 				continue
 			}
+			v, canonErr := e.canonicalArrayValue(expr.Left, v)
+			if canonErr != nil {
+				return nil, canonErr
+			}
 			if compare(left, v) == 0 {
 				if expr.Not {
 					return false, nil
@@ -6165,6 +6221,10 @@ func (e *Executor) evalInExpr(expr *parser.InExpr, row storage.Row) (interface{}
 		if v == nil {
 			sawNull = true
 			continue
+		}
+		v, err = e.canonicalArrayValue(expr.Left, v)
+		if err != nil {
+			return nil, err
 		}
 		if compare(left, v) == 0 {
 			if expr.Not {
@@ -6293,6 +6353,10 @@ func (e *Executor) evalIsDistinctExpr(expr *parser.IsDistinctExpr, row storage.R
 		return nil, err
 	}
 	right, err := e.evalExpr(expr.Right, row)
+	if err != nil {
+		return nil, err
+	}
+	left, right, err = e.canonicalizeArrayComparison(expr.Left, expr.Right, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -6824,6 +6888,12 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if err != nil {
 			return nil, err
 		}
+		if isComparisonOp(ex.Op) {
+			left, right, err = e.canonicalizeArrayComparison(ex.Left, ex.Right, left, right)
+			if err != nil {
+				return nil, err
+			}
+		}
 		// Use the same logic as evalBinaryExpr to preserve integer semantics.
 		combined := &parser.BinaryExpr{Op: ex.Op}
 		return e.applyBinaryOp(combined.Op, left, right)
@@ -7017,7 +7087,9 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		}
 		return formatArrayLiteral(elements), nil
 	case *parser.SubscriptExpr:
-		value, err := e.evalExprWithAggregates(ex.Expr, rows)
+		value, err := e.arrayOperand(ex.Expr, func() (interface{}, error) {
+			return e.evalExprWithAggregates(ex.Expr, rows)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -7025,20 +7097,22 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if err != nil {
 			return nil, err
 		}
-		return subscriptArrayValue(value, index)
+		return e.subscriptArrayValue(ex.Expr, value, index)
 	case *parser.AnyAllExpr:
 		left, err := e.evalExprWithAggregates(ex.Left, rows)
 		if err != nil {
 			return nil, err
 		}
-		arrayValue, err := e.evalExprWithAggregates(ex.Array, rows)
+		arrayValue, err := e.arrayOperand(ex.Array, func() (interface{}, error) {
+			return e.evalExprWithAggregates(ex.Array, rows)
+		})
 		if err != nil {
 			return nil, err
 		}
 		if arrayValue == nil {
 			return nil, nil
 		}
-		elements, err := parseArrayLiteral(toString(arrayValue))
+		elements, err := e.parsedArray(ex.Array, arrayValue)
 		if err != nil {
 			return nil, fmt.Errorf("ANY/ALL requires an array operand: %w", err)
 		}
@@ -7084,6 +7158,10 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 					sawNull = true
 					continue
 				}
+				v, canonErr := e.canonicalArrayValue(ex.Left, v)
+				if canonErr != nil {
+					return nil, canonErr
+				}
 				if compare(left, v) == 0 {
 					if ex.Not {
 						return false, nil
@@ -7116,6 +7194,10 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			if v == nil {
 				sawNull = true
 				continue
+			}
+			v, err = e.canonicalArrayValue(ex.Left, v)
+			if err != nil {
+				return nil, err
 			}
 			if compare(left, v) == 0 {
 				if ex.Not {

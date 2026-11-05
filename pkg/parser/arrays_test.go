@@ -138,6 +138,7 @@ func TestMultidimensionalAndUnsupportedElementArraysRejected(t *testing.T) {
 		`CREATE TABLE t (a BLOB[])`,
 		`CREATE TABLE t (a DATE[])`,
 		`SELECT ARRAY[ARRAY[1,2]]`,
+		`SELECT ARRAY[[1,2],[3,4]]`,
 	} {
 		t.Run(sql, func(t *testing.T) {
 			_, err := New(lexer.New(sql)).Parse()
@@ -184,5 +185,44 @@ func TestBracketIdentifierStillParses(t *testing.T) {
 	}
 	if stmt.From[0].Name != "table" {
 		t.Fatalf("FROM = %q, want table", stmt.From[0].Name)
+	}
+}
+
+// A bracket directly after an expression starts an array subscript, so the
+// SQLite bracket-quoted alias in that position is read as a subscript. The
+// projection shapes below therefore parse as subscripts and fail later (the
+// base is not an array); a bracket alias on a FROM entry has no subscript
+// position and is a syntax error. Bracket identifiers keep working wherever a
+// name is expected (after a keyword or a comma).
+func TestBracketAliasShapesAfterExpression(t *testing.T) {
+	for _, sql := range []string{
+		`SELECT count(*) [cnt] FROM t`,
+		`SELECT 1 [x]`,
+	} {
+		t.Run(sql, func(t *testing.T) {
+			stmt := parseOne(t, sql).(*SelectStmt)
+			if _, ok := stmt.Columns[0].Expr.(*SubscriptExpr); !ok {
+				t.Fatalf("%q projection = %T, want *SubscriptExpr", sql, stmt.Columns[0].Expr)
+			}
+		})
+	}
+	if _, err := New(lexer.New(`SELECT * FROM t [a]`)).Parse(); err == nil {
+		t.Fatal("bracket alias on a FROM entry parsed, want a syntax error")
+	}
+
+	// `[x]` after an expression is a subscript, not an alias.
+	stmt := parseOne(t, `SELECT arr[1] FROM t`).(*SelectStmt)
+	if _, ok := stmt.Columns[0].Expr.(*SubscriptExpr); !ok {
+		t.Fatalf("projection = %T, want *SubscriptExpr", stmt.Columns[0].Expr)
+	}
+
+	// Name positions after a keyword or comma still quote with brackets.
+	for _, sql := range []string{
+		`SELECT [col], [col2] FROM [tbl]`,
+		`INSERT INTO [tbl] ([col]) VALUES (1)`,
+	} {
+		if _, err := New(lexer.New(sql)).Parse(); err != nil {
+			t.Errorf("%q should keep bracket identifiers: %v", sql, err)
+		}
 	}
 }

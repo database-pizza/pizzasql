@@ -2655,6 +2655,12 @@ func (p *Parser) parseArrayConstructor() (Expr, error) {
 		return expr, nil
 	}
 	for {
+		// A bracketed identifier here is ARRAY[[...]] (or ARRAY[[col]]): the
+		// lexer reads the inner brackets as SQLite quoting, so report the
+		// nested-array shape explicitly instead of resolving a bogus column.
+		if p.curTokenIs(lexer.TokenIdent) && p.curToken.Bracketed {
+			return nil, pgerror.Unsupported("multidimensional arrays are not supported; ARRAY[...] elements must be scalars")
+		}
 		element, err := p.parseExpr()
 		if err != nil {
 			return nil, err

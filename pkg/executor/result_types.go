@@ -13,6 +13,78 @@ import (
 // type name declared in the schema.
 type columnTypeResolver func(table, column string) (string, bool)
 
+// snapshotTypeResolver builds a column-type resolver from the FROM clause. It
+// reads every table schema up front, before the statement takes the session lock
+// for its scan, so value-time lookups never re-enter the session lock (which
+// would deadlock the scan that is asking).
+func (e *Executor) snapshotTypeResolver(refs []parser.TableRef) columnTypeResolver {
+	type tableSnapshot struct {
+		name  string
+		alias string
+		types map[string]string
+	}
+	var tables []tableSnapshot
+	for _, ref := range collectAllTableRefs(refs) {
+		if ref.Subquery != nil || ref.Function != nil || ref.Name == "" {
+			continue
+		}
+		schema, err := e.session.GetSchema(ref.Name)
+		if err != nil {
+			continue
+		}
+		snapshot := tableSnapshot{name: ref.Name, alias: ref.Alias, types: make(map[string]string, len(schema.Columns))}
+		for _, column := range schema.Columns {
+			snapshot.types[strings.ToUpper(column.Name)] = column.Type
+		}
+		tables = append(tables, snapshot)
+	}
+	return func(table, column string) (string, bool) {
+		upper := strings.ToUpper(column)
+		for _, snapshot := range tables {
+			if table != "" && !strings.EqualFold(table, snapshot.alias) && !strings.EqualFold(table, snapshot.name) {
+				continue
+			}
+			if typeName, ok := snapshot.types[upper]; ok {
+				return typeName, true
+			}
+			if table != "" {
+				break
+			}
+		}
+		return "", false
+	}
+}
+
+// pushTypeScope adds the column-type resolver of the SELECT or DML statement
+// being evaluated. Scopes nest: the innermost resolver wins, and an outer
+// query's resolver still answers for correlated references.
+func (e *Executor) pushTypeScope(resolve columnTypeResolver) {
+	e.typeScopes = append(e.typeScopes, resolve)
+}
+
+// popTypeScope removes the innermost resolver pushed by pushTypeScope.
+func (e *Executor) popTypeScope() {
+	if len(e.typeScopes) == 0 {
+		return
+	}
+	e.typeScopes = e.typeScopes[:len(e.typeScopes)-1]
+}
+
+// resolveColumnType resolves a column reference against the active statement
+// scopes, innermost first. It reports false when no scope declares the column,
+// which leaves the caller on the TEXT fallback.
+func (e *Executor) resolveColumnType(table, column string) (string, bool) {
+	for i := len(e.typeScopes) - 1; i >= 0; i-- {
+		if e.typeScopes[i] == nil {
+			continue
+		}
+		if typeName, ok := e.typeScopes[i](table, column); ok {
+			return typeName, true
+		}
+	}
+	return "", false
+}
+
 // schemaTypeResolver builds a resolver over a single table schema. The table
 // qualifier is ignored because the analyzer has already validated it.
 func schemaTypeResolver(schema *storage.Schema) columnTypeResolver {
@@ -261,9 +333,10 @@ func subscriptResultType(expr *parser.SubscriptExpr, resolve columnTypeResolver)
 
 // arrayResultTypeName maps an element type name to the type name the wire layer
 // reports for the array. The mapping follows the element's carrier: INTEGER is
-// int4 and REAL is float4, matching the scalar mappings; narrower integer types
-// report int8[] because values are not range-checked, and NUMERIC/DECIMAL report
-// float8[] because the engine carries them as float64.
+// int4 and REAL is float4, matching the scalar mappings, and narrower integer
+// types report int8[] because values are not range-checked. NUMERIC/DECIMAL keep
+// their own array type: array elements are validated text, so their digits are
+// not rounded through float64.
 func arrayResultTypeName(elementType string) string {
 	switch strings.ToUpper(strings.TrimSpace(elementType)) {
 	case "INTEGER", "INT", "INT4":
@@ -272,8 +345,10 @@ func arrayResultTypeName(elementType string) string {
 		return "BIGINT[]"
 	case "REAL", "FLOAT", "FLOAT4":
 		return "REAL[]"
-	case "DOUBLE", "FLOAT8", "NUMERIC", "DECIMAL":
+	case "DOUBLE", "FLOAT8":
 		return "DOUBLE[]"
+	case "NUMERIC", "DECIMAL":
+		return "NUMERIC[]"
 	case "BOOLEAN", "BOOL":
 		return "BOOLEAN[]"
 	case "VARCHAR", "NVARCHAR", "CHARACTER VARYING":

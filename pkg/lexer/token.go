@@ -378,6 +378,10 @@ type Token struct {
 	Literal string
 	Line    int
 	Column  int
+	// Bracketed is set on an identifier that came from SQLite's [bracket]
+	// quoting, which lets the parser tell an identifier apart from a nested
+	// array literal in ARRAY[...] context.
+	Bracketed bool
 }
 
 func (t Token) String() string {

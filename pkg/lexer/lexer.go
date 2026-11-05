@@ -378,9 +378,10 @@ func (l *Lexer) readQuotedIdentifier(quote byte) Token {
 // readBracketIdentifier reads a [bracket identifier] (SQL Server style).
 func (l *Lexer) readBracketIdentifier() Token {
 	tok := Token{
-		Type:   TokenIdent,
-		Line:   l.line,
-		Column: l.column,
+		Type:      TokenIdent,
+		Line:      l.line,
+		Column:    l.column,
+		Bracketed: true,
 	}
 
 	l.readChar() // skip [

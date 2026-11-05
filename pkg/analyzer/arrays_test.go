@@ -15,8 +15,8 @@ func arrayCatalog() *Catalog {
 		Name: "documents",
 		Columns: []ColumnInfo{
 			{Name: "id", Type: TypeInteger, PrimaryKey: true},
-			{Name: "tags", Type: TypeFromName("TEXT[]"), Nullable: true},
-			{Name: "nums", Type: TypeFromName("INTEGER[]"), Nullable: true},
+			{Name: "tags", Type: TypeFromName("TEXT[]"), Nullable: true, Array: true},
+			{Name: "nums", Type: TypeFromName("INTEGER[]"), Nullable: true, Array: true},
 		},
 	})
 	return catalog
@@ -59,6 +59,9 @@ func TestArrayExpressionsAnalyze(t *testing.T) {
 		`SELECT array_length(tags, 1) FROM documents`,
 		`SELECT ARRAY['a','b'] FROM documents`,
 		`SELECT '{1,2}'::INTEGER[] FROM documents`,
+		`SELECT nums FROM documents WHERE nums = '{3,4}'`,
+		`SELECT nums FROM documents WHERE '{3,4}' = nums`,
+		`SELECT nums FROM documents WHERE nums <> '{3,4}'`,
 	} {
 		if err := a.Analyze(parse(t, sql)); err != nil {
 			t.Errorf("analyze %q: %v", sql, err)
@@ -74,6 +77,11 @@ func TestArrayExpressionRejections(t *testing.T) {
 	}{
 		{`SELECT missing[1] FROM documents`, "column not found"},
 		{`SELECT tags['x'] FROM documents`, "array subscript must be an integer expression"},
+		// A text literal is only coercible to an array side, not to a scalar
+		// integer column.
+		{`SELECT id FROM documents WHERE id = '{3,4}'`, "cannot compare INTEGER with TEXT"},
+		// An array column still does not compare with a scalar number.
+		{`SELECT nums FROM documents WHERE nums = 5`, "cannot compare INTEGER with INTEGER"},
 	}
 	for _, tc := range cases {
 		err := a.Analyze(parse(t, tc.sql))

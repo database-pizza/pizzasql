@@ -29,6 +29,7 @@ const (
 	arrayElementText arrayElementKind = iota
 	arrayElementInteger
 	arrayElementReal
+	arrayElementNumeric
 	arrayElementBoolean
 )
 
@@ -58,8 +59,12 @@ func arrayElementKindForName(name string) (arrayElementKind, error) {
 		return arrayElementText, nil
 	case "INTEGER", "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
 		return arrayElementInteger, nil
-	case "REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL":
+	case "REAL", "FLOAT", "DOUBLE":
 		return arrayElementReal, nil
+	case "NUMERIC", "DECIMAL":
+		// NUMERIC elements keep their exact text: the engine's float64 carrier
+		// would lose digits above 2^53 and trailing zeros.
+		return arrayElementNumeric, nil
 	case "BOOLEAN", "BOOL":
 		return arrayElementBoolean, nil
 	default:
@@ -132,6 +137,9 @@ func parseArrayLiteral(text string) ([]*string, error) {
 				i++
 			}
 			raw := strings.TrimSpace(inner[start:i])
+			if raw == "" {
+				return nil, invalidArrayInput(text, "empty array element")
+			}
 			if !strings.EqualFold(raw, "NULL") {
 				value = &raw
 			}
@@ -256,6 +264,12 @@ func canonicalArrayElement(element *string, kind arrayElementKind, typeName stri
 		}
 		canonical := strconv.FormatFloat(f, 'g', -1, 64)
 		return &canonical, nil
+	case arrayElementNumeric:
+		if !isNumericArrayElement(raw) {
+			return nil, pgerror.InvalidText("invalid input syntax for type %s: %q", typeName, raw)
+		}
+		canonical := raw
+		return &canonical, nil
 	case arrayElementBoolean:
 		value, ok := parseArrayBoolean(raw)
 		if !ok {
@@ -298,15 +312,43 @@ func arrayElementValue(element *string, elementType string) (interface{}, error)
 	raw := *element
 	switch kind {
 	case arrayElementInteger:
-		return strconv.ParseInt(raw, 10, 64)
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nil, pgerror.InvalidText("invalid input syntax for type integer: %q", raw)
+		}
+		return n, nil
 	case arrayElementReal:
-		return strconv.ParseFloat(raw, 64)
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, pgerror.InvalidText("invalid input syntax for type double precision: %q", raw)
+		}
+		return f, nil
+	case arrayElementNumeric:
+		if !isNumericArrayElement(raw) {
+			return nil, pgerror.InvalidText("invalid input syntax for type numeric: %q", raw)
+		}
+		// Return the text so a value above 2^53 keeps every digit.
+		return raw, nil
 	case arrayElementBoolean:
-		value, _ := parseArrayBoolean(raw)
+		value, ok := parseArrayBoolean(raw)
+		if !ok {
+			return nil, pgerror.InvalidText("invalid input syntax for type boolean: %q", raw)
+		}
 		return value, nil
 	default:
 		return raw, nil
 	}
+}
+
+// isNumericArrayElement reports whether text is a valid SQL numeric spelling.
+// NUMERIC elements are not rewritten, so this is validation only.
+func isNumericArrayElement(raw string) bool {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return false
+	}
+	_, err := strconv.ParseFloat(text, 64)
+	return err == nil
 }
 
 // arrayValueElement renders one evaluated expression value as a canonical array
@@ -356,11 +398,99 @@ func (e *Executor) evalArrayExpr(expr *parser.ArrayExpr, row storage.Row) (inter
 	return formatArrayLiteral(elements), nil
 }
 
+// arrayExpressionIsConstant reports whether evaluating an array expression once
+// per statement is safe: it references no columns and no volatile function.
+func arrayExpressionIsConstant(expr parser.Expr) bool {
+	if expr == nil || len(collectColumnRefs(expr)) != 0 {
+		return false
+	}
+	return ValidateDeterministicExpr(expr) == nil
+}
+
+// arrayOperand evaluates an array-valued expression through the per-statement
+// value cache. A constant operand is evaluated once for the whole scan instead
+// of once per row; a column-dependent operand is re-evaluated every time.
+func (e *Executor) arrayOperand(expr parser.Expr, evaluate func() (interface{}, error)) (interface{}, error) {
+	if e.arrayValueCache != nil && expr != nil {
+		if value, ok := e.arrayValueCache[expr]; ok {
+			return value, nil
+		}
+	}
+	value, err := evaluate()
+	if err != nil {
+		return nil, err
+	}
+	if e.arrayValueCache != nil && expr != nil && arrayExpressionIsConstant(expr) {
+		e.arrayValueCache[expr] = value
+	}
+	return value, nil
+}
+
+// arrayParseEntry memoizes the parsed elements of one array expression for the
+// current statement. The evaluated text is compared before a hit is used, so a
+// value that changes between rows or between executions is re-parsed.
+type arrayParseEntry struct {
+	text     string
+	elements []*string
+	err      error
+}
+
+// parsedArray parses an evaluated array value for one expression. The
+// per-statement cache keyed by AST node keeps `= ANY($1)` to one parse for the
+// whole scan instead of one parse per row.
+func (e *Executor) parsedArray(expr parser.Expr, value interface{}) ([]*string, error) {
+	text := toString(value)
+	if e.arrayCache != nil && expr != nil {
+		if entry, ok := e.arrayCache[expr]; ok && entry.text == text {
+			return entry.elements, entry.err
+		}
+	}
+	elements, err := parseArrayLiteral(text)
+	if e.arrayCache != nil && expr != nil {
+		e.arrayCache[expr] = &arrayParseEntry{text: text, elements: elements, err: err}
+	}
+	return elements, err
+}
+
+// arrayElementTypeOf reports the element type of an expression whose value is an
+// array, resolved against the declared column types of the query currently
+// executing. An unknown type (a derived table, a bare literal) reports false so
+// the caller keeps the element text.
+func (e *Executor) arrayElementTypeOf(expr parser.Expr) (string, bool) {
+	if expr == nil {
+		return "", false
+	}
+	return arrayElementType(inferExprType(expr, e.resolveColumnType))
+}
+
+// arrayIndexValue validates an array subscript or array_length dimension.
+// PostgreSQL's signatures take integers; floats, booleans, and text are a
+// datatype mismatch, not an implicit truncation.
+func arrayIndexValue(value interface{}, what string) (int64, error) {
+	switch v := value.(type) {
+	case int64:
+		return v, nil
+	case int:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	default:
+		return 0, pgerror.DatatypeMismatch("%s must be an integer, got %T", what, value)
+	}
+}
+
 // evalSubscriptExpr evaluates arr[index] with PostgreSQL's 1-based indexing. An
 // out-of-range subscript yields NULL, and a NULL array, index, or element yields
-// NULL.
+// NULL. The element is decoded to the array's declared element type so a
+// boolean subscript is a Go bool rather than the canonical t/f text.
 func (e *Executor) evalSubscriptExpr(expr *parser.SubscriptExpr, row storage.Row) (interface{}, error) {
-	value, err := e.evalExpr(expr.Expr, row)
+	value, err := e.arrayOperand(expr.Expr, func() (interface{}, error) {
+		return e.evalExpr(expr.Expr, row)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -368,19 +498,22 @@ func (e *Executor) evalSubscriptExpr(expr *parser.SubscriptExpr, row storage.Row
 	if err != nil {
 		return nil, err
 	}
-	return subscriptArrayValue(value, index)
+	return e.subscriptArrayValue(expr.Expr, value, index)
 }
 
 // subscriptArrayValue applies a 1-based subscript to an evaluated array value.
-func subscriptArrayValue(value, index interface{}) (interface{}, error) {
+func (e *Executor) subscriptArrayValue(arrayExpr parser.Expr, value, index interface{}) (interface{}, error) {
 	if value == nil || index == nil {
 		return nil, nil
 	}
-	elements, err := parseArrayLiteral(toString(value))
+	position, err := arrayIndexValue(index, "array subscript")
+	if err != nil {
+		return nil, err
+	}
+	elements, err := e.parsedArray(arrayExpr, value)
 	if err != nil {
 		return nil, fmt.Errorf("array subscript requires an array value: %w", err)
 	}
-	position := toInt64(index)
 	if position < 1 || position > int64(len(elements)) {
 		return nil, nil
 	}
@@ -388,7 +521,11 @@ func subscriptArrayValue(value, index interface{}) (interface{}, error) {
 	if element == nil {
 		return nil, nil
 	}
-	return *element, nil
+	elementType, ok := e.arrayElementTypeOf(arrayExpr)
+	if !ok {
+		return *element, nil
+	}
+	return arrayElementValue(element, elementType)
 }
 
 // evalAnyAllExpr evaluates `left op ANY(array)` / `left op ALL(array)` with SQL
@@ -399,14 +536,16 @@ func (e *Executor) evalAnyAllExpr(expr *parser.AnyAllExpr, row storage.Row) (int
 	if err != nil {
 		return nil, err
 	}
-	arrayValue, err := e.evalExpr(expr.Array, row)
+	arrayValue, err := e.arrayOperand(expr.Array, func() (interface{}, error) {
+		return e.evalExpr(expr.Array, row)
+	})
 	if err != nil {
 		return nil, err
 	}
 	if arrayValue == nil {
 		return nil, nil
 	}
-	elements, err := parseArrayLiteral(toString(arrayValue))
+	elements, err := e.parsedArray(expr.Array, arrayValue)
 	if err != nil {
 		return nil, fmt.Errorf("ANY/ALL requires an array operand: %w", err)
 	}
@@ -481,17 +620,21 @@ func compareArrayElement(op lexer.TokenType, left interface{}, element string) (
 // evalArrayLength implements array_length(array, dimension). Only dimension 1 is
 // meaningful for a one-dimensional array; any other dimension yields NULL, as
 // PostgreSQL does for an out-of-range dimension of a non-nested array.
-func evalArrayLength(args []interface{}) (interface{}, error) {
+func (e *Executor) evalArrayLength(arrayExpr parser.Expr, args []interface{}) (interface{}, error) {
 	if len(args) != 2 {
 		return nil, fmt.Errorf("array_length requires two arguments")
 	}
 	if args[0] == nil || args[1] == nil {
 		return nil, nil
 	}
-	if toInt64(args[1]) != 1 {
+	dimension, err := arrayIndexValue(args[1], "array dimension")
+	if err != nil {
+		return nil, err
+	}
+	if dimension != 1 {
 		return nil, nil
 	}
-	elements, err := parseArrayLiteral(toString(args[0]))
+	elements, err := e.parsedArray(arrayExpr, args[0])
 	if err != nil {
 		return nil, fmt.Errorf("array_length requires an array value: %w", err)
 	}
@@ -500,6 +643,53 @@ func evalArrayLength(args []interface{}) (interface{}, error) {
 		return nil, nil
 	}
 	return int64(len(elements)), nil
+}
+
+// arrayTypeOf reports the declared array type of an expression, if any.
+func (e *Executor) arrayTypeOf(expr parser.Expr) (string, bool) {
+	if expr == nil {
+		return "", false
+	}
+	typeName := inferExprType(expr, e.resolveColumnType)
+	if _, ok := arrayElementType(typeName); !ok {
+		return "", false
+	}
+	return typeName, true
+}
+
+// canonicalArrayValue canonicalizes a value against the array type of expr. It
+// is a no-op for non-array expressions, NULL, and non-string values.
+func (e *Executor) canonicalArrayValue(arrayExpr parser.Expr, value interface{}) (interface{}, error) {
+	typeName, ok := e.arrayTypeOf(arrayExpr)
+	if !ok || value == nil {
+		return value, nil
+	}
+	text, isText := value.(string)
+	if !isText {
+		return value, nil
+	}
+	return canonicalArrayText(text, typeName)
+}
+
+// canonicalizeArrayComparison canonicalizes the string operand of a comparison
+// when the other operand is array-typed, so a text literal such as '{a, b}' or
+// '{"a","b"}' compares equal to the canonical stored '{a,b}'.
+func (e *Executor) canonicalizeArrayComparison(leftExpr, rightExpr parser.Expr, left, right interface{}) (interface{}, interface{}, error) {
+	if _, ok := e.arrayTypeOf(leftExpr); ok {
+		canonical, err := e.canonicalArrayValue(leftExpr, right)
+		if err != nil {
+			return nil, nil, err
+		}
+		right = canonical
+	}
+	if _, ok := e.arrayTypeOf(rightExpr); ok {
+		canonical, err := e.canonicalArrayValue(rightExpr, left)
+		if err != nil {
+			return nil, nil, err
+		}
+		left = canonical
+	}
+	return left, right, nil
 }
 
 // evalArrayCast converts a value to an array type. The input must already be

@@ -305,3 +305,133 @@ func (c *countingConn) reset() {
 	defer c.mu.Unlock()
 	c.buf.Reset()
 }
+
+// A parameter inside a subscript must bind: brackets are ordinary syntax, not a
+// quoted region.
+func TestArraySubscriptParameterBinding(t *testing.T) {
+	c, conn := arrayConnection(t)
+	for _, sql := range []string{
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])`,
+		`INSERT INTO t VALUES (1, '{a,b,c}')`,
+	} {
+		if _, err := c.executor.Execute(parseStmt(t, sql)); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	messages := runExtendedParseBindExecute(t, c, conn, `SELECT tags[$1] FROM t`, 23, "2")
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("tags[$1] failed: %s", errorCode(errMsg))
+	}
+	if row := firstDataRow(t, messages); len(row) != 1 || row[0] != "b" {
+		t.Fatalf("tags[$1] row = %v, want [b]", row)
+	}
+
+	// An untyped parameter binds the same way.
+	conn.reset()
+	messages = runExtendedParseBindExecute(t, c, conn, `SELECT tags[$1] FROM t`, 0, "3")
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("untyped tags[$1] failed: %s", errorCode(errMsg))
+	}
+	if row := firstDataRow(t, messages); len(row) != 1 || row[0] != "c" {
+		t.Fatalf("untyped tags[$1] row = %v, want [c]", row)
+	}
+}
+
+// Quotes and backslashes inside a bound array element survive canonicalization,
+// SQL-literal interpolation, casting, and storage unchanged.
+func TestArrayParameterEscapedElements(t *testing.T) {
+	c, conn := arrayConnection(t)
+	if _, err := c.executor.Execute(parseStmt(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])`)); err != nil {
+		t.Fatal(err)
+	}
+	const arrayText = "{\"it's\",\"back\\\\slash\"}"
+	const canonical = "{it's,\"back\\\\slash\"}"
+
+	messages := runExtendedParseBindExecute(t, c, conn, `SELECT $1::TEXT[]`, 1009, arrayText)
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("escaped array cast failed: %s", errorCode(errMsg))
+	}
+	if row := firstDataRow(t, messages); len(row) != 1 || row[0] != canonical {
+		t.Fatalf("escaped array text = %v, want %s", row, canonical)
+	}
+
+	conn.reset()
+	messages = runExtendedParseBindExecute(t, c, conn, `INSERT INTO t VALUES (1, $1) RETURNING tags`, 1009, arrayText)
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("escaped array insert failed: %s", errorCode(errMsg))
+	}
+	if row := firstDataRow(t, messages); len(row) != 1 || row[0] != canonical {
+		t.Fatalf("escaped array insert = %v, want %s", row, canonical)
+	}
+}
+
+func TestNumericArrayCastOID(t *testing.T) {
+	c, conn := arrayConnection(t)
+	messages := runSimple(t, c, conn, `SELECT '{1.10,12345678901234567890}'::NUMERIC[] AS amounts`)
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("numeric array cast failed: %s", errorCode(errMsg))
+	}
+	rd := findRowDescription(t, messages)
+	if oid := rowDescriptionOIDs(t, rd.Data)[0]; oid != 1231 {
+		t.Fatalf("numeric array OID = %d, want 1231", oid)
+	}
+	if row := firstDataRow(t, messages); row[0] != "{1.10,12345678901234567890}" {
+		t.Fatalf("numeric array value = %v", row[0])
+	}
+}
+
+func TestArrayIndexTypeSQLState(t *testing.T) {
+	c, conn := arrayConnection(t)
+	for _, sql := range []string{
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, nums INTEGER[])`,
+		`INSERT INTO t VALUES (1, '{10,20}')`,
+	} {
+		if _, err := c.executor.Execute(parseStmt(t, sql)); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	for _, sql := range []string{
+		`SELECT nums[1.5] FROM t`,
+		`SELECT nums[TRUE] FROM t`,
+		`SELECT nums['x'] FROM t`,
+		`SELECT array_length(nums, 1.5) FROM t`,
+	} {
+		conn.reset()
+		messages := runSimple(t, c, conn, sql)
+		errMsg := findError(messages)
+		if errMsg == nil {
+			t.Errorf("%s was accepted", sql)
+			continue
+		}
+		if code := errorCode(errMsg); code != ErrCodeDatatypeMismatch {
+			t.Errorf("%s SQLSTATE = %q, want %q", sql, code, ErrCodeDatatypeMismatch)
+		}
+	}
+}
+
+func TestBooleanSubscriptPredicateOverSimpleQuery(t *testing.T) {
+	c, conn := arrayConnection(t)
+	for _, sql := range []string{
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, flags BOOLEAN[])`,
+		`INSERT INTO t VALUES (1, '{t,f}'), (2, '{f,t}')`,
+	} {
+		if _, err := c.executor.Execute(parseStmt(t, sql)); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	for _, tc := range []struct{ sql, want string }{
+		{`SELECT count(*) FROM t WHERE flags[1]`, "1"},
+		{`SELECT count(*) FROM t WHERE NOT flags[1]`, "1"},
+		{`SELECT count(*) FROM t WHERE flags[1] = TRUE`, "1"},
+	} {
+		conn.reset()
+		messages := runSimple(t, c, conn, tc.sql)
+		if errMsg := findError(messages); errMsg != nil {
+			t.Fatalf("%s failed: %s", tc.sql, errorCode(errMsg))
+		}
+		if row := firstDataRow(t, messages); len(row) != 1 || row[0] != tc.want {
+			t.Errorf("%s = %v, want %s", tc.sql, row, tc.want)
+		}
+	}
+}

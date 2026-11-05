@@ -11,6 +11,7 @@ import (
 const (
 	CodeFeatureNotSupported  = "0A000"
 	CodeInvalidText          = "22P02"
+	CodeDatatypeMismatch     = "42804"
 	CodeUniqueViolation      = "23505"
 	CodeForeignKeyViolation  = "23503"
 	CodeCheckViolation       = "23514"
@@ -39,4 +40,15 @@ var ErrInvalidText = errors.New("invalid text representation")
 // explanation of the rejected input.
 func InvalidText(format string, args ...interface{}) error {
 	return fmt.Errorf("%w: %s", ErrInvalidText, fmt.Sprintf(format, args...))
+}
+
+// ErrDatatypeMismatch marks a value whose type is wrong for the operation it is
+// used in, such as a non-integer array subscript. Protocol layers map it to
+// SQLSTATE 42804 (datatype_mismatch).
+var ErrDatatypeMismatch = errors.New("datatype mismatch")
+
+// DatatypeMismatch returns an error that wraps ErrDatatypeMismatch with a
+// client-facing explanation of the incompatible value.
+func DatatypeMismatch(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrDatatypeMismatch, fmt.Sprintf(format, args...))
 }

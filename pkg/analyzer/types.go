@@ -323,6 +323,9 @@ type ColumnInfo struct {
 	Default    interface{}
 	TableName  string // For qualified references
 	Generated  bool   // generated columns cannot be written by the user
+	// Array marks a one-dimensional array column. Type holds the element's
+	// affinity, so comparisons need this flag to accept a text array literal.
+	Array bool
 }
 
 // TableInfo describes a table schema.
@@ -354,4 +357,6 @@ type ExprInfo struct {
 	IsAggregate bool
 	IsConstant  bool
 	Nullable    bool
+	// Array marks an expression whose value is an array.
+	Array bool
 }

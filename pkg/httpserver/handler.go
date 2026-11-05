@@ -11,6 +11,7 @@ import (
 
 	"github.com/goccy/go-json"
 
+	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/capabilities"
 	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
 	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
@@ -539,6 +540,14 @@ func sqlStateHTTPError(err error) *HTTPError {
 		return &HTTPError{
 			Status:  http.StatusBadRequest,
 			Code:    pgerror.CodeInvalidText,
+			Message: message,
+		}
+	}
+	var analysisErr *analyzer.AnalysisError
+	if errors.Is(err, pgerror.ErrDatatypeMismatch) || (errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch) {
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    pgerror.CodeDatatypeMismatch,
 			Message: message,
 		}
 	}
