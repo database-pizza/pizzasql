@@ -391,7 +391,7 @@ func (s *Session) stageCascadeUpdate(table string, oldRow, newRow Row, exp *casc
 	newKey := s.table.dataKey(table, newPK)
 	if oldKey != newKey {
 		if _, gerr := s.getByPKLocked(table, newPK); gerr == nil {
-			return &PrimaryKeyViolationError{Table: table, Key: newPK}
+			return newPrimaryKeyViolation(table, schema, newRow)
 		} else if gerr != ErrKeyNotFound {
 			return gerr
 		}

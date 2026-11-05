@@ -736,7 +736,7 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	if !committed {
-		return 0, &PrimaryKeyViolationError{Table: table, Key: strings.TrimPrefix(key, m.dataPrefix(table))}
+		return 0, newPrimaryKeyViolation(table, schema, nr)
 	}
 
 	m.applyUniquePlan(uniquePlan, nil)
@@ -854,7 +854,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 	for i, op := range ops {
 		key := string(op.Key)
 		if _, duplicate := seen[key]; duplicate {
-			return 0, 0, &PrimaryKeyViolationError{Table: table, Key: key}
+			return 0, 0, newPrimaryKeyViolation(table, schema, normalized[i])
 		}
 		seen[key] = struct{}{}
 		keys[i] = op.Key
@@ -878,7 +878,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 	}
 	for i, found := range existing {
 		if found {
-			return 0, 0, &PrimaryKeyViolationError{Table: table, Key: string(ops[i].Key)}
+			return 0, 0, newPrimaryKeyViolation(table, schema, normalized[i])
 		}
 	}
 

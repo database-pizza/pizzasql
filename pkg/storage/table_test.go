@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -289,12 +290,47 @@ func TestInsertBulkStringPrimaryKeyCount(t *testing.T) {
 	}
 	if n, err := tables.InsertBulk("labels", []Row{{"id": "a", "value": "duplicate"}}); err == nil || n != 0 {
 		t.Fatalf("existing duplicate: n=%d err=%v", n, err)
+	} else if got, want := err.Error(), "duplicate primary key: 'a'"; got != want {
+		t.Fatalf("existing duplicate message = %q, want %q", got, want)
 	}
 	if n, err := tables.InsertBulk("labels", []Row{{"id": "c"}, {"id": "c"}}); err == nil || n != 0 {
 		t.Fatalf("batch duplicate: n=%d err=%v", n, err)
+	} else if got, want := err.Error(), "duplicate primary key: 'c'"; got != want {
+		t.Fatalf("batch duplicate message = %q, want %q", got, want)
 	}
 	if _, err := tables.GetByPK("labels", "c"); err == nil {
 		t.Fatal("duplicate batch persisted a row")
+	}
+}
+
+// A single-column key reports its value; a TEXT key containing the row-key
+// separator or a quote is rendered as a SQL literal.
+func TestSingleColumnPrimaryKeyViolationMessage(t *testing.T) {
+	_, _, schemas, tables := newTestSession(t)
+	createTestTable(t, schemas, "nums", []Column{{Name: "id", Type: "INTEGER", PrimaryKey: true}})
+	createTestTable(t, schemas, "texts", []Column{{Name: "id", Type: "TEXT", PrimaryKey: true}})
+
+	cases := []struct {
+		table string
+		value interface{}
+		want  string
+	}{
+		{"nums", int64(1), "duplicate primary key: 1"},
+		{"texts", "a:1", "duplicate primary key: 'a:1'"},
+		{"texts", "o'brien", "duplicate primary key: 'o''brien'"},
+	}
+	for _, tc := range cases {
+		if err := tables.Insert(tc.table, Row{"id": tc.value}); err != nil {
+			t.Fatalf("insert %s %v: %v", tc.table, tc.value, err)
+		}
+		err := tables.Insert(tc.table, Row{"id": tc.value})
+		var duplicate *PrimaryKeyViolationError
+		if !errors.As(err, &duplicate) {
+			t.Fatalf("duplicate insert %s %v error = %v, want PrimaryKeyViolationError", tc.table, tc.value, err)
+		}
+		if got := err.Error(); got != tc.want {
+			t.Fatalf("duplicate insert %s %v message = %q, want %q", tc.table, tc.value, got, tc.want)
+		}
 	}
 }
 

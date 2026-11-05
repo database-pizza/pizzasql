@@ -95,6 +95,18 @@ func TestForeignKeyUpdateCascade(t *testing.T) {
 	if res := execMust(t, e, "SELECT pa, pb FROM cchild WHERE id = 10"); res.Rows[0][0] != "y" || res.Rows[0][1] != int64(2) {
 		t.Fatalf("composite child after cascade = %v, want ('y', 2)", res.Rows)
 	}
+
+	// A cascaded key move onto an existing row reports the key components, not
+	// the durable length-prefixed encoding.
+	execMust(t, e, "INSERT INTO cparent (a, b) VALUES ('z', 3)")
+	_, err := execSQL(e, "UPDATE cparent SET a = 'z', b = 3 WHERE a = 'y' AND b = 2")
+	var duplicate *storage.PrimaryKeyViolationError
+	if !errors.As(err, &duplicate) {
+		t.Fatalf("colliding cascade error = %v, want PrimaryKeyViolationError", err)
+	}
+	if got, want := err.Error(), "duplicate primary key: ('z',3)"; got != want {
+		t.Fatalf("colliding cascade message = %q, want %q", got, want)
+	}
 }
 
 // SET NULL clears the child columns on delete and on a key update, and a NOT
