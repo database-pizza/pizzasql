@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/danfragoso/pizzasql-next/pkg/lexer"
+	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
@@ -361,6 +363,14 @@ func TestCheckConstraintRejectsUnsupportedExpressions(t *testing.T) {
 			ddl:  "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (t.age > 0))",
 		},
 		{
+			name: "qualified column in parentheses",
+			ddl:  "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK ((t.age) > 0))",
+		},
+		{
+			name: "qualified column in cast",
+			ddl:  "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (CAST(t.age AS INTEGER) > 0))",
+		},
+		{
 			name: "unknown column",
 			ddl:  "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK (missing > 0))",
 		},
@@ -466,5 +476,50 @@ func TestCheckConstraintExpressionRoundTrip(t *testing.T) {
 				requireCheckViolation(t, err, "")
 			}
 		})
+	}
+}
+
+// The persisted predicate text must round-trip. A quoted keyword column is the
+// motivating case: FormatExpr quotes it, so CREATE TABLE, later writes, and a
+// durable reload all keep binding to the column instead of the keyword.
+func TestCheckConstraintQuotedKeywordColumn(t *testing.T) {
+	pool, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (id INTEGER PRIMARY KEY, "order" INTEGER CHECK ("order" > 0))`)
+
+	stored, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if len(stored.Checks) != 1 {
+		t.Fatalf("checks = %+v, want 1", stored.Checks)
+	}
+	if !strings.Contains(stored.Checks[0].Expression, `"order"`) {
+		t.Fatalf("stored expression = %q, want the keyword column quoted", stored.Checks[0].Expression)
+	}
+
+	_, err = execSQL(e, `INSERT INTO t (id, "order") VALUES (1, -1)`)
+	requireCheckViolation(t, err, "")
+	execMust(t, e, `INSERT INTO t (id, "order") VALUES (1, 3)`)
+
+	// The durable text stays evaluable after reload.
+	reloaded := storage.NewSchemaManager(pool, "testdb")
+	reopened := newExec(reloaded, storage.NewTableManager(pool, reloaded, "testdb"))
+	_, err = execSQL(reopened, `INSERT INTO t (id, "order") VALUES (2, -2)`)
+	requireCheckViolation(t, err, "")
+	execMust(t, reopened, `INSERT INTO t (id, "order") VALUES (2, 4)`)
+}
+
+// A predicate whose formatted text cannot be re-parsed is rejected at DDL time
+// instead of being published as a constraint that fails every later write.
+func TestCheckConstraintRejectsNonRoundTrippingExpression(t *testing.T) {
+	schema := &storage.Schema{Name: "t", Columns: []storage.Column{{Name: "id", Type: "INTEGER"}}}
+	// FormatExpr renders a number literal verbatim; this one is not valid SQL.
+	_, err := checkConstraintFor("", &parser.LiteralExpr{Type: lexer.TokenNumber, Value: "1 +"}, schema)
+	if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+		t.Fatalf("error = %v, want ErrFeatureNotSupported", err)
+	}
+	if !strings.Contains(err.Error(), "cannot be stored") {
+		t.Fatalf("error = %q, want the round-trip explanation", err.Error())
 	}
 }

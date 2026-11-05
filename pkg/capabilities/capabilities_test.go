@@ -2,6 +2,7 @@ package capabilities
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
@@ -88,5 +89,18 @@ func TestCheckConstraintIsAdvertised(t *testing.T) {
 	}
 	if got := doc.ErrorCodes[pgerror.CodeCheckViolation]; got != "check_violation" {
 		t.Fatalf("23514 mapping = %q, want check_violation", got)
+	}
+}
+
+func TestDDLNotesDescribeCheckDependencies(t *testing.T) {
+	doc := Current()
+	if !strings.Contains(doc.DDL.DropColumn.Notes, "CHECK") || !strings.Contains(doc.DDL.DropColumn.Notes, "0A000") {
+		t.Fatalf("drop_column notes = %q, want the persisted CHECK restriction", doc.DDL.DropColumn.Notes)
+	}
+	if !strings.Contains(doc.DDL.RenameColumn.Notes, "CHECK") || !strings.Contains(doc.DDL.RenameColumn.Notes, "0A000") {
+		t.Fatalf("rename_column notes = %q, want the persisted CHECK restriction", doc.DDL.RenameColumn.Notes)
+	}
+	if !strings.Contains(doc.DDL.AddColumnBackfill.Notes, "23514") {
+		t.Fatalf("add_column_backfill notes = %q, want the CHECK backfill failure", doc.DDL.AddColumnBackfill.Notes)
 	}
 }

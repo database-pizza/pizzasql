@@ -176,9 +176,9 @@ func Current() *Document {
 
 		DDL: DDL{
 			AddColumn:              Feature{Supported: true, Status: "materializes_constant_default", Notes: "adds one nullable column; a constant DEFAULT is written into every existing row, so the rewrite cost is O(rows) and holds the table's exclusive gate"},
-			AddColumnBackfill:      Feature{Supported: true, Status: "rewrites_rows", Notes: "a constant DEFAULT is materialized into existing rows at DDL time; ADD COLUMN ... NOT NULL without a DEFAULT fails with 23502 on a non-empty table, ADD COLUMN ... UNIQUE conflicts with 23505 when backfilling a non-NULL default into more than one row, and the column is published together with its UNIQUE index in one atomic schema write"},
-			DropColumn:             Feature{Supported: true, Status: "rewrites_rows"},
-			RenameColumn:           Feature{Supported: true, Status: "rewrites_rows"},
+			AddColumnBackfill:      Feature{Supported: true, Status: "rewrites_rows", Notes: "a constant DEFAULT is materialized into existing rows at DDL time; ADD COLUMN ... NOT NULL without a DEFAULT fails with 23502 on a non-empty table, ADD COLUMN ... UNIQUE conflicts with 23505 when backfilling a non-NULL default into more than one row, ADD COLUMN ... CHECK fails with 23514 when an existing row or the backfilled default violates the predicate, and the column is published together with its CHECK constraints and UNIQUE index in one atomic schema write"},
+			DropColumn:             Feature{Supported: true, Status: "rewrites_rows", Notes: "rejected with 0A000 when a persisted CHECK constraint references the column; the stored predicate text cannot be rewritten"},
+			RenameColumn:           Feature{Supported: true, Status: "rewrites_rows", Notes: "rejected with 0A000 when a persisted CHECK constraint or expression index references the column; the stored expression text cannot be rewritten"},
 			RenameColumnIndexes:    Feature{Supported: true, Status: "rewrites_index_metadata", Notes: "column references in index definitions are rewritten in place, including composite and unique indexes; index names are unchanged; RENAME COLUMN is rejected when an expression index references the column (drop that index, rename, then recreate it)"},
 			CreateTableIfNotExists: true,
 			AddColumnIfNotExists:   true,

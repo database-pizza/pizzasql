@@ -17,16 +17,23 @@ import (
 // simple-query behavior can be asserted end to end.
 func newDataConnection(t *testing.T) (*Connection, net.Conn) {
 	t.Helper()
-	server, client := net.Pipe()
-	t.Cleanup(func() {
-		server.Close()
-		client.Close()
-	})
 	kv := testkv.New(t)
 	pool := kv.Pool(4)
 	t.Cleanup(func() { pool.Close() })
 	schema := storage.NewSchemaManager(pool, "pg_features")
 	table := storage.NewTableManager(pool, schema, "pg_features")
+	return newDataConnectionFor(t, schema, table)
+}
+
+// newDataConnectionFor wires a wire connection to an existing storage engine, so
+// a test can drive two independent sessions over one shared store.
+func newDataConnectionFor(t *testing.T, schema *storage.SchemaManager, table *storage.TableManager) (*Connection, net.Conn) {
+	t.Helper()
+	server, client := net.Pipe()
+	t.Cleanup(func() {
+		server.Close()
+		client.Close()
+	})
 	exec := executor.New(schema, table)
 	exec.SyncCatalog()
 

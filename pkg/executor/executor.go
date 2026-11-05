@@ -23,6 +23,12 @@ import (
 // feature-not-supported SQLSTATE rather than a generic internal error.
 var ErrUnsupportedFeature = errors.New("unsupported feature")
 
+// ErrNoTransaction marks a transaction-control statement that found no
+// transaction to act on. Adapters may report it as a benign no-op (PostgreSQL
+// treats ROLLBACK outside a transaction as a warning) instead of an internal
+// error.
+var ErrNoTransaction = errors.New("no transaction in progress")
+
 // Executor executes SQL statements.
 type Executor struct {
 	schema   *storage.SchemaManager
@@ -4343,7 +4349,7 @@ func (e *Executor) executeBegin(stmt *parser.BeginStmt) (*Result, error) {
 // executeCommit commits the current transaction.
 func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 	if !e.inTransaction {
-		return nil, fmt.Errorf("cannot commit: no transaction in progress")
+		return nil, fmt.Errorf("cannot commit: %w", ErrNoTransaction)
 	}
 
 	lsn, err := e.session.CommitWithLSN()
@@ -4368,7 +4374,7 @@ func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 // executeRollback rolls back the current transaction or to a savepoint.
 func (e *Executor) executeRollback(stmt *parser.RollbackStmt) (*Result, error) {
 	if !e.inTransaction {
-		return nil, fmt.Errorf("cannot rollback: no transaction in progress")
+		return nil, fmt.Errorf("cannot rollback: %w", ErrNoTransaction)
 	}
 
 	if stmt.Savepoint != "" {
@@ -4415,7 +4421,7 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 // executeRelease releases a savepoint.
 func (e *Executor) executeRelease(stmt *parser.ReleaseStmt) (*Result, error) {
 	if !e.inTransaction {
-		return nil, fmt.Errorf("cannot release savepoint: no transaction in progress")
+		return nil, fmt.Errorf("cannot release savepoint: %w", ErrNoTransaction)
 	}
 
 	// Find and remove the savepoint
@@ -7553,6 +7559,10 @@ func collectTableColumnRefs(expr parser.Expr) []tableColRef {
 			for _, a := range n.Args {
 				walk(a)
 			}
+		case *parser.ParenExpr:
+			walk(n.Expr)
+		case *parser.CastExpr:
+			walk(n.Expr)
 		}
 	}
 	walk(expr)

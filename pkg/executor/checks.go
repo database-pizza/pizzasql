@@ -57,6 +57,15 @@ func checkConstraintFor(name string, expr parser.Expr, schema *storage.Schema) (
 			"CHECK expression %s is invalid: %v", text, err,
 		)
 	}
+	// The predicate is persisted as this exact text and re-parsed by the
+	// evaluator on every later write. Reject a DDL whose formatted text does not
+	// round-trip instead of publishing a constraint that fails every write.
+	if _, err := parseStoredExpr(text); err != nil {
+		return storage.CheckConstraint{}, pgerror.Unsupported(
+			"CHECK expression %s cannot be stored for later evaluation: %v; the predicate must round-trip through the engine's SQL text form",
+			text, err,
+		)
+	}
 	return storage.CheckConstraint{Name: name, Expression: text}, nil
 }
 
