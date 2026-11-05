@@ -32,9 +32,9 @@ func jsonErrorField(t *testing.T, msg *Message, want byte) string {
 	return ""
 }
 
-// The supported JSON contract is TEXT storage plus the JSON1 function surface.
-// JSON/JSONB type names are accepted as text-affinity aliases; there is no
-// native binary jsonb type or ->> operator.
+// The supported JSON contract is TEXT storage plus the JSON1 function surface
+// and the -> / ->> operators. JSON/JSONB type names are accepted as
+// text-affinity aliases; there is no native binary jsonb type.
 func TestJSONTextContractOverSimpleQuery(t *testing.T) {
 	c, client := newDataConnection(t)
 	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE settings (id INTEGER PRIMARY KEY, body TEXT)"), 0)})
@@ -82,10 +82,23 @@ func TestJSONInvalidInputOverSimpleQuery(t *testing.T) {
 	}
 }
 
-func TestJSONArrowOperatorUnsupported(t *testing.T) {
+func TestJSONArrowOperatorsOverSimpleQuery(t *testing.T) {
 	c, client := newDataConnection(t)
-	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(`SELECT '{"a":1}' -> '$.a'`), 0)})
-	if len(msgs) == 0 || msgs[0].Type != MsgErrorResponse {
-		t.Fatalf("expected a parse error for the -> operator, got %v", msgs)
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE settings (id INTEGER PRIMARY KEY, body TEXT)"), 0)})
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(`INSERT INTO settings (id, body) VALUES (1, '{"theme":"dark","widgets":[1,2]}')`), 0)})
+
+	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(`SELECT body ->> 'theme', body -> 'widgets' -> 0 FROM settings WHERE id = 1`), 0)})
+	values := dataRowValues(t, msgs[1])
+	if len(values) != 2 || values[0] != "dark" || values[1] != "1" {
+		t.Fatalf("arrow operators = %v, want [dark 1]", values)
+	}
+
+	// Malformed JSON through an arrow operator is the same error json_extract throws.
+	msgs = runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(`SELECT 'not json' ->> 'a'`), 0)})
+	if len(msgs) != 2 || msgs[0].Type != MsgErrorResponse {
+		t.Fatalf("expected ErrorResponse+ReadyForQuery, got %v", msgs)
+	}
+	if msg := jsonErrorField(t, msgs[0], ErrorFieldMessage); !strings.Contains(msg, "malformed JSON") {
+		t.Fatalf("error message = %q, want a malformed-JSON error", msg)
 	}
 }

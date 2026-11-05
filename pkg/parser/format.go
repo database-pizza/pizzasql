@@ -141,6 +141,10 @@ func operatorString(op lexer.TokenType) string {
 		return "%"
 	case lexer.TokenConcat:
 		return "||"
+	case lexer.TokenArrow:
+		return "->"
+	case lexer.TokenArrowText:
+		return "->>"
 	case lexer.TokenEq:
 		return "="
 	case lexer.TokenNeq:

@@ -487,6 +487,60 @@ func TestLexerBlobLiteralWhitespaceAndErrors(t *testing.T) {
 	}
 }
 
+func TestLexerJSONArrowOperators(t *testing.T) {
+	tests := []struct {
+		input   string
+		literal string
+	}{
+		{"->", "->"},
+		{"->>", "->>"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			tok := New(tt.input).NextToken()
+			want := TokenArrow
+			if tt.input == "->>" {
+				want = TokenArrowText
+			}
+			if tok.Type != want {
+				t.Fatalf("type = %v, want %v", tok.Type, want)
+			}
+			if tok.Literal != tt.literal {
+				t.Fatalf("literal = %q, want %q", tok.Literal, tt.literal)
+			}
+		})
+	}
+}
+
+func TestLexerJSONArrowOperatorsDoNotChangeMinusOrComments(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected []TokenType
+	}{
+		{"1-2", []TokenType{TokenNumber, TokenMinus, TokenNumber, TokenEOF}},
+		{"-3", []TokenType{TokenMinus, TokenNumber, TokenEOF}},
+		{"-- comment", []TokenType{TokenComment, TokenEOF}},
+		{"a->'b'", []TokenType{TokenIdent, TokenArrow, TokenString, TokenEOF}},
+		{"a->>'b'", []TokenType{TokenIdent, TokenArrowText, TokenString, TokenEOF}},
+		{"a -> 'b' ->> 0", []TokenType{TokenIdent, TokenArrow, TokenString, TokenArrowText, TokenNumber, TokenEOF}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			tokens := New(tt.input).Tokenize()
+			if len(tokens) != len(tt.expected) {
+				t.Fatalf("expected %d tokens, got %d: %v", len(tt.expected), len(tokens), tokens)
+			}
+			for i, want := range tt.expected {
+				if tokens[i].Type != want {
+					t.Errorf("token[%d] = %v, want %v", i, tokens[i].Type, want)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkLexer(b *testing.B) {
 	input := `
 		SELECT u.id, u.name, u.email, COUNT(o.id) as order_count

@@ -23,6 +23,8 @@ const (
 	TokenSlash      // /
 	TokenPercent    // %
 	TokenConcat     // ||
+	TokenArrow      // ->
+	TokenArrowText  // ->>
 	TokenEq         // =
 	TokenNeq        // <> or !=
 	TokenLt         // <
@@ -402,6 +404,8 @@ var tokenNames = map[TokenType]string{
 	TokenSlash:      "/",
 	TokenPercent:    "%",
 	TokenConcat:     "||",
+	TokenArrow:      "->",
+	TokenArrowText:  "->>",
 	TokenEq:         "=",
 	TokenNeq:        "<>",
 	TokenLt:         "<",

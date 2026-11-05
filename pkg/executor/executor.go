@@ -5018,6 +5018,10 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 		return applyBitwise(expr.Op, left, right)
 	}
 
+	if expr.Op == lexer.TokenArrow || expr.Op == lexer.TokenArrowText {
+		return jsonArrowExtract(left, right, expr.Op == lexer.TokenArrowText)
+	}
+
 	switch expr.Op {
 	case lexer.TokenPlus:
 		if left == nil || right == nil {
@@ -5140,6 +5144,9 @@ func (e *Executor) applyBinaryOp(op lexer.TokenType, left, right interface{}) (i
 			return nil, nil
 		}
 		return applyBitwise(op, left, right)
+	}
+	if op == lexer.TokenArrow || op == lexer.TokenArrowText {
+		return jsonArrowExtract(left, right, op == lexer.TokenArrowText)
 	}
 	switch op {
 	case lexer.TokenPlus:
@@ -7203,6 +7210,14 @@ func toInt64(v interface{}) int64 {
 			return 1
 		}
 		return 0
+	case jsonText:
+		// -> returns JSON text, so integer conversion parses its text form.
+		// Keep exact integers exact before falling back to float truncation.
+		if i, err := strconv.ParseInt(string(val), 10, 64); err == nil {
+			return i
+		}
+		f, _ := strconv.ParseFloat(string(val), 64)
+		return int64(f)
 	default:
 		return 0
 	}
@@ -7226,6 +7241,9 @@ func toFloat(v interface{}) float64 {
 	case string:
 		f, _ := strconv.ParseFloat(val, 64)
 		return f
+	case jsonText:
+		f, _ := strconv.ParseFloat(string(val), 64)
+		return f
 	default:
 		return 0
 	}
@@ -7245,6 +7263,9 @@ func toBool(v interface{}) bool {
 		return val != 0
 	case string:
 		return val != "" && val != "0" && strings.ToLower(val) != "false"
+	case jsonText:
+		s := string(val)
+		return s != "" && s != "0" && strings.ToLower(s) != "false"
 	default:
 		return false
 	}
@@ -7323,6 +7344,9 @@ func toNumeric(v interface{}) (float64, bool) {
 		return val, true
 	case string:
 		f, err := strconv.ParseFloat(val, 64)
+		return f, err == nil
+	case jsonText:
+		f, err := strconv.ParseFloat(string(val), 64)
 		return f, err == nil
 	default:
 		return 0, false

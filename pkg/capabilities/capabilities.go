@@ -217,8 +217,8 @@ func Current() *Document {
 		JSON: JSON{
 			Storage:        "TEXT (JSON and JSONB type names are accepted without native semantics; insert JSON as text)",
 			Functions:      "json, json_extract, json_set, json_insert, json_replace, json_remove, json_valid, json_type, json_array, json_array_length, json_object, json_quote, json_group_array; PostgreSQL text compatibility: concat_ws, string_agg, pg_backend_pid",
-			ArrowOperators: Feature{Supported: false, Status: "rejected", SQLState: "42601", Notes: "-> and ->> are not implemented; use json_extract"},
-			InvalidInput:   "json_extract/json_set throw 'malformed JSON'; json_valid returns 0",
+			ArrowOperators: Feature{Supported: true, Status: "supported", Notes: "-> returns JSON text for a member or element, ->> returns the SQL value (text, number, 1/0 for booleans, NULL for JSON null); right operand is a label, an array index, or a $ path; missing paths and NULL operands return NULL; chaining is left-to-right"},
+			InvalidInput:   "json_extract/json_set and ->/->> throw 'malformed JSON'; json_valid returns 0",
 		},
 
 		ErrorCodes: map[string]string{
