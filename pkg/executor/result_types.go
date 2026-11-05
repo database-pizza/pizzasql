@@ -75,7 +75,7 @@ func (e *Executor) joinedSelectColumnTypes(stmt *parser.SelectStmt, refs []parse
 	for _, projection := range stmt.Columns {
 		if projection.Star {
 			for _, ref := range refs {
-				if schema, err := e.schema.GetSchema(ref.Name); err == nil {
+				if schema, err := e.session.GetSchema(ref.Name); err == nil {
 					for _, column := range schema.Columns {
 						types = append(types, column.Type)
 					}
@@ -106,7 +106,7 @@ func (e *Executor) joinedTypeResolver(refs []parser.TableRef) columnTypeResolver
 			if table != "" && !strings.EqualFold(table, ref.Alias) && !strings.EqualFold(table, ref.Name) {
 				continue
 			}
-			schema, err := e.schema.GetSchema(ref.Name)
+			schema, err := e.session.GetSchema(ref.Name)
 			if err != nil {
 				continue
 			}

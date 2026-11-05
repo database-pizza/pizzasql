@@ -215,6 +215,24 @@ func (m *SchemaManager) foreignKeyCatalogSnapshot() (*foreignKeyCatalog, error) 
 	if err != nil {
 		return nil, err
 	}
+	catalog, err := buildForeignKeyCatalog(version, tables, m.GetSchema)
+	if err != nil {
+		return nil, err
+	}
+
+	m.fkCatalogMu.Lock()
+	if m.Version() == version {
+		m.fkCatalog = catalog
+	}
+	m.fkCatalogMu.Unlock()
+	return catalog, nil
+}
+
+// buildForeignKeyCatalog derives the foreign-key metadata of a catalog view from
+// its table list and definitions. Both the shared SchemaManager cache and a
+// transaction's staged catalog build it, so a session validates against the
+// constraints it can see.
+func buildForeignKeyCatalog(version uint64, tables []string, getSchema func(string) (*Schema, error)) (*foreignKeyCatalog, error) {
 	catalog := &foreignKeyCatalog{
 		version:      version,
 		participants: make(map[string]bool),
@@ -228,7 +246,7 @@ func (m *SchemaManager) foreignKeyCatalogSnapshot() (*foreignKeyCatalog, error) 
 		catalog.adjacency[a][b] = true
 	}
 	for _, name := range tables {
-		schema, err := m.GetSchema(name)
+		schema, err := getSchema(name)
 		if err != nil {
 			return nil, err
 		}
@@ -242,13 +260,37 @@ func (m *SchemaManager) foreignKeyCatalogSnapshot() (*foreignKeyCatalog, error) 
 			link(parent, child)
 		}
 	}
-
-	m.fkCatalogMu.Lock()
-	if m.Version() == version {
-		m.fkCatalog = catalog
-	}
-	m.fkCatalogMu.Unlock()
 	return catalog, nil
+}
+
+// closure returns the foreign-key-connected component of the given tables.
+func (c *foreignKeyCatalog) closure(tables []string) map[string]bool {
+	closure := make(map[string]bool)
+	queue := make([]string, 0, len(tables))
+	for _, table := range tables {
+		if c.participants[strings.ToLower(table)] {
+			queue = append(queue, strings.ToLower(table))
+		}
+	}
+	for len(queue) > 0 {
+		table := queue[0]
+		queue = queue[1:]
+		if closure[table] {
+			continue
+		}
+		closure[table] = true
+		neighbors := make([]string, 0, len(c.adjacency[table]))
+		for neighbor := range c.adjacency[table] {
+			neighbors = append(neighbors, neighbor)
+		}
+		sort.Strings(neighbors)
+		for _, neighbor := range neighbors {
+			if !closure[neighbor] {
+				queue = append(queue, neighbor)
+			}
+		}
+	}
+	return closure
 }
 
 // referencingForeignKeys returns every FOREIGN KEY declaration whose parent is
@@ -354,32 +396,7 @@ func (m *SchemaManager) ForeignKeyClosure(tables []string) (map[string]bool, err
 	if err != nil {
 		return nil, err
 	}
-	closure := make(map[string]bool)
-	queue := make([]string, 0, len(tables))
-	for _, table := range tables {
-		if catalog.participants[strings.ToLower(table)] {
-			queue = append(queue, strings.ToLower(table))
-		}
-	}
-	for len(queue) > 0 {
-		table := queue[0]
-		queue = queue[1:]
-		if closure[table] {
-			continue
-		}
-		closure[table] = true
-		neighbors := make([]string, 0, len(catalog.adjacency[table]))
-		for neighbor := range catalog.adjacency[table] {
-			neighbors = append(neighbors, neighbor)
-		}
-		sort.Strings(neighbors)
-		for _, neighbor := range neighbors {
-			if !closure[neighbor] {
-				queue = append(queue, neighbor)
-			}
-		}
-	}
-	return closure, nil
+	return catalog.closure(tables), nil
 }
 
 // lockForeignKeyWrites serializes writes that can affect referential integrity,
@@ -477,14 +494,56 @@ func joinForeignKeyValues(values []string) string {
 // foreignKeyClosure returns the tables a commit must re-validate, or nil when no
 // staged table participates in a foreign key.
 func (s *Session) foreignKeyClosure() (map[string]bool, error) {
-	if len(s.overlay) == 0 {
-		return nil, nil
-	}
 	tables := make([]string, 0, len(s.overlay))
+	seen := make(map[string]bool, len(s.overlay))
 	for table := range s.overlay {
+		if seen[table] {
+			continue
+		}
+		seen[table] = true
 		tables = append(tables, table)
 	}
-	return s.schema.ForeignKeyClosure(tables)
+	// DDL staged by this transaction can add or remove a constraint without
+	// staging a row, so its tables join the validation component too.
+	if s.schemaTx != nil {
+		for table, schema := range s.schemaTx.staged {
+			if schema == nil || seen[table] {
+				continue
+			}
+			seen[table] = true
+			tables = append(tables, table)
+		}
+	}
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	return s.foreignKeyClosureLocked(tables)
+}
+
+// foreignKeyClosureLocked computes the constrained component of tables against
+// the catalog this session observes (caller holds the session lock).
+func (s *Session) foreignKeyClosureLocked(tables []string) (map[string]bool, error) {
+	if s.schemaTx == nil {
+		return s.schema.ForeignKeyClosure(tables)
+	}
+	catalog, err := s.foreignKeyCatalogLocked()
+	if err != nil {
+		return nil, err
+	}
+	return catalog.closure(tables), nil
+}
+
+// referencingForeignKeysLocked returns the FOREIGN KEY declarations whose parent
+// is table, as this session observes the catalog.
+func (s *Session) referencingForeignKeysLocked(table string) ([]referencingForeignKey, error) {
+	if s.schemaTx == nil {
+		return s.schema.referencingForeignKeys(table)
+	}
+	catalog, err := s.foreignKeyCatalogLocked()
+	if err != nil {
+		return nil, err
+	}
+	return catalog.referencing[strings.ToLower(table)], nil
 }
 
 // validateForeignKeyFinalState checks the committed row image of every table in
@@ -497,7 +556,7 @@ func (s *Session) validateForeignKeyFinalState(closure map[string]bool) error {
 	schemas := make(map[string]*Schema, len(closure))
 	tables := make(map[string][]Row, len(closure))
 	for table := range closure {
-		schema, err := s.schema.GetSchema(table)
+		schema, err := s.getSchemaLocked(table)
 		if err != nil {
 			return err
 		}
@@ -518,14 +577,18 @@ func (s *Session) validateForeignKeyFinalState(closure map[string]bool) error {
 // table gate because the caller holds the table's exclusive gate.
 func (s *Session) finalRows(table string, schema *Schema) ([]Row, error) {
 	overlay := s.overlay[strings.ToLower(table)]
+	source := s.durableSourceLocked(table)
 	rows := make([]Row, 0)
-	err := s.table.scanRows(table, func(row Row) (bool, error) {
+	err := s.table.scanRowsAtPrefix(s.table.dataPrefix(source), func(_ string, row Row, _ uint64) (bool, error) {
 		pk, err := schema.PrimaryKeyForRow(row)
 		if err != nil {
 			return true, err
 		}
 		if _, staged := overlay[s.table.dataKey(table, pk)]; staged {
 			return false, nil
+		}
+		if err := s.applyStagedRewritesLocked(table, row); err != nil {
+			return true, err
 		}
 		rows = append(rows, row)
 		return false, nil
@@ -537,7 +600,11 @@ func (s *Session) finalRows(table string, schema *Schema) ([]Row, error) {
 		if entry.absent {
 			continue
 		}
-		rows = append(rows, cloneRow(entry.row))
+		row := cloneRow(entry.row)
+		if err := s.applyStagedRewritesLocked(table, row); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
 	}
 	return rows, nil
 }

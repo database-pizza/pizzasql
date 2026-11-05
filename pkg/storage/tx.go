@@ -42,6 +42,17 @@ type Session struct {
 	// use predicateGens so writes to other index values do not cause conflicts.
 	scanGens      map[string]uint64
 	predicateGens map[string]predicateRead
+
+	// schemaTx is the transaction-scoped catalog overlay. It exists only while a
+	// transaction is open: DDL stages into it instead of publishing, and commit
+	// merges it into the same batch write as the staged rows. A nil overlay means
+	// every catalog read goes straight to the shared SchemaManager.
+	schemaTx *SchemaTx
+
+	// fkCatalog caches the foreign-key metadata of the schemaTx view, keyed by
+	// the catalog version that produced it.
+	fkCatalog *foreignKeyCatalog
+	fkVersion uint64
 }
 
 type predicateRead struct {
@@ -86,6 +97,9 @@ func (s *Session) Begin() error {
 	s.reads = make(map[string]uint64)
 	s.scanGens = make(map[string]uint64)
 	s.predicateGens = make(map[string]predicateRead)
+	s.schemaTx = newSchemaTx(s)
+	s.fkCatalog = nil
+	s.fkVersion = 0
 	return nil
 }
 
@@ -118,6 +132,88 @@ func (s *Session) RollbackTo(pos int) {
 	defer s.mu.Unlock()
 	s.rollbackToLocked(pos)
 	s.aborted = false
+}
+
+// SessionSavepoint captures the complete session state at a SQL SAVEPOINT: the
+// staged rows with their mutation log and read set, and the staged DDL catalog.
+// A rollback restores all of it, so DDL issued after a savepoint is undone with
+// the rows that accompanied it.
+type SessionSavepoint struct {
+	datalog       int
+	overlay       map[string]map[string]*overlayEntry
+	mutationLog   []txMutation
+	reads         map[string]uint64
+	scanGens      map[string]uint64
+	predicateGens map[string]predicateRead
+	schema        *schemaTxSnapshot
+}
+
+// Savepoint captures the session state a later RollbackToSavepoint restores.
+func (s *Session) Savepoint() *SessionSavepoint {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.savepointLocked()
+}
+
+// savepointLocked captures the session state (caller holds the session lock).
+func (s *Session) savepointLocked() *SessionSavepoint {
+	sp := &SessionSavepoint{
+		datalog:       len(s.log),
+		overlay:       make(map[string]map[string]*overlayEntry, len(s.overlay)),
+		mutationLog:   append([]txMutation(nil), s.log...),
+		reads:         copyLSNMap(s.reads),
+		scanGens:      copyLSNMap(s.scanGens),
+		predicateGens: make(map[string]predicateRead, len(s.predicateGens)),
+	}
+	for table, entries := range s.overlay {
+		staged := make(map[string]*overlayEntry, len(entries))
+		for key, entry := range entries {
+			staged[key] = entry
+		}
+		sp.overlay[table] = staged
+	}
+	for key, predicate := range s.predicateGens {
+		sp.predicateGens[key] = predicate
+	}
+	if s.schemaTx != nil {
+		snapshot := s.schemaTx.snapshot()
+		sp.schema = &snapshot
+	}
+	return sp
+}
+
+// RollbackToSavepoint restores the state captured by Savepoint.
+func (s *Session) RollbackToSavepoint(sp *SessionSavepoint) {
+	if sp == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rollbackToSavepointLocked(sp)
+	s.aborted = false
+}
+
+// rollbackToSavepointLocked restores a savepoint (caller holds the session
+// lock).
+func (s *Session) rollbackToSavepointLocked(sp *SessionSavepoint) {
+	s.overlay = sp.overlay
+	s.log = sp.mutationLog
+	s.reads = sp.reads
+	s.scanGens = sp.scanGens
+	s.predicateGens = sp.predicateGens
+	if s.schemaTx != nil && sp.schema != nil {
+		s.schemaTx.restore(*sp.schema)
+	}
+	s.fkCatalog = nil
+	s.fkVersion = 0
+}
+
+func copyLSNMap(source map[string]uint64) map[string]uint64 {
+	cloned := make(map[string]uint64, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 // Rollback discards the transaction without writing anything durable.
@@ -153,6 +249,12 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		return 0, fmt.Errorf("current transaction is aborted")
 	}
 
+	// Staged DDL is published by this same batch write, so the commit is atomic
+	// across catalog changes and rows. hasDDL also forces the exclusive table
+	// gates for the affected tables below, because the commit rewrites or
+	// removes their durable rows.
+	hasDDL := s.schemaTx != nil && s.schemaTx.hasDDL()
+
 	// Referential integrity spans tables: a commit must validate the final
 	// child rows against the final parent rows, including rows another table
 	// staged in this same transaction. Take the foreign-key write gate before
@@ -185,6 +287,15 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 	}
 	defer unlockAll()
 
+	// Another session may have published DDL while this transaction was open.
+	// Re-read the committed catalog under the gates so the final row validation
+	// below sees the catalog that is actually in effect.
+	if s.schemaTx != nil {
+		s.schemaTx.refreshCommitted()
+		s.fkCatalog = nil
+		s.fkVersion = 0
+	}
+
 	// A staged row was normalized against the schema as of its INSERT or UPDATE,
 	// which a concurrent ADD COLUMN can predate. Re-apply the schema that is
 	// current under the held gates before any derived state is computed: the CAS
@@ -212,6 +323,32 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		}
 	}
 
+	// Compute the durable effects of staged DDL before derived state is planned:
+	// the rows an ALTER TABLE rewrites and a RENAME TABLE moves are part of the
+	// transaction's final row state, so uniqueness and cache planning must see
+	// them. The catalog writes travel in the same batch as everything else.
+	var ddlOps []BatchOp
+	var ddlChecks []CompareCheck
+	var ddlEntries map[string]map[string]*overlayEntry
+	var touchedTables, touchedIndexes []string
+	if hasDDL {
+		catalogOps, catalogChecks, err := s.schemaTx.commitCatalogOps()
+		if err != nil {
+			s.resetLocked()
+			return 0, err
+		}
+		dataOps, dataEntries, err := s.schemaTx.commitDataOps()
+		if err != nil {
+			s.resetLocked()
+			return 0, err
+		}
+		ddlOps = append(catalogOps, dataOps...)
+		ddlChecks = catalogChecks
+		ddlEntries = dataEntries
+		touchedTables = s.schemaTx.touchedTables()
+		touchedIndexes = s.schemaTx.touchedIndexes()
+	}
+
 	// Validate the final overlay against every foreign key in the constrained
 	// component. The per-table gates acquired above exclude concurrent writers,
 	// so this sees a stable state; checking the final state (rather than each
@@ -228,7 +365,8 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 	// with a "UNIQUE constraint failed" error rather than ErrSerialization.
 	uniquePlans := make(map[string]uniqueCachePlan, len(uniqueTables))
 	for t := range uniqueTables {
-		plan, err := s.table.prepareUniqueRows(t, s.overlay[t])
+		entries := s.finalRowEntries(t, ddlEntries)
+		plan, err := s.table.prepareUniqueRowsWith(t, entries, s.uniqueIndexesLocked(t))
 		if err != nil {
 			s.resetLocked()
 			return 0, err
@@ -247,15 +385,17 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		exclusiveTables[predicate.table] = true
 	}
 	cachePlans := make(map[string]*tableCachePlan)
-	for table, entries := range s.overlay {
-		if exclusiveTables[table] {
-			plan, err := s.table.prepareTableCache(table, entries, s.reads)
-			if err != nil {
-				s.resetLocked()
-				return 0, err
-			}
-			cachePlans[table] = plan
+	for table := range s.overlay {
+		if !exclusiveTables[table] {
+			continue
 		}
+		entries := s.finalRowEntries(table, ddlEntries)
+		plan, err := s.table.prepareTableCache(table, entries, s.reads)
+		if err != nil {
+			s.resetLocked()
+			return 0, err
+		}
+		cachePlans[table] = plan
 	}
 
 	// Build the compare set from every observed key.
@@ -263,7 +403,6 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 	for key, lsn := range s.reads {
 		checks = append(checks, CompareCheck{Key: []byte(key), LSN: lsn})
 	}
-	sort.Slice(checks, func(i, j int) bool { return string(checks[i].Key) < string(checks[j].Key) })
 
 	// Build the batch ops from the staged overlay.
 	ops := make([]BatchOp, 0)
@@ -281,6 +420,13 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 			}
 		}
 	}
+
+	if hasDDL {
+		ops = append(ops, ddlOps...)
+		checks = append(checks, ddlChecks...)
+	}
+
+	sort.Slice(checks, func(i, j int) bool { return string(checks[i].Key) < string(checks[j].Key) })
 	sort.Slice(ops, func(i, j int) bool { return string(ops[i].Key) < string(ops[j].Key) })
 
 	// A read-only transaction has nothing to write; commit trivially.
@@ -324,9 +470,39 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		s.table.bumpIndexPredicateWildcard(t)
 		s.table.bumpGeneration(t)
 	}
+	if hasDDL {
+		s.publishCommittedDDL(touchedTables, touchedIndexes)
+	}
 
 	s.resetLocked()
 	return commitLSN, nil
+}
+
+// publishCommittedDDL publishes a committed catalog change to the rest of the
+// process. The durable batch is already written, so this only drops the derived
+// state that described the previous catalog: the shared schema and index caches,
+// the row-derived caches of every touched table, and the index caches of every
+// touched index. Other sessions reload lazily from the committed records.
+func (s *Session) publishCommittedDDL(tables, indexes []string) {
+	s.schema.invalidateCommittedDDL()
+	for _, table := range tables {
+		s.table.InvalidateCache(table)
+		s.table.bumpIndexPredicateWildcard(table)
+		s.table.bumpGeneration(table)
+	}
+	committed, err := s.schema.ListIndexes()
+	if err != nil {
+		committed = nil
+	}
+	known := make(map[string]bool, len(committed))
+	for _, name := range committed {
+		known[strings.ToLower(name)] = true
+	}
+	for _, index := range indexes {
+		if !known[index] {
+			s.table.ClearIndex(index, "", nil) //nolint:errcheck
+		}
+	}
 }
 
 // acquireCommitLocks acquires the per-table gates needed to commit the staged
@@ -361,13 +537,20 @@ func (s *Session) acquireCommitLocks() (locks []*sync.RWMutex, exclusive []bool,
 		for _, predicate := range s.predicateGens {
 			affected[predicate.table] = true
 		}
+		// Staged DDL rewrites or removes durable rows and publishes catalog
+		// records, so the commit needs the exclusive gate of every touched table.
+		if s.schemaTx != nil && s.schemaTx.hasDDL() {
+			for _, t := range s.schemaTx.touchedTables() {
+				affected[t] = true
+			}
+		}
 
 		// Tables written in this transaction that carry a UNIQUE index need the
 		// exclusive gate so their final overlay can be validated against durable
 		// rows without racing another writer.
 		uniqueTables = make(map[string]bool)
 		for t := range s.overlay {
-			uniq, err := s.table.hasUniqueIndex(t)
+			uniq, err := s.hasUniqueIndexLocked(t)
 			if err != nil {
 				return nil, nil, nil, nil, err
 			}
@@ -409,7 +592,7 @@ func (s *Session) acquireCommitLocks() (locks []*sync.RWMutex, exclusive []bool,
 			if _, written := s.overlay[t]; !written {
 				continue
 			}
-			uniq, err := s.table.hasUniqueIndex(t)
+			uniq, err := s.hasUniqueIndexLocked(t)
 			if err != nil {
 				unlock(locks, exclusive)
 				return nil, nil, nil, nil, err
@@ -435,13 +618,16 @@ func (s *Session) acquireCommitLocks() (locks []*sync.RWMutex, exclusive []bool,
 // so a commit cannot persist a row that violates the schema now in effect.
 func (s *Session) applyOverlaySchemaDefaults() error {
 	for table, entries := range s.overlay {
-		schema, err := s.schema.GetSchema(table)
+		schema, err := s.getSchemaLocked(table)
 		if err != nil {
 			return err
 		}
 		for _, entry := range entries {
 			if entry.absent {
 				continue
+			}
+			if err := s.applyStagedRewritesLocked(table, entry.row); err != nil {
+				return err
 			}
 			if err := s.schema.applySchemaDefaults(schema, entry.row); err != nil {
 				return err
@@ -454,6 +640,61 @@ func (s *Session) applyOverlaySchemaDefaults() error {
 	return nil
 }
 
+// finalRowEntries merges the rows a staged DDL rewrite or rename produces into
+// the table's staged entries, so uniqueness and cache planning validate the row
+// image the commit is about to publish (caller holds the session lock).
+func (s *Session) finalRowEntries(table string, ddlEntries map[string]map[string]*overlayEntry) map[string]*overlayEntry {
+	staged := s.overlay[table]
+	rewritten := ddlEntries[table]
+	if len(rewritten) == 0 {
+		return staged
+	}
+	merged := make(map[string]*overlayEntry, len(staged)+len(rewritten))
+	for key, entry := range staged {
+		merged[key] = entry
+	}
+	for key, entry := range rewritten {
+		merged[key] = entry
+	}
+	return merged
+}
+
+// uniqueIndexesLocked returns the UNIQUE indexes of a table as this session
+// observes them (caller holds the session lock).
+func (s *Session) uniqueIndexesLocked(table string) []*Index {
+	var indexes []*Index
+	if s.schemaTx != nil {
+		indexes, _ = s.schemaTx.listTableIndexes(table)
+	} else {
+		indexes, _ = s.schema.ListTableIndexes(table)
+	}
+	unique := indexes[:0]
+	for _, idx := range indexes {
+		if idx.Unique {
+			unique = append(unique, idx)
+		}
+	}
+	return unique
+}
+
+// hasUniqueIndexLocked reports whether the session's view of a table carries a
+// UNIQUE index, so a transaction validates rows against an index it staged.
+func (s *Session) hasUniqueIndexLocked(table string) (bool, error) {
+	if s.schemaTx == nil {
+		return s.table.hasUniqueIndex(table)
+	}
+	indexes, err := s.schemaTx.listTableIndexes(table)
+	if err != nil {
+		return false, err
+	}
+	for _, idx := range indexes {
+		if idx.Unique {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Session) resetLocked() {
 	s.inTx = false
 	s.aborted = false
@@ -462,6 +703,9 @@ func (s *Session) resetLocked() {
 	s.reads = make(map[string]uint64)
 	s.scanGens = make(map[string]uint64)
 	s.predicateGens = make(map[string]predicateRead)
+	s.schemaTx = nil
+	s.fkCatalog = nil
+	s.fkVersion = 0
 }
 
 func (s *Session) stagePut(table, key string, row Row) {
@@ -498,24 +742,61 @@ func (s *Session) GetByPK(table, pk string) (Row, error) {
 	if !s.inTx {
 		return s.table.GetByPK(table, pk)
 	}
-	key := s.table.dataKey(table, pk)
+	stagedKey := s.table.dataKey(table, pk)
 	tl := strings.ToLower(table)
-	if e, ok := s.overlay[tl][key]; ok {
+	if e, ok := s.overlay[tl][stagedKey]; ok {
 		if e.absent {
 			return nil, ErrKeyNotFound
 		}
 		return cloneRow(e.row), nil
 	}
-	row, lsn, err := s.table.getByPKWithLSN(table, pk)
+	durableKey := s.durableDataKeyLocked(table, pk)
+	row, lsn, err := s.table.getKeyWithLSN(durableKey)
 	if err != nil {
 		if err == ErrKeyNotFound {
-			s.reads[key] = 0
+			s.reads[durableKey] = 0
 			return nil, ErrKeyNotFound
 		}
 		return nil, err
 	}
-	s.reads[key] = lsn
+	s.reads[durableKey] = lsn
+	if err := s.applyStagedRewritesLocked(table, row); err != nil {
+		return nil, err
+	}
 	return row, nil
+}
+
+// durableSourceLocked returns the committed table name whose data prefix holds
+// the rows of a table this transaction sees. RENAME TABLE moves the definition
+// immediately but leaves rows under the committed prefix until the commit, so
+// reads must follow the source (caller holds the session lock).
+func (s *Session) durableSourceLocked(table string) string {
+	if s.schemaTx == nil {
+		return table
+	}
+	lower := strings.ToLower(table)
+	source, ok := s.schemaTx.dataSources[lower]
+	if !ok || source == "" {
+		return table
+	}
+	return source
+}
+
+// hasStagedSourceLocked reports whether the table's durable rows live under a
+// different (older) name because RENAME TABLE is staged.
+func (s *Session) hasStagedSourceLocked(table string) bool {
+	if s.schemaTx == nil {
+		return false
+	}
+	lower := strings.ToLower(table)
+	source, ok := s.schemaTx.dataSources[lower]
+	return ok && source != "" && source != lower
+}
+
+// durableDataKeyLocked returns the key a row is durably stored under, following
+// a staged rename (caller holds the session lock).
+func (s *Session) durableDataKeyLocked(table, pk string) string {
+	return s.table.dataKey(s.durableSourceLocked(table), pk)
 }
 
 // Select scans a table, merging the staged overlay so a transaction sees its
@@ -547,7 +828,7 @@ func (s *Session) SelectLimited(table string, filter func(Row) bool, maxRows int
 }
 
 func (s *Session) selectLocked(table string, filter func(Row) bool) ([]Row, error) {
-	schema, err := s.schema.GetSchema(table)
+	schema, err := s.getSchemaLocked(table)
 	if err != nil {
 		return nil, err
 	}
@@ -559,18 +840,29 @@ func (s *Session) selectLocked(table string, filter func(Row) bool) ([]Row, erro
 		s.scanGens[tl] = s.table.generation(tl)
 	}
 	overlay := s.overlay[tl]
+	source := s.durableSourceLocked(table)
+	sourceLower := strings.ToLower(source)
+	if sourceLower != tl {
+		// A concurrent write to the committed name must invalidate the commit
+		// just like a write to the staged name.
+		if _, ok := s.scanGens[sourceLower]; !ok {
+			s.scanGens[sourceLower] = s.table.generation(sourceLower)
+		}
+	}
 
 	var rows []Row
-	err = s.table.scanRowsWithLSN(table, func(row Row, lsn uint64) (bool, error) {
+	err = s.table.scanRowsAtPrefix(s.table.dataPrefix(source), func(durableKey string, row Row, lsn uint64) (bool, error) {
 		pk, err := schema.PrimaryKeyForRow(row)
 		if err != nil {
 			return true, err
 		}
-		key := s.table.dataKey(table, pk)
-		if _, ok := overlay[key]; ok {
+		if _, ok := overlay[s.table.dataKey(table, pk)]; ok {
 			return false, nil
 		}
-		s.reads[key] = lsn
+		s.reads[durableKey] = lsn
+		if err := s.applyStagedRewritesLocked(table, row); err != nil {
+			return true, err
+		}
 		if filter == nil || filter(row) {
 			rows = append(rows, row)
 		}
@@ -583,11 +875,26 @@ func (s *Session) selectLocked(table string, filter func(Row) bool) ([]Row, erro
 		if e.absent {
 			continue
 		}
-		if filter == nil || filter(e.row) {
-			rows = append(rows, cloneRow(e.row))
+		row := cloneRow(e.row)
+		if err := s.applyStagedRewritesLocked(table, row); err != nil {
+			return nil, err
+		}
+		if filter == nil || filter(row) {
+			rows = append(rows, row)
 		}
 	}
 	return rows, nil
+}
+
+// applyStagedRewritesLocked applies the transaction's pending ALTER TABLE row
+// transformations, so the session reads its own DDL before the commit writes
+// the transformed images (caller holds the session lock).
+func (s *Session) applyStagedRewritesLocked(table string, row Row) error {
+	if s.schemaTx == nil {
+		return nil
+	}
+	_, err := s.schemaTx.rewriteRow(table, row)
+	return err
 }
 
 // SelectByIndex reads only matching durable rows while capturing their LSNs,
@@ -600,12 +907,19 @@ func (s *Session) SelectByIndex(table, indexName string, colValue interface{}) (
 		return s.table.SelectByIndex(table, indexName, colValue)
 	}
 	tableKey := strings.ToLower(table)
-	index, err := s.schema.GetIndex(indexName)
+	index, err := s.getIndexLocked(indexName)
 	if err != nil {
 		return nil, err
 	}
 	col := index.Columns[0].Name
 	want := formatIndexValue(colValue)
+	if s.hasStagedSourceLocked(table) || !s.indexIsCommittedLocked(index.Name) {
+		// The derived index caches describe the committed catalog: an index this
+		// transaction created has no entries yet, and a renamed table's entries
+		// are keyed under the old storage name. Either way, scan the rows the
+		// session observes instead.
+		return s.filterByIndexLocked(table, index, want)
+	}
 	versions, predicate, err := s.table.selectByIndexWithLSN(table, indexName, colValue)
 	if err != nil {
 		return nil, err
@@ -623,6 +937,9 @@ func (s *Session) SelectByIndex(table, indexName string, colValue interface{}) (
 			continue
 		}
 		s.reads[version.key] = version.lsn
+		if err := s.applyStagedRewritesLocked(table, version.row); err != nil {
+			return nil, err
+		}
 		rows = append(rows, version.row)
 	}
 	for _, entry := range overlay {
@@ -653,6 +970,9 @@ func (s *Session) SelectByIndexKey(table string, idx *Index, valueKey string) ([
 	}
 
 	tableKey := strings.ToLower(table)
+	if s.hasStagedSourceLocked(table) || !s.indexIsCommittedLocked(idx.Name) {
+		return s.filterByIndexLocked(table, idx, valueKey)
+	}
 	versions, predicate, err := s.table.selectByIndexKeyWithLSN(table, idx.Name, valueKey)
 	if err != nil {
 		return nil, err
@@ -670,6 +990,9 @@ func (s *Session) SelectByIndexKey(table string, idx *Index, valueKey string) ([
 			continue
 		}
 		s.reads[version.key] = version.lsn
+		if err := s.applyStagedRewritesLocked(table, version.row); err != nil {
+			return nil, err
+		}
 		rows = append(rows, version.row)
 	}
 	for _, entry := range overlay {
@@ -685,6 +1008,45 @@ func (s *Session) SelectByIndexKey(table string, idx *Index, valueKey string) ([
 		}
 	}
 	return rows, nil
+}
+
+// filterByIndexLocked returns the rows this session observes whose index key
+// equals valueKey, without consulting the derived index caches. It is the
+// fallback for a table renamed in this transaction, whose committed index
+// entries still name the old storage prefix (caller holds the session lock).
+func (s *Session) filterByIndexLocked(table string, idx *Index, valueKey string) ([]Row, error) {
+	rows, err := s.selectLocked(table, nil)
+	if err != nil {
+		return nil, err
+	}
+	matched := make([]Row, 0, len(rows))
+	for _, row := range rows {
+		key, err := s.table.IndexRowKey(idx, row)
+		if err != nil {
+			return nil, err
+		}
+		if key == valueKey {
+			matched = append(matched, row)
+		}
+	}
+	return matched, nil
+}
+
+// indexIsCommittedLocked reports whether the shared table manager can resolve an
+// index, and therefore whether its derived index caches cover it (caller holds
+// the session lock).
+func (s *Session) indexIsCommittedLocked(name string) bool {
+	_, err := s.schema.GetIndex(name)
+	return err == nil
+}
+
+// getIndexLocked resolves an index definition against the session catalog
+// (caller holds the session lock).
+func (s *Session) getIndexLocked(name string) (*Index, error) {
+	if s.schemaTx != nil {
+		return s.schemaTx.getIndex(name)
+	}
+	return s.schema.GetIndex(name)
 }
 
 // CountFast returns the exact row count, observing the staged overlay in a
@@ -749,7 +1111,11 @@ func (s *Session) InsertBulkWithLastRowID(table string, rows []Row) (int, int64,
 
 // insertLocked is the transaction insert helper (caller holds s.mu).
 func (s *Session) insertLocked(table string, row Row) (int64, error) {
-	nr, key, err := s.table.prepareInsert(table, row)
+	schema, err := s.getSchemaLocked(table)
+	if err != nil {
+		return 0, err
+	}
+	nr, key, err := s.table.prepareInsertWithSchema(table, schema, row)
 	if err != nil {
 		return 0, err
 	}
@@ -764,15 +1130,16 @@ func (s *Session) insertLocked(table string, row Row) (int64, error) {
 			return 0, &PrimaryKeyViolationError{Table: table, Key: pk}
 		}
 	} else {
-		_, lsn, err := s.table.getByPKWithLSN(table, pk)
+		durableKey := s.durableDataKeyLocked(table, pk)
+		_, lsn, err := s.table.getKeyWithLSN(durableKey)
 		if err == nil {
-			s.reads[key] = lsn
+			s.reads[durableKey] = lsn
 			return 0, &PrimaryKeyViolationError{Table: table, Key: pk}
 		}
-		if err != ErrKeyNotFound {
+		if err != nil && err != ErrKeyNotFound {
 			return 0, err
 		}
-		s.reads[key] = 0
+		s.reads[durableKey] = 0
 	}
 
 	s.stagePut(table, key, nr)
@@ -817,7 +1184,7 @@ func (s *Session) updateByPKStaged(table, pk string, updateFn func(Row) (Row, er
 // updateByPKLocked stages a point update. The caller holds the session lock and
 // a transaction.
 func (s *Session) updateByPKLocked(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
-	schema, err := s.schema.GetSchema(table)
+	schema, err := s.getSchemaLocked(table)
 	if err != nil {
 		return nil, false, err
 	}
@@ -939,6 +1306,9 @@ func (s *Session) getByPKLocked(table, pk string) (Row, error) {
 		return nil, err
 	}
 	s.reads[key] = lsn
+	if err := s.applyStagedRewritesLocked(table, row); err != nil {
+		return nil, err
+	}
 	return row, nil
 }
 
@@ -951,7 +1321,7 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 	}
 	defer s.mu.Unlock()
 
-	schema, err := s.schema.GetSchema(table)
+	schema, err := s.getSchemaLocked(table)
 	if err != nil {
 		return 0, err
 	}
@@ -999,7 +1369,7 @@ func (s *Session) Delete(table string, filter func(Row) bool) (int, error) {
 	}
 	defer s.mu.Unlock()
 
-	schema, err := s.schema.GetSchema(table)
+	schema, err := s.getSchemaLocked(table)
 	if err != nil {
 		return 0, err
 	}
@@ -1025,17 +1395,39 @@ func (s *Session) Delete(table string, filter func(Row) bool) (int, error) {
 	return count, nil
 }
 
-// ClearIndex passes through to the durable table manager.
+// ClearIndex drops the in-memory entries of an index. Inside a transaction the
+// drop is staged in the catalog overlay instead: the committed index (and its
+// cache) stays intact for every other session, and the commit clears it once the
+// catalog change is durable.
 func (s *Session) ClearIndex(indexName, tableName string, columns []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.schemaTx != nil && s.schemaTx.hasDDL() {
+		return nil
+	}
 	return s.table.ClearIndex(indexName, tableName, columns)
 }
 
-// InvalidateCache passes through to the durable table manager.
+// InvalidateCache drops the derived caches of a table. Inside a transaction the
+// durable rows are still current, so nothing is invalidated until the commit
+// publishes the catalog change.
 func (s *Session) InvalidateCache(table string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.schemaTx != nil {
+		return
+	}
 	s.table.InvalidateCache(table)
 }
 
-// BuildIndex passes through to the durable table manager.
+// BuildIndex builds index entries for every existing row. Inside a transaction
+// the index is only staged; its entries are derived lazily from durable rows
+// once the commit publishes it and the session is merged in afterwards.
 func (s *Session) BuildIndex(indexName, tableName string, columns []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.schemaTx != nil {
+		return nil
+	}
 	return s.table.BuildIndex(indexName, tableName, columns)
 }

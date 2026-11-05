@@ -111,7 +111,7 @@ func (e *Executor) resolveForeignKey(table string, schema *storage.Schema, uniqu
 		parent = schema
 		parentIndexes = uniqueIndexes
 	} else {
-		resolved, err := e.schema.GetSchema(declaration.refTable)
+		resolved, err := e.session.GetSchema(declaration.refTable)
 		if err != nil {
 			return storage.ForeignKeyConstraint{}, pgerror.Unsupported(
 				"foreign key %s on table %s references table %q, which does not exist; create the parent table before the child table",
@@ -119,7 +119,7 @@ func (e *Executor) resolveForeignKey(table string, schema *storage.Schema, uniqu
 			)
 		}
 		parent = resolved
-		indexes, err := e.schema.ListTableIndexes(declaration.refTable)
+		indexes, err := e.session.ListTableIndexes(declaration.refTable)
 		if err != nil {
 			return storage.ForeignKeyConstraint{}, err
 		}
@@ -235,7 +235,7 @@ func sameColumnSet(a, b []string) bool {
 // rewritten, so accepting the change would either silently stop enforcing the
 // constraint or leave the catalog naming a missing column.
 func (e *Executor) rejectForeignKeyColumnChange(table, column, action string) error {
-	labels, err := e.schema.ForeignKeyColumnDependency(table, column)
+	labels, err := e.session.ForeignKeyColumnDependency(table, column)
 	if err != nil {
 		return err
 	}
@@ -253,7 +253,7 @@ func (e *Executor) rejectForeignKeyColumnChange(table, column, action string) er
 // persisted verbatim, so a rename would leave parent-side enforcement pointing
 // at a table that no longer exists.
 func (e *Executor) rejectForeignKeyTableRename(table string) error {
-	labels, err := e.schema.ForeignKeyTableDependency(table)
+	labels, err := e.session.ForeignKeyTableDependency(table)
 	if err != nil {
 		return err
 	}
@@ -270,7 +270,7 @@ func (e *Executor) rejectForeignKeyTableRename(table string) error {
 // foreign key names as its parent, because the constraint would be left dangling
 // on the child table.
 func (e *Executor) rejectForeignKeyDependentTableDrop(table string) error {
-	labels, err := e.schema.ForeignKeyTableDependency(table)
+	labels, err := e.session.ForeignKeyTableDependency(table)
 	if err != nil {
 		return err
 	}

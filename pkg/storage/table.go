@@ -334,6 +334,72 @@ func (m *TableManager) scanRowsWithLSN(table string, fn rowWithLSNVisitFunc) err
 	})
 }
 
+// scanRowsAtPrefix streams the rows under an explicit data prefix together with
+// their keys and durable LSNs. A transaction uses it when the rows of a table
+// still live under an older name because RENAME TABLE defers moving them to the
+// commit.
+func (m *TableManager) scanRowsAtPrefix(prefix string, fn func(key string, row Row, lsn uint64) (stop bool, err error)) error {
+	return m.pool.WithClient(func(client *KVClient) (retErr error) {
+		cursor, err := client.ScanWithLimit([]byte(prefix), scanPageSize)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := cursor.Close(); retErr == nil {
+				retErr = err
+			}
+		}()
+		for {
+			entries, done, err := cursor.Next()
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				row, err := decodeRow(e.Value)
+				if err != nil {
+					return err
+				}
+				stop, err := fn(string(e.Key), row, e.LSN)
+				if err != nil {
+					return err
+				}
+				if stop {
+					return nil
+				}
+			}
+			if done {
+				return nil
+			}
+		}
+	})
+}
+
+// getKeyWithLSN reads and decodes a row by its explicit durable key.
+func (m *TableManager) getKeyWithLSN(key string) (Row, uint64, error) {
+	var value []byte
+	var lsn uint64
+	err := m.pool.WithClient(func(c *KVClient) error {
+		res, err := c.Get([]byte(key))
+		if err != nil {
+			return err
+		}
+		value = res.Value
+		lsn = res.LSN
+		return nil
+	})
+	if err != nil {
+		if err == ErrKeyNotFound {
+			return nil, 0, ErrKeyNotFound
+		}
+		return nil, 0, err
+	}
+	row, err := decodeRow(value)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to parse row: %w", err)
+	}
+	return row, lsn, nil
+}
+
 // scanCountKeys counts the durable rows of table using a key-only scan so row
 // values are never pulled across the wire. It is used for first-time COUNT(*)
 // derivation.
@@ -480,6 +546,13 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 	if err != nil {
 		return nil, "", err
 	}
+	return m.prepareInsertWithSchema(table, schema, row)
+}
+
+// prepareInsertWithSchema is prepareInsert against a caller-supplied schema, so
+// a transaction normalizes rows with the catalog it can see, including a table
+// it created or altered in the open transaction.
+func (m *TableManager) prepareInsertWithSchema(table string, schema *Schema, row Row) (Row, string, error) {
 	normalizedRow, key, _, err := m.normalizeInsertRow(table, schema, row)
 	if err != nil {
 		return nil, "", err
