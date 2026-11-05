@@ -3,6 +3,7 @@ package pgserver
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"testing"
 
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
@@ -15,12 +16,27 @@ func TestGetOIDForTypeDatetime(t *testing.T) {
 		"DATETIME":  1184,
 		"TIMESTAMP": 1184,
 		"DATE":      1082,
-		"BIGINT":    20,
+		"SMALLINT":  21,
+		"INT2":      21,
+		"TINYINT":   21,
+		"MEDIUMINT": 23,
 		"INTEGER":   23,
 		"INT":       23,
+		"INT4":      23,
+		"BIGINT":    20,
+		"INT8":      20,
+		"NUMERIC":   1700,
+		"DECIMAL":   1700,
+		"REAL":      700,
+		"FLOAT":     700,
+		"DOUBLE":    701,
 		"TEXT":      25,
+		"VARCHAR":   25,
+		"CHAR":      25,
 		"UUID":      25,
 		"BOOLEAN":   16,
+		"BOOL":      16,
+		"BLOB":      17,
 	}
 	for name, want := range cases {
 		if got := c.getOIDForType(name); got != want {
@@ -107,4 +123,98 @@ func rowDescriptionOIDs(t *testing.T, data []byte) []int32 {
 		pos += 2 // format code
 	}
 	return oids
+}
+
+func TestGetTypeSizeForType(t *testing.T) {
+	c := &Connection{}
+	cases := map[string]int16{
+		"SMALLINT":  2,
+		"INTEGER":   4,
+		"BIGINT":    8,
+		"REAL":      4,
+		"DOUBLE":    8,
+		"BOOLEAN":   1,
+		"DATE":      4,
+		"TIMESTAMP": 8,
+		"NUMERIC":   -1,
+		"TEXT":      -1,
+		"BLOB":      -1,
+	}
+	for name, want := range cases {
+		if got := c.getTypeSizeForType(name); got != want {
+			t.Errorf("getTypeSizeForType(%q) = %d, want %d", name, got, want)
+		}
+	}
+}
+
+// projectionOIDs runs sql and returns the type OIDs in its RowDescription.
+func projectionOIDs(t *testing.T, c *Connection, client net.Conn, sql string) []int32 {
+	t.Helper()
+	msgs := resultMessages(runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(sql), 0)}))
+	return rowDescriptionOIDs(t, findRowDescription(t, msgs).Data)
+}
+
+// TestRowDescriptionProjectionOIDs asserts the wire OIDs for column
+// projections, expression projections, and empty result sets.
+func TestRowDescriptionProjectionOIDs(t *testing.T) {
+	c, client := newDataConnection(t)
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(
+		`CREATE TABLE typed (
+			i INTEGER PRIMARY KEY,
+			big BIGINT,
+			small SMALLINT,
+			price NUMERIC,
+			flag BOOLEAN,
+			name TEXT,
+			data BLOB,
+			created_at TIMESTAMP,
+			day DATE
+		)`), 0)})
+	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(
+		`INSERT INTO typed VALUES (1, 9000000000, 7, 19.5, TRUE, 'x', X'00', '2024-05-06 07:08:09', '2024-05-06')`), 0)})
+
+	cases := []struct {
+		name string
+		sql  string
+		want []int32
+	}{
+		{
+			name: "columns",
+			sql:  "SELECT i, big, small, price, flag, name, data, created_at, day FROM typed",
+			want: []int32{23, 20, 21, 1700, 16, 25, 17, 1184, 1082},
+		},
+		{name: "count star", sql: "SELECT count(*) FROM typed", want: []int32{20}},
+		{name: "sum integer", sql: "SELECT sum(i) FROM typed", want: []int32{20}},
+		{name: "avg integer", sql: "SELECT avg(i) FROM typed", want: []int32{1700}},
+		{name: "comparison", sql: "SELECT i = 1 FROM typed", want: []int32{16}},
+		{name: "string literal", sql: "SELECT 'text'", want: []int32{25}},
+		{name: "integer literal", sql: "SELECT 42", want: []int32{23}},
+		{name: "wide integer literal", sql: "SELECT 4294967296", want: []int32{20}},
+		{name: "numeric literal", sql: "SELECT 1.5", want: []int32{1700}},
+		{name: "cast", sql: "SELECT CAST(i AS BIGINT) FROM typed", want: []int32{20}},
+		{
+			name: "empty result",
+			sql:  "SELECT i, created_at, i + 1 FROM typed WHERE i = 999",
+			want: []int32{23, 1184, 20},
+		},
+		{
+			name: "aggregate empty result",
+			sql:  "SELECT count(*), max(created_at) FROM typed WHERE i = 999",
+			want: []int32{20, 1184},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := projectionOIDs(t, c, client, tc.sql)
+			if len(got) != len(tc.want) {
+				t.Fatalf("%s: OIDs = %v, want %v", tc.sql, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("%s: OIDs = %v, want %v", tc.sql, got, tc.want)
+				}
+			}
+		})
+	}
 }

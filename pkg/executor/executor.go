@@ -445,6 +445,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		} else {
 			result.AddColumn("column1")
 		}
+		result.ColumnTypes = []string{inferExprType(stmt.Columns[0].Expr, nil)}
 		result.AddRow(int64(count))
 		return result, nil
 	}
@@ -495,6 +496,13 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			} else {
 				result.AddColumn(fmt.Sprintf("column%d", i+1))
 			}
+		}
+		// An empty result still carries the projection metadata the scanned
+		// path would report.
+		if isMultiTable || stmt.From[0].Join != nil {
+			result.ColumnTypes = e.joinedSelectColumnTypes(stmt, collectAllTableRefs(stmt.From))
+		} else {
+			result.ColumnTypes = selectColumnTypes(stmt, schema)
 		}
 		return result, nil
 	}
@@ -1382,6 +1390,9 @@ func (e *Executor) executeCompound(c *parser.CompoundSelect) (*Result, error) {
 	for _, col := range left.Columns {
 		result.AddColumn(col)
 	}
+	// A compound SELECT reports the left branch's projection metadata, as
+	// PostgreSQL does: the set operation does not retype its columns.
+	result.ColumnTypes = append([]string(nil), left.ColumnTypes...)
 
 	switch c.Op {
 	case parser.SetOpUnion:
@@ -1479,6 +1490,9 @@ func (e *Executor) executeSelectExpr(stmt *parser.SelectStmt) (*Result, error) {
 		} else {
 			result.AddColumn(fmt.Sprintf("column%d", i+1))
 		}
+		// A SELECT without FROM has no schema, but literal and operator
+		// projections still have a known type.
+		result.ColumnTypes = append(result.ColumnTypes, inferExprType(col.Expr, nil))
 	}
 
 	// Evaluate expressions
@@ -1711,6 +1725,7 @@ func schemaFromColumns(columns []string) *storage.Schema {
 // executeAggregateSelect executes a SELECT with aggregate functions.
 func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storage.Row, schema *storage.Schema) (*Result, error) {
 	result := NewResult("SELECT")
+	resolve := schemaTypeResolver(schema)
 
 	// Determine columns and evaluate aggregates
 	for i, col := range stmt.Columns {
@@ -1721,6 +1736,12 @@ func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storag
 		} else {
 			result.AddColumn(fmt.Sprintf("column%d", i+1))
 		}
+		if col.Star || col.TableStar != "" {
+			// The aggregate path emits one synthesized column per wildcard.
+			result.ColumnTypes = append(result.ColumnTypes, "TEXT")
+			continue
+		}
+		result.ColumnTypes = append(result.ColumnTypes, inferExprType(col.Expr, resolve))
 	}
 
 	// Calculate values

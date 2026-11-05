@@ -1369,10 +1369,16 @@ func (c *Connection) writeMessage(msgType byte, data []byte) error {
 // getOIDForType returns PostgreSQL OID for type
 func (c *Connection) getOIDForType(typeName string) int32 {
 	switch strings.ToUpper(typeName) {
-	case "INTEGER", "INT":
+	case "SMALLINT", "INT2", "TINYINT":
+		// TINYINT has no PostgreSQL equivalent; the smallest integer type
+		// reports it without losing the integer nature of the values.
+		return 21 // INT2OID
+	case "INTEGER", "INT", "INT4", "MEDIUMINT":
 		return 23 // INT4OID
-	case "BIGINT":
+	case "BIGINT", "INT8":
 		return 20 // INT8OID
+	case "NUMERIC", "DECIMAL":
+		return 1700 // NUMERICOID
 	case "TEXT", "VARCHAR", "CHAR", "UUID":
 		// UUID is stored as text (SQLite-style), so it reports TEXTOID rather
 		// than the native PG UUID OID.
@@ -1396,12 +1402,14 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 	}
 }
 
-// getTypeSizeForType returns type size
+// getTypeSizeForType returns type size in bytes, or -1 for variable length.
 func (c *Connection) getTypeSizeForType(typeName string) int16 {
 	switch strings.ToUpper(typeName) {
-	case "INTEGER", "INT":
+	case "SMALLINT", "INT2", "TINYINT":
+		return 2
+	case "INTEGER", "INT", "INT4", "MEDIUMINT":
 		return 4
-	case "BIGINT":
+	case "BIGINT", "INT8":
 		return 8
 	case "REAL", "FLOAT":
 		return 4
