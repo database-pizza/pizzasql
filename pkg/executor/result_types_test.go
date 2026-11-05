@@ -209,7 +209,8 @@ func TestInferExprType(t *testing.T) {
 		{"-1.5", "DOUBLE"},
 		{"(id)", "INTEGER"},
 
-		// Casts report the target type the executor converts to.
+		// Casts over a column report the carrier type the executor produces, not
+		// the target width: the value is not proven to fit a narrower type.
 		{"CAST(id AS BIGINT)", "BIGINT"},
 		{"CAST(id AS SMALLINT)", "BIGINT"},
 		{"CAST(id AS TEXT)", "TEXT"},
@@ -219,7 +220,29 @@ func TestInferExprType(t *testing.T) {
 		{"CAST(id AS INTEGER)", "BIGINT"},
 		{"CAST(id AS TINYINT)", "BIGINT"},
 		{"CAST(id AS DATE)", "TEXT"},
-		{"CAST(id AS NUMERIC)", "TEXT"},
+		// Scalar NUMERIC is float64-backed, so its result metadata is float8.
+		{"CAST(id AS NUMERIC)", "DOUBLE"},
+		{"CAST(id AS DECIMAL)", "DOUBLE"},
+
+		// A literal cast reports its declared width when the constant fits the
+		// carrier; INT2 is the exact-width spelling a SMALLINT column cannot use.
+		{"CAST(1 AS SMALLINT)", "INT2"},
+		{"1::SMALLINT", "INT2"},
+		{"'5'::SMALLINT", "INT2"},
+		{"32767::SMALLINT", "INT2"},
+		{"32768::SMALLINT", "BIGINT"},
+		{"'abc'::SMALLINT", "BIGINT"},
+		{"CAST(NULL AS SMALLINT)", "BIGINT"},
+		{"CAST(1 AS INTEGER)", "INTEGER"},
+		{"2147483647::INTEGER", "INTEGER"},
+		{"2147483648::INTEGER", "BIGINT"},
+		{"1::BIGINT", "BIGINT"},
+		{"1.5::REAL", "REAL"},
+		{"CAST(1 AS REAL)", "REAL"},
+		{"3.5e38::REAL", "DOUBLE"},
+		{"1.5::DOUBLE", "DOUBLE"},
+		{"1::NUMERIC", "DOUBLE"},
+		{"1.5::DECIMAL", "DOUBLE"},
 
 		// NUMERIC/DECIMAL have no exact decimal carrier: their values are
 		// float64, so expressions over them report DOUBLE.
@@ -266,6 +289,12 @@ func TestSelectColumnTypesExpressions(t *testing.T) {
 		{"SELECT 42 FROM t", []string{"INTEGER"}},
 		{"SELECT 1.5 FROM t", []string{"DOUBLE"}},
 		{"SELECT CAST(id AS BIGINT) FROM t", []string{"BIGINT"}},
+		{"SELECT 1::SMALLINT FROM t", []string{"INT2"}},
+		{"SELECT 40000::SMALLINT FROM t", []string{"BIGINT"}},
+		{"SELECT 1.5::REAL FROM t", []string{"REAL"}},
+		{"SELECT 1.5::DOUBLE FROM t", []string{"DOUBLE"}},
+		{"SELECT 1::NUMERIC FROM t", []string{"DOUBLE"}},
+		{"SELECT CAST(id AS SMALLINT) FROM t", []string{"BIGINT"}},
 		{"SELECT created_at FROM t GROUP BY created_at", []string{"TIMESTAMP"}},
 		{"SELECT id FROM t UNION SELECT id FROM t", []string{"INTEGER"}},
 		// The empty result still reports projection metadata.
@@ -295,7 +324,7 @@ func TestSelectColumnTypesWithoutFrom(t *testing.T) {
 	e := newExec(schema, table)
 
 	res := execMust(t, e, "SELECT 1, 1.5, 'x', 1 = 1, CAST(1 AS SMALLINT)")
-	want := []string{"INTEGER", "DOUBLE", "TEXT", "BOOLEAN", "BIGINT"}
+	want := []string{"INTEGER", "DOUBLE", "TEXT", "BOOLEAN", "INT2"}
 	if len(res.ColumnTypes) != len(want) {
 		t.Fatalf("column types = %v, want %v", res.ColumnTypes, want)
 	}
@@ -303,5 +332,27 @@ func TestSelectColumnTypesWithoutFrom(t *testing.T) {
 		if res.ColumnTypes[i] != want[i] {
 			t.Fatalf("column types = %v, want %v", res.ColumnTypes, want)
 		}
+	}
+}
+
+// TestCompoundWidensExactInt2 covers the one composition where an exact literal
+// cast type stops being safe: a union also carries the right branch's values, so
+// the left branch's int2 proof widens back to the int8 carrier. INTERSECT and
+// EXCEPT keep only the left branch's rows and keep the exact type.
+func TestCompoundWidensExactInt2(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	res := execMust(t, e, `SELECT 1::SMALLINT AS v UNION ALL SELECT 40000`)
+	if len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != "BIGINT" {
+		t.Fatalf("union column types = %v, want [BIGINT]", res.ColumnTypes)
+	}
+	if len(res.Rows) != 2 || res.Rows[1][0] != int64(40000) {
+		t.Fatalf("union rows = %v", res.Rows)
+	}
+
+	res = execMust(t, e, `SELECT 1::SMALLINT AS v INTERSECT SELECT 1`)
+	if len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != "INT2" {
+		t.Fatalf("intersect column types = %v, want [INT2]", res.ColumnTypes)
 	}
 }

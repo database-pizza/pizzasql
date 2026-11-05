@@ -421,3 +421,29 @@ func TestCatalogIntrospectionIsAdvertised(t *testing.T) {
 		t.Fatalf("document does not advertise the catalog as read-only: %s", body)
 	}
 }
+
+// The scalar NUMERIC contract is advertised: float8-backed scalars with a
+// float64 client type, while NUMERIC[] keeps exact text.
+func TestScalarNumericIsAdvertisedAsFloat8Backed(t *testing.T) {
+	doc := Current()
+	numeric := doc.Types.Numeric
+	if !numeric.Supported {
+		t.Fatalf("types.numeric = %+v, want supported", numeric)
+	}
+	if numeric.Status != "float8_backed" {
+		t.Fatalf("types.numeric status = %q, want float8_backed", numeric.Status)
+	}
+	for _, want := range []string{"OID 701", "float8", "float64", "NUMERIC[]", "OID 1231", "exact"} {
+		if !strings.Contains(numeric.Notes, want) {
+			t.Fatalf("types.numeric notes = %q, want it to mention %q", numeric.Notes, want)
+		}
+	}
+
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"numeric":{"supported":true`) {
+		t.Fatalf("document does not advertise types.numeric as supported: %s", body)
+	}
+}

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
@@ -319,7 +320,7 @@ func inferExprType(expr parser.Expr, resolve columnTypeResolver) string {
 	case *parser.LiteralExpr:
 		return literalType(e)
 	case *parser.CastExpr:
-		if typeName, ok := castResultType(e.Type.SQLTypeName()); ok {
+		if typeName, ok := castResultType(e.Type.SQLTypeName(), e.Expr); ok {
 			return typeName
 		}
 		return "TEXT"
@@ -370,22 +371,52 @@ func literalType(lit *parser.LiteralExpr) string {
 	}
 }
 
+// exactInt2TypeName is the result type name for a SMALLINT cast whose constant
+// operand fits int2. A SMALLINT column keeps reporting the int8 carrier because
+// stored values are not range-checked, so the exact width needs its own spelling
+// for the wire layer to map to OID 21 (int2).
+const exactInt2TypeName = "INT2"
+
 // castResultType reports the result type of CAST(x AS name). Only targets the
 // executor actually converts are reported; every other target leaves the value
 // untouched, so the value keeps its original encoding and stays TEXT metadata.
 //
-// Casts report the carrier type of the converted value, not the target width:
-// evalCastExpr always produces int64 for integer targets and float64 for
-// real targets, and it does not range-check them. A narrower advertised type
-// (int2/int4/float4) could otherwise fail to decode a value the engine accepted.
-func castResultType(name string) (string, bool) {
+// evalCastExpr always produces int64 for integer targets and float64 for real
+// targets and does not range-check them, so a narrower advertised type could
+// fail to decode a value the engine accepted. A cast therefore reports its
+// declared width only when the operand is a constant that fits that width:
+// SMALLINT and INTEGER use the int64 result range, and REAL the float32 range.
+// A cast over a column, parameter, or other expression reports the carrier type
+// instead (int8 or float8).
+func castResultType(name string, operand parser.Expr) (string, bool) {
 	if element, isArray := arrayElementType(name); isArray {
 		return arrayResultTypeName(element), true
 	}
 	switch strings.ToUpper(strings.TrimSpace(name)) {
-	case "INTEGER", "INT", "SMALLINT", "TINYINT", "MEDIUMINT", "BIGINT":
+	case "SMALLINT":
+		if value, ok := constantNumericValue(operand); ok && value >= math.MinInt16 && value <= math.MaxInt16 {
+			return exactInt2TypeName, true
+		}
 		return "BIGINT", true
-	case "REAL", "FLOAT", "DOUBLE":
+	case "INTEGER", "INT":
+		if value, ok := constantNumericValue(operand); ok && value >= math.MinInt32 && value <= math.MaxInt32 {
+			return "INTEGER", true
+		}
+		return "BIGINT", true
+	case "TINYINT", "MEDIUMINT", "BIGINT":
+		return "BIGINT", true
+	case "REAL", "FLOAT":
+		// float4 cannot represent a magnitude above MaxFloat32; the binary
+		// encoder rejects such a value rather than sending an infinity.
+		if value, ok := constantNumericValue(operand); ok && math.Abs(value) <= math.MaxFloat32 {
+			return "REAL", true
+		}
+		return "DOUBLE", true
+	case "DOUBLE":
+		return "DOUBLE", true
+	case "NUMERIC", "DECIMAL":
+		// A scalar NUMERIC is float64-backed: the engine keeps no exact decimal
+		// carrier and the wire reports float8 (701). NUMERIC[] keeps exact text.
 		return "DOUBLE", true
 	case "TEXT", "VARCHAR", "CHAR", "CHARACTER", "CLOB", "NCHAR", "NVARCHAR":
 		return "TEXT", true
@@ -403,6 +434,48 @@ func castResultType(name string) (string, bool) {
 		return "NAME", true
 	default:
 		return "", false
+	}
+}
+
+// constantNumericValue reports the numeric value of a cast operand that is
+// statically known: a numeric or string literal, optionally parenthesized or
+// signed. It reports false for every other expression, including a NULL literal,
+// so the caller keeps the carrier type when the value is not proven to fit.
+func constantNumericValue(expr parser.Expr) (float64, bool) {
+	switch e := expr.(type) {
+	case *parser.ParenExpr:
+		return constantNumericValue(e.Expr)
+	case *parser.UnaryExpr:
+		if e.Op != lexer.TokenMinus && e.Op != lexer.TokenPlus {
+			return 0, false
+		}
+		value, ok := constantNumericValue(e.Operand)
+		if !ok {
+			return 0, false
+		}
+		if e.Op == lexer.TokenMinus {
+			return -value, true
+		}
+		return value, true
+	case *parser.LiteralExpr:
+		switch e.Type {
+		case lexer.TokenNumber, lexer.TokenString:
+			// evalCastExpr converts through toFloat, which parses the same
+			// decimal text; a value that does not parse is not proven either.
+			value, err := strconv.ParseFloat(e.Value, 64)
+			if err != nil {
+				return 0, false
+			}
+			return value, true
+		case lexer.TokenTRUE:
+			return 1, true
+		case lexer.TokenFALSE:
+			return 0, true
+		default:
+			return 0, false
+		}
+	default:
+		return 0, false
 	}
 }
 
@@ -449,7 +522,7 @@ func arrayResultTypeName(elementType string) string {
 	switch strings.ToUpper(strings.TrimSpace(elementType)) {
 	case "INTEGER", "INT", "INT4":
 		return "INTEGER[]"
-	case "BIGINT", "INT8", "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+	case "BIGINT", "INT8", "SMALLINT", exactInt2TypeName, "TINYINT", "MEDIUMINT":
 		return "BIGINT[]"
 	case "REAL", "FLOAT", "FLOAT4":
 		return "REAL[]"
@@ -495,6 +568,11 @@ func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) str
 		return "REGCLASS"
 	case "TO_REGTYPE":
 		return "REGTYPE"
+	case "PIZZASQL_PARAM":
+		// Internal marker for a bound parameter. It returns its argument
+		// unchanged, and reporting the carrier type keeps cast metadata
+		// independent of the bound value.
+		return firstArgType(fn, resolve)
 	default:
 		return "TEXT"
 	}
@@ -622,11 +700,27 @@ func caseResultType(e *parser.CaseExpr, resolve columnTypeResolver) string {
 // isIntegerTypeName reports whether a type name is an integer type.
 func isIntegerTypeName(name string) bool {
 	switch strings.ToUpper(strings.TrimSpace(name)) {
-	case "INTEGER", "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT":
+	case "INTEGER", "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT", exactInt2TypeName:
 		return true
 	default:
 		return false
 	}
+}
+
+// carrierColumnTypes widens exact-width result types to their carrier. A compound
+// SELECT reports the left branch's metadata but also contains the right branch's
+// values, which were never checked against the narrower type the left branch
+// proved.
+func carrierColumnTypes(types []string) []string {
+	wides := make([]string, len(types))
+	for i, typeName := range types {
+		if strings.EqualFold(typeName, exactInt2TypeName) {
+			wides[i] = "BIGINT"
+			continue
+		}
+		wides[i] = typeName
+	}
+	return wides
 }
 
 // isFloatCarrierTypeName reports whether a type name is carried as float64.

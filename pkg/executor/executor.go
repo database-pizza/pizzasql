@@ -1598,8 +1598,13 @@ func (e *Executor) executeCompound(c *parser.CompoundSelect) (*Result, error) {
 		result.AddColumn(col)
 	}
 	// A compound SELECT reports the left branch's projection metadata, as
-	// PostgreSQL does: the set operation does not retype its columns.
+	// PostgreSQL does: the set operation does not retype its columns. A union
+	// also carries the right branch's values, so an exact-width type the left
+	// branch proved widens back to its carrier.
 	result.ColumnTypes = append([]string(nil), left.ColumnTypes...)
+	if c.Op == parser.SetOpUnion || c.Op == parser.SetOpUnionAll {
+		result.ColumnTypes = carrierColumnTypes(result.ColumnTypes)
+	}
 
 	switch c.Op {
 	case parser.SetOpUnion:
@@ -6174,6 +6179,15 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 			return nil, err
 		}
 		args[i] = val
+	}
+
+	if name == "PIZZASQL_PARAM" {
+		// Internal marker for a bound parameter: it returns its argument
+		// unchanged so casts over parameters stay on the carrier type.
+		if len(args) != 1 {
+			return nil, fmt.Errorf("pizzasql_param expects exactly one argument")
+		}
+		return args[0], nil
 	}
 
 	// Native jsonb functions and JSON1 scalar functions are dispatched

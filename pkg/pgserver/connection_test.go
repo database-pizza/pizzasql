@@ -27,7 +27,7 @@ func TestBindQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "SELECT 'O''Reilly', 42, NULL, TRUE, '$5'"
+	want := "SELECT pizzasql_param('O''Reilly'), pizzasql_param(42), pizzasql_param(NULL), pizzasql_param(TRUE), '$5'"
 	if query != want {
 		t.Fatalf("bound query = %q, want %q", query, want)
 	}
