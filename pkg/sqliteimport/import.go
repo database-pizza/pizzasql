@@ -320,9 +320,7 @@ var (
 	// Use \w+ (not \S+) so the trailing comma of the column is preserved.
 	reInlineRefs = regexp.MustCompile(`(?i)\bREFERENCES\s+\w+\s*(?:\([^)]*\))?\s*(?:(?:ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))\s*)*`)
 	// Table-level FOREIGN KEY constraint lines
-	reTableFK = regexp.MustCompile(`(?i),?\s*FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+\w+\s*(?:\([^)]*\))?\s*(?:(?:ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))\s*)*`)
-	// Table-level CHECK constraints
-	reTableCheck = regexp.MustCompile(`(?i),?\s*CHECK\s*\([^)]*\)`)
+	reTableFK    = regexp.MustCompile(`(?i),?\s*FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+\w+\s*(?:\([^)]*\))?\s*(?:(?:ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))\s*)*`)
 	reOnConflict = regexp.MustCompile(`(?i)\bON\s+CONFLICT\s+\w+`)
 	// Complex DEFAULT expressions: DEFAULT (...) — strip entirely, keep no default
 	reComplexDefault = regexp.MustCompile(`(?i)\bDEFAULT\s*\([^)]*\)`)
@@ -340,7 +338,6 @@ func sanitizeDDL(ddl string) string {
 	ddl = reWithoutRowid.ReplaceAllString(ddl, "")
 	ddl = reStrict.ReplaceAllString(ddl, "")
 	ddl = reTableFK.ReplaceAllString(ddl, "")
-	ddl = reTableCheck.ReplaceAllString(ddl, "")
 	ddl = reComplexDefault.ReplaceAllString(ddl, "")
 	ddl = reInlineRefs.ReplaceAllString(ddl, "")
 	ddl = reOnConflict.ReplaceAllString(ddl, "")

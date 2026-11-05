@@ -79,3 +79,39 @@ func TestExportCompositePrimaryKey(t *testing.T) {
 		t.Fatalf("dump lost the composite key:\n%s", dump)
 	}
 }
+
+// CHECK constraints are part of the schema and must survive a logical dump.
+func TestExportPreservesCheckConstraints(t *testing.T) {
+	kv := testkv.New(t)
+	pool := kv.Pool(4)
+	t.Cleanup(func() { pool.Close() })
+
+	schemaManager := storage.NewSchemaManager(pool, "testdb")
+	tableManager := storage.NewTableManager(pool, schemaManager, "testdb")
+
+	if err := schemaManager.CreateTable(&storage.Schema{
+		Name: "items",
+		Checks: []storage.CheckConstraint{
+			{Name: "positive_qty", Expression: "qty > 0"},
+			{Expression: "LENGTH(name) > 0"},
+		},
+		Columns: []storage.Column{
+			{Name: "id", Type: "INTEGER", Nullable: false, PrimaryKey: true},
+			{Name: "qty", Type: "INTEGER", Nullable: false},
+			{Name: "name", Type: "TEXT", Nullable: false},
+		},
+	}); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	dump, err := ExportDatabase(schemaManager, tableManager, ExportOptions{Tables: []string{"items"}})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !strings.Contains(dump, `CONSTRAINT positive_qty CHECK (qty > 0)`) {
+		t.Fatalf("dump lost the named CHECK:\n%s", dump)
+	}
+	if !strings.Contains(dump, `CHECK (LENGTH(name) > 0)`) {
+		t.Fatalf("dump lost the unnamed CHECK:\n%s", dump)
+	}
+}

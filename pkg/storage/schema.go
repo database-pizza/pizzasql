@@ -1412,7 +1412,7 @@ func (m *SchemaManager) AddColumn(table string, column Column, checks []CheckCon
 		seen = make(map[string]struct{})
 	}
 	if columnHasDefault(column) {
-		if err := m.applyRows(table, func(row Row) (bool, error) {
+		rewrite := func(row Row) (bool, error) {
 			value, present := rowColumnValue(row, column.Name)
 			if !present {
 				var err error
@@ -1433,7 +1433,22 @@ func (m *SchemaManager) AddColumn(table string, column Column, checks []CheckCon
 				seen[encoded] = struct{}{}
 			}
 			return !present, nil
-		}); err != nil {
+		}
+		// Validate the complete rewrite before writing anything. An expression
+		// default (notably one used with UNIQUE) can fail on a later row after
+		// earlier batches were already flushed; a dry run keeps a rejected
+		// ALTER from leaving invisible values in rows the schema never saw. A
+		// constant default has already been validated by the pre-scan above, so
+		// it keeps the single-scan path.
+		if column.DefaultExpr != "" {
+			if err := m.dryRunRows(table, rewrite); err != nil {
+				return err
+			}
+		}
+		if seen != nil {
+			seen = make(map[string]struct{})
+		}
+		if err := m.applyRows(table, rewrite); err != nil {
 			return err
 		}
 	}
@@ -1972,6 +1987,17 @@ func (m *SchemaManager) applyRows(table string, transform func(Row) (bool, error
 				return flush()
 			}
 		}
+	})
+}
+
+// dryRunRows evaluates a row transform over every row without writing. It is
+// used before a multi-batch rewrite whose validation can fail on a later row.
+func (m *SchemaManager) dryRunRows(table string, transform func(Row) (bool, error)) error {
+	return m.applyRows(table, func(row Row) (bool, error) {
+		if _, err := transform(row); err != nil {
+			return false, err
+		}
+		return false, nil
 	})
 }
 

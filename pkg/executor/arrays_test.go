@@ -1068,3 +1068,30 @@ func TestArrayContainment(t *testing.T) {
 		t.Fatalf("integer containment error = %v, want 42804", err)
 	}
 }
+
+// Derived tables, CTEs, and views must carry array types into the outer
+// projection's result metadata instead of falling back to TEXT.
+func TestDerivedAndCTEArrayColumnTypes(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[], nums INTEGER[])`)
+	execMust(t, e, `INSERT INTO t VALUES (1, '{a,b}', '{1,2}')`)
+	execMust(t, e, `CREATE VIEW v AS SELECT tags, nums FROM t`)
+
+	cases := []struct {
+		sql string
+		typ string
+	}{
+		{`SELECT tags FROM v`, "TEXT[]"},
+		{`SELECT nums FROM v`, "INTEGER[]"},
+		{`WITH x AS (SELECT tags FROM t) SELECT tags FROM x`, "TEXT[]"},
+		{`SELECT tags FROM (SELECT tags FROM t) AS d`, "TEXT[]"},
+		{`SELECT tags[1] FROM (SELECT tags FROM t) AS d`, "TEXT"},
+	}
+	for _, tc := range cases {
+		res := execMust(t, e, tc.sql)
+		if len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != tc.typ {
+			t.Errorf("%s column types = %v, want [%s]", tc.sql, res.ColumnTypes, tc.typ)
+		}
+	}
+}

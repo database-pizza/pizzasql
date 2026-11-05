@@ -359,6 +359,10 @@ func TestSubstituteParams(t *testing.T) {
 		{"SELECT * FROM t WHERE x = ?", []interface{}{true}, "SELECT * FROM t WHERE x = 1"},
 		{"SELECT * FROM t WHERE x = ?", []interface{}{false}, "SELECT * FROM t WHERE x = 0"},
 		{"SELECT * FROM t WHERE x = ?", []interface{}{3.14}, "SELECT * FROM t WHERE x = 3.14"},
+		{"SELECT ?", []interface{}{"a?b"}, "SELECT 'a?b'"},
+		{"SELECT '?', ?", []interface{}{1}, "SELECT '?', 1"},
+		{"SELECT \"?\", ?", []interface{}{1}, "SELECT \"?\", 1"},
+		{"SELECT 1 -- ?\n, ?", []interface{}{2}, "SELECT 1 -- ?\n, 2"},
 	}
 
 	for _, tt := range tests {
