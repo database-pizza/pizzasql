@@ -351,6 +351,14 @@ func recreateCreateTableSQL(s *storage.Schema) string {
 			parent[i] = quoteIdent(name)
 		}
 		clause := fmt.Sprintf("FOREIGN KEY (%s) REFERENCES %s (%s)", strings.Join(child, ", "), quoteIdent(fk.RefTable), strings.Join(parent, ", "))
+		for _, action := range []struct {
+			clause string
+			value  string
+		}{{"ON DELETE", fk.OnDelete}, {"ON UPDATE", fk.OnUpdate}} {
+			if action.value != "" {
+				clause += " " + action.clause + " " + action.value
+			}
+		}
 		if fk.Name != "" {
 			clause = fmt.Sprintf("CONSTRAINT %s %s", quoteIdent(fk.Name), clause)
 		}

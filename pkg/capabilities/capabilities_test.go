@@ -163,7 +163,11 @@ func TestForeignKeyIsAdvertised(t *testing.T) {
 	if fk.SQLState != pgerror.CodeForeignKeyViolation {
 		t.Fatalf("foreign_key SQLSTATE = %q, want %q", fk.SQLState, pgerror.CodeForeignKeyViolation)
 	}
-	for _, want := range []string{"UNIQUE", "COMMIT", "MATCH SIMPLE", "self", "CASCADE", "DEFERRABLE", "0A000", "pg_constraint"} {
+	for _, want := range []string{
+		"UNIQUE", "COMMIT", "MATCH SIMPLE", "MATCH keyword", "self", "CASCADE", "DEFERRABLE", "0A000",
+		"PRAGMA foreign_keys", "rejects OFF", "foreign_key_list", "database-wide foreign-key write gate",
+		"DROP/RENAME COLUMN", "DROP TABLE", "pg_constraint",
+	} {
 		if !strings.Contains(fk.Notes, want) {
 			t.Fatalf("foreign_key notes = %q, want it to mention %q", fk.Notes, want)
 		}

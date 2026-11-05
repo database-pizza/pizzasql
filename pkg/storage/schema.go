@@ -52,6 +52,11 @@ type ForeignKeyConstraint struct {
 	Columns    []string `json:"columns"`
 	RefTable   string   `json:"ref_table"`
 	RefColumns []string `json:"ref_columns"`
+	// OnDelete and OnUpdate hold the declared referential action text (only
+	// NO ACTION and RESTRICT are accepted). They are empty when the clause was
+	// omitted and are kept so sqlite_master can reproduce the declaration.
+	OnDelete string `json:"on_delete,omitempty"`
+	OnUpdate string `json:"on_update,omitempty"`
 }
 
 // Label identifies the constraint in error messages: the declared name when
@@ -507,6 +512,8 @@ func cloneSchema(schema *Schema) *Schema {
 				Columns:    append([]string(nil), fk.Columns...),
 				RefTable:   fk.RefTable,
 				RefColumns: append([]string(nil), fk.RefColumns...),
+				OnDelete:   fk.OnDelete,
+				OnUpdate:   fk.OnUpdate,
 			}
 		}
 	}

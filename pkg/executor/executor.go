@@ -3724,6 +3724,14 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		return nil, fmt.Errorf("table already exists: %s", stmt.Table.Name)
 	}
 
+	// Creating a table can add a FOREIGN KEY to the graph. Serialize the DDL
+	// with point writes so a concurrent child insert or parent delete cannot
+	// validate against a half-published constraint.
+	if e.table != nil {
+		unlockFK := e.table.LockForeignKeyWriteGate()
+		defer unlockFK()
+	}
+
 	// Build schema
 	schema := &storage.Schema{
 		Name: stmt.Table.Name,
@@ -3988,12 +3996,23 @@ func conflictActionName(action parser.ConflictAction) string {
 
 // executeDropTable executes a DROP TABLE statement.
 func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error) {
+	// Dropping a table can remove the parent or child side of a FOREIGN KEY.
+	// Serialize the DDL with point writes so a concurrent insert or delete cannot
+	// validate against a constraint that is being removed.
+	if e.table != nil {
+		unlockFK := e.table.LockForeignKeyWriteGate()
+		defer unlockFK()
+	}
+
 	for _, tableRef := range stmt.Tables {
 		if !e.schema.TableExists(tableRef.Name) {
 			if stmt.IfExists {
 				continue
 			}
 			return nil, fmt.Errorf("table not found: %s", tableRef.Name)
+		}
+		if err := e.rejectForeignKeyDependentTableDrop(tableRef.Name); err != nil {
+			return nil, err
 		}
 
 		// First, drop all indexes associated with this table
@@ -4367,6 +4386,9 @@ func (e *Executor) executeAlterTableDropColumn(table string, action *parser.Drop
 	if err := e.rejectCheckColumnChange(table, action.Column, "drop"); err != nil {
 		return nil, err
 	}
+	if err := e.rejectForeignKeyColumnChange(table, action.Column, "drop"); err != nil {
+		return nil, err
+	}
 	if err := e.schema.DropColumn(table, action.Column); err != nil {
 		return nil, err
 	}
@@ -4380,6 +4402,9 @@ func (e *Executor) executeAlterTableDropColumn(table string, action *parser.Drop
 
 // executeAlterTableRename renames a table.
 func (e *Executor) executeAlterTableRename(table string, action *parser.RenameTableAction) (*Result, error) {
+	if err := e.rejectForeignKeyTableRename(table); err != nil {
+		return nil, err
+	}
 	if err := e.schema.RenameTable(table, action.NewName); err != nil {
 		return nil, err
 	}
@@ -4399,6 +4424,9 @@ func (e *Executor) executeAlterTableRenameColumn(table string, action *parser.Re
 		return nil, err
 	}
 	if err := e.rejectCheckColumnChange(table, action.OldName, "rename"); err != nil {
+		return nil, err
+	}
+	if err := e.rejectForeignKeyColumnChange(table, action.OldName, "rename"); err != nil {
 		return nil, err
 	}
 	if err := e.schema.RenameColumn(table, action.OldName, action.NewName); err != nil {
@@ -4813,17 +4841,17 @@ func (e *Executor) executePragma(stmt *parser.PragmaStmt) (*Result, error) {
 		}
 		if ref, ok := stmt.Value.(*parser.ColumnRef); ok && (strings.EqualFold(ref.Column, "on") || strings.EqualFold(ref.Column, "off")) {
 			if strings.EqualFold(ref.Column, "off") {
-				return nil, fmt.Errorf("feature not supported: foreign keys are always enforced; PRAGMA foreign_keys = OFF is not supported")
+				return nil, pgerror.Unsupported("foreign keys are always enforced; PRAGMA foreign_keys = OFF is not supported (SQLite defaults it to OFF)")
 			}
 			return result, nil
 		}
 		if literal, ok := stmt.Value.(*parser.LiteralExpr); ok && (literal.Value == "1" || literal.Value == "0") {
 			if literal.Value == "0" {
-				return nil, fmt.Errorf("feature not supported: foreign keys are always enforced; PRAGMA foreign_keys = OFF is not supported")
+				return nil, pgerror.Unsupported("foreign keys are always enforced; PRAGMA foreign_keys = OFF is not supported (SQLite defaults it to OFF)")
 			}
 			return result, nil
 		}
-		return nil, fmt.Errorf("feature not supported: PRAGMA foreign_keys accepts ON or OFF")
+		return nil, pgerror.Unsupported("PRAGMA foreign_keys accepts ON or OFF")
 	default:
 		return nil, fmt.Errorf("unknown pragma: %s", stmt.Name)
 	}

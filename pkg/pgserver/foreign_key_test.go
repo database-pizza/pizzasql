@@ -67,3 +67,13 @@ func TestForeignKeyParentDeleteSQLState(t *testing.T) {
 		t.Fatalf("rejected delete removed the parent: %v", values)
 	}
 }
+
+// Foreign keys are always enforced, so disabling them is rejected as an
+// unsupported feature (0A000) rather than a generic execution error.
+func TestForeignKeyPragmaOffReturnsFeatureNotSupported(t *testing.T) {
+	c, client := newDataConnection(t)
+	messages := runQuery(t, c, client, simpleQueryMessage("PRAGMA foreign_keys = OFF"))
+	if code := errorCode(messages[0]); code != ErrCodeFeatureNotSupported {
+		t.Fatalf("PRAGMA foreign_keys = OFF SQLSTATE = %q, want %q", code, ErrCodeFeatureNotSupported)
+	}
+}

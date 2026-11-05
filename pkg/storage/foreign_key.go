@@ -261,6 +261,79 @@ func (m *SchemaManager) referencingForeignKeys(table string) ([]referencingForei
 	return catalog.referencing[strings.ToLower(table)], nil
 }
 
+// foreignKeyReferenceName formats a constraint for a DDL error message. The
+// child table is included because an unnamed constraint's label is only unique
+// within its table.
+func foreignKeyReferenceName(child string, fk ForeignKeyConstraint) string {
+	return fmt.Sprintf("%s on %s", fk.Label(), child)
+}
+
+// ForeignKeyColumnDependency returns the constraints that keep a column in
+// place: a FOREIGN KEY this table declares on it, or a FOREIGN KEY (from this
+// table or another one) that references it as a parent column. DROP/RENAME
+// COLUMN cannot rewrite persisted constraint text, so a non-empty result must
+// reject the change instead of silently disabling the constraint.
+func (m *SchemaManager) ForeignKeyColumnDependency(table, column string) ([]string, error) {
+	catalog, err := m.foreignKeyCatalogSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	schema, err := m.GetSchema(table)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var labels []string
+	add := func(child string, fk ForeignKeyConstraint) {
+		label := foreignKeyReferenceName(child, fk)
+		if seen[label] {
+			return
+		}
+		seen[label] = true
+		labels = append(labels, label)
+	}
+	for _, fk := range schema.ForeignKeys {
+		for _, name := range fk.Columns {
+			if strings.EqualFold(name, column) {
+				add(schema.Name, fk)
+				break
+			}
+		}
+	}
+	for _, ref := range catalog.referencing[strings.ToLower(table)] {
+		for _, name := range ref.FK.RefColumns {
+			if strings.EqualFold(name, column) {
+				add(ref.Table, ref.FK)
+				break
+			}
+		}
+	}
+	sort.Strings(labels)
+	return labels, nil
+}
+
+// ForeignKeyTableDependency returns the constraints that name table as their
+// referenced parent, including a self-reference. RENAME TABLE cannot rewrite
+// them, and DROP TABLE would leave them dangling.
+func (m *SchemaManager) ForeignKeyTableDependency(table string) ([]string, error) {
+	catalog, err := m.foreignKeyCatalogSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var labels []string
+	for _, ref := range catalog.referencing[strings.ToLower(table)] {
+		label := foreignKeyReferenceName(ref.Table, ref.FK)
+		if seen[label] {
+			continue
+		}
+		seen[label] = true
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	return labels, nil
+}
+
 // ForeignKeyParticipants reports whether a write to table can affect referential
 // integrity. A table participates when it declares a FOREIGN KEY or when another
 // table references it.
@@ -326,6 +399,16 @@ func (m *TableManager) lockForeignKeyWrites(tables ...string) (func(), error) {
 		}
 	}
 	return func() {}, nil
+}
+
+// LockForeignKeyWriteGate takes the foreign-key write gate unconditionally.
+// Schema DDL uses it around CREATE TABLE and DROP TABLE: the table that gains or
+// loses a constraint is not part of the foreign-key graph yet (or has just been
+// removed from it), so the participant check would skip the gate exactly when
+// the graph is changing. Callers must take it before any table gate.
+func (m *TableManager) LockForeignKeyWriteGate() func() {
+	m.foreignKeyMu.Lock()
+	return m.foreignKeyMu.Unlock
 }
 
 // foreignKeyStateValidator validates the final row state of a set of tables

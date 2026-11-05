@@ -39,6 +39,13 @@ The migration command exits after writing and verifying the destination. It refu
   pre-CHECK engine ignores it on read and drops it on the next schema write, so
   rolling back to such an engine silently stops enforcing CHECK constraints;
   restore the newer engine (or re-create the constraints) after a rollback.
+- `Schema.ForeignKeys` (`foreign_keys`) is an additive, optional JSON array of
+  foreign-key declarations (child columns, referenced table and columns, and any
+  declared `ON DELETE`/`ON UPDATE` action text). A pre-foreign-key engine ignores
+  the field on read and drops it on the next schema write, so rolling back to
+  such an engine silently stops enforcing referential integrity: dangling child
+  rows become insertable and deleting a referenced parent no longer fails.
+  Restore the newer engine (or re-create the constraints) after a rollback.
 - `Schema.PrimaryKeyColumns` (`primary_key_columns`) is an additive, optional
   JSON field for composite primary keys. A single-column catalog still carries
   only `primary_key`; a composite catalog persists `primary_key` as an empty

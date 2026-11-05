@@ -273,12 +273,20 @@ func TestForeignKeySelfReference(t *testing.T) {
 	_, err := execSQL(e, "INSERT INTO nodes (id, parent_id) VALUES (4, 99)")
 	requireForeignKeyViolation(t, err)
 
-	// A self-referencing row cannot be deleted while it points at itself.
+	// Row 1 exists and references itself, but row 2 also references it, so the
+	// delete is rejected because another row still points at it.
 	_, err = execSQL(e, "DELETE FROM nodes WHERE id = 1")
 	requireForeignKeyViolation(t, err)
 
+	// A row that only references itself can be deleted: the row and the
+	// reference leave together.
 	execMust(t, e, "INSERT INTO nodes (id, parent_id) VALUES (5, 5)")
 	execMust(t, e, "DELETE FROM nodes WHERE id = 5")
+
+	// Once the other child is gone, node 1's self-reference no longer blocks.
+	execMust(t, e, "DELETE FROM nodes WHERE id = 2")
+	execMust(t, e, "DELETE FROM nodes WHERE id = 1")
+	execMust(t, e, "INSERT INTO nodes (id, parent_id) VALUES (1, 1)")
 
 	// A composite self-reference resolves against this table's table-level key.
 	execMust(t, e, `CREATE TABLE tree (
@@ -526,6 +534,19 @@ func TestForeignKeyInSQLiteCatalog(t *testing.T) {
 	if res.RowCount != 1 || !strings.Contains(res.Rows[0][0].(string), "FOREIGN KEY") {
 		t.Fatalf("sqlite_schema SQL = %v, want the foreign key", res.Rows)
 	}
+
+	// Declared referential actions round-trip through the catalog text.
+	execMust(t, e, `CREATE TABLE child_actions (
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER,
+		CONSTRAINT child_parent_actions FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE NO ACTION
+	)`)
+	res = execMust(t, e, "SELECT sql FROM sqlite_master WHERE name = 'child_actions'")
+	sql, _ = res.Rows[0][0].(string)
+	want := "CONSTRAINT `child_parent_actions` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`) ON DELETE RESTRICT ON UPDATE NO ACTION"
+	if !strings.Contains(sql, want) {
+		t.Fatalf("catalog SQL %q does not contain %q", sql, want)
+	}
 }
 
 // Foreign keys coexist with the composite primary key, CHECK, and default
@@ -635,4 +656,149 @@ func TestForeignKeyInsertSelect(t *testing.T) {
 	if res := execMust(t, e, "SELECT count(*) FROM child"); res.Rows[0][0] != int64(1) {
 		t.Fatalf("child rows after valid INSERT ... SELECT = %v, want 1", res.Rows)
 	}
+}
+
+// Referential integrity is a final-state property: a parent and its child can be
+// inserted in one transaction, and the commit validates both.
+func TestForeignKeyTransactionInsertParentAndChild(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))")
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "INSERT INTO parent (id) VALUES (1)")
+	execMust(t, e, "INSERT INTO child (id, parent_id) VALUES (10, 1)")
+	execMust(t, e, "COMMIT")
+
+	if res := execMust(t, e, "SELECT count(*) FROM child"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("child rows = %v, want 1", res.Rows)
+	}
+}
+
+// Rows of one multi-row self-referential INSERT may reference each other: the
+// statement is validated against its own final row set.
+func TestForeignKeySiblingReferencesInOneInsert(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes(id))")
+
+	execMust(t, e, "INSERT INTO nodes (id, parent_id) VALUES (1, 2), (2, 1)")
+	if res := execMust(t, e, "SELECT count(*) FROM nodes"); res.Rows[0][0] != int64(2) {
+		t.Fatalf("nodes = %v, want 2", res.Rows)
+	}
+
+	_, err := execSQL(e, "INSERT INTO nodes (id, parent_id) VALUES (3, 4), (4, 99)")
+	requireForeignKeyViolation(t, err)
+	if res := execMust(t, e, "SELECT count(*) FROM nodes"); res.Rows[0][0] != int64(2) {
+		t.Fatalf("rejected sibling insert left rows behind: %v", res.Rows)
+	}
+}
+
+// INSERT OR REPLACE rebuilds the conflicting row inside one implicit
+// transaction, so replacing a referenced parent row with the same key is valid
+// while a replacement that moves the key orphans children and fails at commit.
+func TestForeignKeyInsertOrReplaceOnReferencedParent(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+	execMust(t, e, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))")
+	execMust(t, e, "INSERT INTO parent (id, code) VALUES (1, 'a')")
+	execMust(t, e, "INSERT INTO child (id, parent_id) VALUES (10, 1)")
+
+	// Same key: the child keeps a valid parent, so the replacement commits.
+	execMust(t, e, "INSERT OR REPLACE INTO parent (id, code) VALUES (1, 'b')")
+	if res := execMust(t, e, "SELECT count(*) FROM child WHERE parent_id = 1"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("child rows after in-place replace = %v, want 1", res.Rows)
+	}
+
+	// A unique-code conflict replaces row 1 with row 2, orphaning the child.
+	_, err := execSQL(e, "INSERT OR REPLACE INTO parent (id, code) VALUES (2, 'b')")
+	requireForeignKeyViolation(t, err)
+	if res := execMust(t, e, "SELECT id, code FROM parent"); res.RowCount != 1 || res.Rows[0][0] != int64(1) || res.Rows[0][1] != "b" {
+		t.Fatalf("parent after rejected replace = %v, want the original row", res.Rows)
+	}
+	if res := execMust(t, e, "SELECT count(*) FROM child"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("child rows after rejected replace = %v, want 1", res.Rows)
+	}
+}
+
+// A UNIQUE parent index is matched as a column set, and the values are matched in
+// declaration order: FOREIGN KEY (a, b) REFERENCES parent(y, x) compares a to y
+// and b to x.
+func TestForeignKeyReorderedUniqueTarget(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE parent (x INTEGER, y INTEGER, UNIQUE (x, y))")
+	execMust(t, e, "CREATE TABLE child (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES parent (y, x))")
+	execMust(t, e, "INSERT INTO parent (x, y) VALUES (1, 2)")
+
+	execMust(t, e, "INSERT INTO child (a, b) VALUES (2, 1)")
+	_, err := execSQL(e, "INSERT INTO child (a, b) VALUES (1, 2)")
+	requireForeignKeyViolation(t, err)
+	_, err = execSQL(e, "DELETE FROM parent")
+	requireForeignKeyViolation(t, err)
+}
+
+// ALTER TABLE rejects changes that would strand a persisted foreign key. The
+// metadata stores table and column names verbatim, so it cannot be rewritten.
+func TestForeignKeyAlterTableRejections(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE u (code TEXT UNIQUE, note TEXT)")
+	execMust(t, e, "CREATE TABLE child (id INTEGER PRIMARY KEY, code TEXT REFERENCES u(code), memo TEXT)")
+
+	rejections := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"drop child column", "ALTER TABLE child DROP COLUMN code", "cannot drop column code"},
+		{"rename child column", "ALTER TABLE child RENAME COLUMN code TO parent_code", "cannot rename column code"},
+		{"drop parent column", "ALTER TABLE u DROP COLUMN code", "cannot drop column code"},
+		{"rename parent column", "ALTER TABLE u RENAME COLUMN code TO code2", "cannot rename column code"},
+		{"rename referenced table", "ALTER TABLE u RENAME TO u2", "cannot rename table u"},
+		{"drop referenced table", "DROP TABLE u", "cannot drop table u"},
+	}
+	for _, tt := range rejections {
+		t.Run(tt.name, func(t *testing.T) {
+			requireUnsupported(t, execErr(t, e, tt.sql), tt.want)
+		})
+	}
+
+	// Unrelated columns and the child table itself are not constrained.
+	execMust(t, e, "ALTER TABLE child DROP COLUMN memo")
+	execMust(t, e, "ALTER TABLE u RENAME COLUMN note TO comment")
+	execMust(t, e, "ALTER TABLE u ADD COLUMN extra TEXT")
+	execMust(t, e, "ALTER TABLE child RENAME TO child2")
+
+	execMust(t, e, "INSERT INTO u (code, comment) VALUES ('a', 'x')")
+	execMust(t, e, "INSERT INTO child2 (id, code) VALUES (1, 'a')")
+	_, err := execSQL(e, "INSERT INTO child2 (id, code) VALUES (2, 'missing')")
+	requireForeignKeyViolation(t, err)
+}
+
+// A self-referential table is both sides of its own constraint, so renaming or
+// dropping it is rejected for the same reason.
+func TestForeignKeySelfReferenceAlterRejections(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes(id), memo TEXT)")
+
+	requireUnsupported(t, execErr(t, e, "ALTER TABLE nodes DROP COLUMN parent_id"), "cannot drop column parent_id")
+	requireUnsupported(t, execErr(t, e, "ALTER TABLE nodes RENAME COLUMN parent_id TO parent"), "cannot rename column parent_id")
+	requireUnsupported(t, execErr(t, e, "ALTER TABLE nodes RENAME TO n2"), "cannot rename table nodes")
+	requireUnsupported(t, execErr(t, e, "DROP TABLE nodes"), "cannot drop table nodes")
+
+	execMust(t, e, "ALTER TABLE nodes DROP COLUMN memo")
+	execMust(t, e, "INSERT INTO nodes (id, parent_id) VALUES (1, 1)")
+	_, err := execSQL(e, "INSERT INTO nodes (id, parent_id) VALUES (2, 9)")
+	requireForeignKeyViolation(t, err)
+}
+
+// execErr parses and executes SQL, returning the error (nil on success).
+func execErr(t *testing.T, e *Executor, sql string) error {
+	t.Helper()
+	_, err := execSQL(e, sql)
+	return err
 }

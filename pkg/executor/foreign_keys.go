@@ -179,6 +179,8 @@ func (e *Executor) resolveForeignKey(table string, schema *storage.Schema, uniqu
 		Columns:    childColumns,
 		RefTable:   parent.Name,
 		RefColumns: canonical,
+		OnDelete:   declaration.onDelete.String(),
+		OnUpdate:   declaration.onUpdate.String(),
 	}, nil
 }
 
@@ -237,4 +239,58 @@ func sameColumnSet(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// rejectForeignKeyColumnChange refuses to drop or rename a column that a
+// persisted foreign key depends on, on the child side or as a referenced parent
+// column. Constraint metadata stores column names verbatim and cannot be
+// rewritten, so accepting the change would either silently stop enforcing the
+// constraint or leave the catalog naming a missing column.
+func (e *Executor) rejectForeignKeyColumnChange(table, column, action string) error {
+	labels, err := e.schema.ForeignKeyColumnDependency(table, column)
+	if err != nil {
+		return err
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	return pgerror.Unsupported(
+		"cannot %s column %s: foreign key %s depends on it; drop the constrained table (or recreate it without that constraint) first",
+		action, column, strings.Join(labels, ", "),
+	)
+}
+
+// rejectForeignKeyTableRename refuses to rename a table another constraint (or
+// its own constraint) names as the parent. The referenced table name is
+// persisted verbatim, so a rename would leave parent-side enforcement pointing
+// at a table that no longer exists.
+func (e *Executor) rejectForeignKeyTableRename(table string) error {
+	labels, err := e.schema.ForeignKeyTableDependency(table)
+	if err != nil {
+		return err
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	return pgerror.Unsupported(
+		"cannot rename table %s: foreign key %s references it; drop the constrained table (or recreate it without that constraint) first",
+		table, strings.Join(labels, ", "),
+	)
+}
+
+// rejectForeignKeyDependentTableDrop refuses to drop a table that a persisted
+// foreign key names as its parent, because the constraint would be left dangling
+// on the child table.
+func (e *Executor) rejectForeignKeyDependentTableDrop(table string) error {
+	labels, err := e.schema.ForeignKeyTableDependency(table)
+	if err != nil {
+		return err
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	return pgerror.Unsupported(
+		"cannot drop table %s: foreign key %s references it; drop or recreate the table that declares that constraint first",
+		table, strings.Join(labels, ", "),
+	)
 }

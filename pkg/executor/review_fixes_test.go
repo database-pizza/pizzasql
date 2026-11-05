@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
@@ -208,6 +210,8 @@ func TestForeignKeysPragmaAlwaysOn(t *testing.T) {
 	}
 	if _, err := execSQL(e, "PRAGMA foreign_keys = OFF"); err == nil {
 		t.Fatal("expected disabling always-on foreign keys to fail")
+	} else if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+		t.Fatalf("PRAGMA foreign_keys = OFF error = %v, want ErrFeatureNotSupported", err)
 	}
 }
 
