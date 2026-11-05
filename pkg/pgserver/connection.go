@@ -1366,19 +1366,26 @@ func (c *Connection) writeMessage(msgType byte, data []byte) error {
 	return WriteMessage(c.writer, msgType, data)
 }
 
-// getOIDForType returns PostgreSQL OID for type
+// getOIDForType returns PostgreSQL OID for type.
+//
+// Types narrower than the value the engine carries are reported as the carrier
+// type, because the engine does not range-check stored or cast values: a value
+// that does not fit int2/int4 or float4 would fail client-side decoding rather
+// than having been rejected on write. INTEGER and REAL keep their declared
+// mappings, which predate this rule and are what existing clients expect.
 func (c *Connection) getOIDForType(typeName string) int32 {
 	switch strings.ToUpper(typeName) {
-	case "SMALLINT", "INT2", "TINYINT":
-		// TINYINT has no PostgreSQL equivalent; the smallest integer type
-		// reports it without losing the integer nature of the values.
-		return 21 // INT2OID
-	case "INTEGER", "INT", "INT4", "MEDIUMINT":
+	case "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+		// Carried as int64 and not range-checked, so int8 is the honest type.
+		return 20 // INT8OID
+	case "INTEGER", "INT", "INT4":
 		return 23 // INT4OID
 	case "BIGINT", "INT8":
 		return 20 // INT8OID
 	case "NUMERIC", "DECIMAL":
-		return 1700 // NUMERICOID
+		// Values round-trip through JSON as float64; there is no exact decimal
+		// carrier, so NUMERIC is not advertised.
+		return 701 // FLOAT8OID
 	case "TEXT", "VARCHAR", "CHAR", "UUID":
 		// UUID is stored as text (SQLite-style), so it reports TEXTOID rather
 		// than the native PG UUID OID.
@@ -1405,12 +1412,14 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 // getTypeSizeForType returns type size in bytes, or -1 for variable length.
 func (c *Connection) getTypeSizeForType(typeName string) int16 {
 	switch strings.ToUpper(typeName) {
-	case "SMALLINT", "INT2", "TINYINT":
-		return 2
-	case "INTEGER", "INT", "INT4", "MEDIUMINT":
+	case "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+		return 8 // Reported as int8; see getOIDForType.
+	case "INTEGER", "INT", "INT4":
 		return 4
 	case "BIGINT", "INT8":
 		return 8
+	case "NUMERIC", "DECIMAL":
+		return 8 // Reported as float8; see getOIDForType.
 	case "REAL", "FLOAT":
 		return 4
 	case "DOUBLE":

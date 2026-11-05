@@ -168,7 +168,7 @@ func TestInferExprType(t *testing.T) {
 		{"1", "INTEGER"},
 		{"2147483647", "INTEGER"},
 		{"2147483648", "BIGINT"},
-		{"1.5", "NUMERIC"},
+		{"1.5", "DOUBLE"},
 		{"'text'", "TEXT"},
 		{"TRUE", "BOOLEAN"},
 		{"FALSE", "BOOLEAN"},
@@ -191,9 +191,9 @@ func TestInferExprType(t *testing.T) {
 		{"count(*)", "BIGINT"},
 		{"count(id)", "BIGINT"},
 		{"sum(id)", "BIGINT"},
-		{"sum(price)", "NUMERIC"},
+		{"sum(price)", "DOUBLE"},
 		{"sum(score)", "DOUBLE"},
-		{"avg(id)", "NUMERIC"},
+		{"avg(id)", "DOUBLE"},
 		{"avg(score)", "DOUBLE"},
 		{"total(id)", "DOUBLE"},
 		{"min(created_at)", "TIMESTAMP"},
@@ -202,20 +202,29 @@ func TestInferExprType(t *testing.T) {
 		// Arithmetic, concatenation, and bitwise operators.
 		{"id + 1", "BIGINT"},
 		{"score + 1", "DOUBLE"},
-		{"price + 1", "NUMERIC"},
+		{"price + 1", "DOUBLE"},
 		{"name || 'x'", "TEXT"},
 		{"id & 3", "BIGINT"},
 		{"-id", "INTEGER"},
-		{"-1.5", "NUMERIC"},
+		{"-1.5", "DOUBLE"},
 		{"(id)", "INTEGER"},
 
 		// Casts report the target type the executor converts to.
 		{"CAST(id AS BIGINT)", "BIGINT"},
-		{"CAST(id AS SMALLINT)", "SMALLINT"},
+		{"CAST(id AS SMALLINT)", "BIGINT"},
 		{"CAST(id AS TEXT)", "TEXT"},
 		{"CAST(name AS BLOB)", "BLOB"},
 		{"CAST(name AS DOUBLE)", "DOUBLE"},
+		{"CAST(id AS REAL)", "DOUBLE"},
+		{"CAST(id AS INTEGER)", "BIGINT"},
+		{"CAST(id AS TINYINT)", "BIGINT"},
 		{"CAST(id AS DATE)", "TEXT"},
+		{"CAST(id AS NUMERIC)", "TEXT"},
+
+		// NUMERIC/DECIMAL have no exact decimal carrier: their values are
+		// float64, so expressions over them report DOUBLE.
+		{"price + price", "DOUBLE"},
+		{"-price", "DOUBLE"},
 
 		// CASE keeps a type only when every branch agrees.
 		{"CASE WHEN flag THEN id ELSE 0 END", "INTEGER"},
@@ -238,8 +247,8 @@ func TestInferExprType(t *testing.T) {
 func TestSelectColumnTypesExpressions(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
-	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TIMESTAMP)")
-	execMust(t, e, "INSERT INTO t VALUES (1, '2024-05-06 07:08:09')")
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TIMESTAMP, price NUMERIC, small SMALLINT)")
+	execMust(t, e, "INSERT INTO t VALUES (1, '2024-05-06 07:08:09', 19.5, 7)")
 
 	cases := []struct {
 		sql  string
@@ -247,11 +256,15 @@ func TestSelectColumnTypesExpressions(t *testing.T) {
 	}{
 		{"SELECT count(*) FROM t", []string{"BIGINT"}},
 		{"SELECT sum(id) FROM t", []string{"BIGINT"}},
-		{"SELECT avg(id) FROM t", []string{"NUMERIC"}},
+		{"SELECT sum(price) FROM t", []string{"DOUBLE"}},
+		{"SELECT avg(id) FROM t", []string{"DOUBLE"}},
+		{"SELECT avg(price) FROM t", []string{"DOUBLE"}},
+		{"SELECT small + 1 FROM t", []string{"BIGINT"}},
+		{"SELECT price + 1 FROM t", []string{"DOUBLE"}},
 		{"SELECT id = 1 FROM t", []string{"BOOLEAN"}},
 		{"SELECT 'text' FROM t", []string{"TEXT"}},
 		{"SELECT 42 FROM t", []string{"INTEGER"}},
-		{"SELECT 1.5 FROM t", []string{"NUMERIC"}},
+		{"SELECT 1.5 FROM t", []string{"DOUBLE"}},
 		{"SELECT CAST(id AS BIGINT) FROM t", []string{"BIGINT"}},
 		{"SELECT created_at FROM t GROUP BY created_at", []string{"TIMESTAMP"}},
 		{"SELECT id FROM t UNION SELECT id FROM t", []string{"INTEGER"}},
@@ -282,7 +295,7 @@ func TestSelectColumnTypesWithoutFrom(t *testing.T) {
 	e := newExec(schema, table)
 
 	res := execMust(t, e, "SELECT 1, 1.5, 'x', 1 = 1, CAST(1 AS SMALLINT)")
-	want := []string{"INTEGER", "NUMERIC", "TEXT", "BOOLEAN", "SMALLINT"}
+	want := []string{"INTEGER", "DOUBLE", "TEXT", "BOOLEAN", "BIGINT"}
 	if len(res.ColumnTypes) != len(want) {
 		t.Fatalf("column types = %v, want %v", res.ColumnTypes, want)
 	}

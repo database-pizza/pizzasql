@@ -482,25 +482,19 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				return e.executeAggregateSelect(stmt, []storage.Row{}, schema)
 			}
 		}
-		// Non-aggregate query with WHERE false: return empty result
-		result := NewResult("SELECT")
-		for i, col := range stmt.Columns {
-			if col.Alias != "" {
-				result.AddColumn(col.Alias)
-			} else if ref, ok := col.Expr.(*parser.ColumnRef); ok {
-				result.AddColumn(ref.Column)
-			} else if col.Star {
-				for _, c := range schema.Columns {
-					result.AddColumn(c.Name)
-				}
-			} else {
-				result.AddColumn(fmt.Sprintf("column%d", i+1))
-			}
+		// Non-aggregate query with WHERE false: return empty result using the
+		// same wildcard expansion and type metadata the scanned path reports.
+		refs := collectAllTableRefs(stmt.From)
+		tableStars, starErr := e.resolveTableStars(stmt.From, stmt.Columns)
+		if starErr != nil {
+			return nil, starErr
 		}
-		// An empty result still carries the projection metadata the scanned
-		// path would report.
+		result := NewResult("SELECT")
+		for _, name := range e.selectColumnNames(stmt, schema, refs, isMultiTable, tableStars) {
+			result.AddColumn(name)
+		}
 		if isMultiTable || stmt.From[0].Join != nil {
-			result.ColumnTypes = e.joinedSelectColumnTypes(stmt, collectAllTableRefs(stmt.From))
+			result.ColumnTypes = e.joinedSelectColumnTypes(stmt, refs)
 		} else {
 			result.ColumnTypes = selectColumnTypes(stmt, schema)
 		}
@@ -1231,58 +1225,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	hasJoin := len(stmt.From) > 0 && stmt.From[0].Join != nil
 	allTableRefs := collectAllTableRefs(stmt.From)
 
-	// Resolve qualified wildcard (table.*) projections once, keyed by qualifier.
-	type starProjection struct {
-		cols   []storage.Column
-		prefix string
-	}
-	tableStars := make(map[string]starProjection)
-	for _, col := range stmt.Columns {
-		if col.TableStar == "" {
-			continue
-		}
-		key := strings.ToUpper(col.TableStar)
-		if _, ok := tableStars[key]; ok {
-			continue
-		}
-		cols, prefix, err := e.resolveTableStar(stmt.From, col.TableStar)
-		if err != nil {
-			return nil, err
-		}
-		tableStars[key] = starProjection{cols: cols, prefix: prefix}
+	// Resolve qualified wildcard (table.*) projections once, keyed by qualifier,
+	// so names, types, and row values expand exactly the same columns.
+	tableStars, err := e.resolveTableStars(stmt.From, stmt.Columns)
+	if err != nil {
+		return nil, err
 	}
 
 	// Determine columns
-	for i, col := range stmt.Columns {
-		if col.Alias != "" {
-			result.AddColumn(col.Alias)
-		} else if ref, ok := col.Expr.(*parser.ColumnRef); ok {
-			result.AddColumn(ref.Column)
-		} else if col.Star {
-			if isMultiTable || hasJoin {
-				// Add columns from ALL joined tables in order
-				for _, tref := range allTableRefs {
-					sch, _ := e.schema.GetSchema(tref.Name)
-					if sch != nil {
-						for _, c := range sch.Columns {
-							result.AddColumn(c.Name)
-						}
-					}
-				}
-			} else {
-				// Handle SELECT * - add all columns from schema
-				for _, c := range schema.Columns {
-					result.AddColumn(c.Name)
-				}
-			}
-		} else if col.TableStar != "" {
-			proj := tableStars[strings.ToUpper(col.TableStar)]
-			for _, c := range proj.cols {
-				result.AddColumn(c.Name)
-			}
-		} else {
-			result.AddColumn(fmt.Sprintf("column%d", i+1))
-		}
+	for _, name := range e.selectColumnNames(stmt, schema, allTableRefs, isMultiTable, tableStars) {
+		result.AddColumn(name)
 	}
 
 	// Populate column types from schema metadata so protocol consumers can
@@ -2503,6 +2455,75 @@ func collectAllTableRefs(from []parser.TableRef) []parser.TableRef {
 		}
 	}
 	return refs
+}
+
+// starProjection is a resolved qualified wildcard: the table's columns and the
+// row-key prefix used to read their values.
+type starProjection struct {
+	cols   []storage.Column
+	prefix string
+}
+
+// resolveTableStars resolves every qualified wildcard in a projection.
+func (e *Executor) resolveTableStars(from []parser.TableRef, columns []parser.SelectColumn) (map[string]starProjection, error) {
+	stars := make(map[string]starProjection)
+	for _, col := range columns {
+		if col.TableStar == "" {
+			continue
+		}
+		key := strings.ToUpper(col.TableStar)
+		if _, ok := stars[key]; ok {
+			continue
+		}
+		cols, prefix, err := e.resolveTableStar(from, col.TableStar)
+		if err != nil {
+			return nil, err
+		}
+		stars[key] = starProjection{cols: cols, prefix: prefix}
+	}
+	return stars, nil
+}
+
+// selectColumnNames expands a projection into result column names using the
+// same wildcard expansion as the row values: every joined table for an
+// unqualified *, the resolved table for table.*, and the schema for a
+// single-table *.
+func (e *Executor) selectColumnNames(stmt *parser.SelectStmt, schema *storage.Schema, refs []parser.TableRef, multiTable bool, stars map[string]starProjection) []string {
+	hasJoin := len(stmt.From) > 0 && stmt.From[0].Join != nil
+	names := make([]string, 0, len(stmt.Columns))
+	for i, col := range stmt.Columns {
+		switch {
+		case col.Alias != "":
+			names = append(names, col.Alias)
+		case col.Star:
+			if multiTable || hasJoin {
+				for _, ref := range refs {
+					if refSchema, err := e.schema.GetSchema(ref.Name); err == nil {
+						for _, c := range refSchema.Columns {
+							names = append(names, c.Name)
+						}
+					}
+				}
+				continue
+			}
+			for _, c := range schema.Columns {
+				names = append(names, c.Name)
+			}
+		case col.TableStar != "":
+			for _, c := range stars[strings.ToUpper(col.TableStar)].cols {
+				names = append(names, c.Name)
+			}
+		case col.Expr != nil:
+			if ref, ok := col.Expr.(*parser.ColumnRef); ok {
+				names = append(names, ref.Column)
+				continue
+			}
+			names = append(names, fmt.Sprintf("column%d", i+1))
+		default:
+			names = append(names, fmt.Sprintf("column%d", i+1))
+		}
+	}
+	return names
 }
 
 // resolveTableStar resolves a qualified wildcard (table.*) qualifier to the

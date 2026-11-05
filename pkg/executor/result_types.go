@@ -171,12 +171,13 @@ func inferExprType(expr parser.Expr, resolve columnTypeResolver) string {
 
 // literalType reports the type of a literal value. Integer literals are INTEGER
 // when they fit int32 and BIGINT otherwise, matching how the value is carried.
-// Non-integral numeric literals are NUMERIC; their text form is decimal text.
+// Non-integral numeric literals are carried as float64, so they report DOUBLE
+// rather than NUMERIC: the engine has no exact decimal carrier.
 func literalType(lit *parser.LiteralExpr) string {
 	switch lit.Type {
 	case lexer.TokenNumber:
 		if strings.ContainsAny(lit.Value, ".eE") {
-			return "NUMERIC"
+			return "DOUBLE"
 		}
 		if n, err := strconv.ParseInt(lit.Value, 10, 64); err == nil && n >= -2147483648 && n <= 2147483647 {
 			return "INTEGER"
@@ -196,19 +197,16 @@ func literalType(lit *parser.LiteralExpr) string {
 // castResultType reports the result type of CAST(x AS name). Only targets the
 // executor actually converts are reported; every other target leaves the value
 // untouched, so the value keeps its original encoding and stays TEXT metadata.
+//
+// Casts report the carrier type of the converted value, not the target width:
+// evalCastExpr always produces int64 for integer targets and float64 for
+// real targets, and it does not range-check them. A narrower advertised type
+// (int2/int4/float4) could otherwise fail to decode a value the engine accepted.
 func castResultType(name string) (string, bool) {
 	switch strings.ToUpper(strings.TrimSpace(name)) {
-	case "INTEGER", "INT":
-		return "INTEGER", true
-	case "SMALLINT", "TINYINT":
-		return "SMALLINT", true
-	case "MEDIUMINT":
-		return "INTEGER", true
-	case "BIGINT":
+	case "INTEGER", "INT", "SMALLINT", "TINYINT", "MEDIUMINT", "BIGINT":
 		return "BIGINT", true
-	case "REAL", "FLOAT":
-		return "REAL", true
-	case "DOUBLE":
+	case "REAL", "FLOAT", "DOUBLE":
 		return "DOUBLE", true
 	case "TEXT", "VARCHAR", "CHAR", "CHARACTER", "CLOB", "NCHAR", "NVARCHAR":
 		return "TEXT", true
@@ -221,43 +219,42 @@ func castResultType(name string) (string, bool) {
 
 // functionResultType reports the result type of a function call. Aggregate
 // result types mirror the values the executor computes: COUNT is BIGINT, SUM
-// over integers is BIGINT, SUM over reals is DOUBLE, and AVG over non-real input
-// is NUMERIC because it produces a non-integral decimal.
+// over integers is BIGINT, SUM over float carriers is DOUBLE, and AVG is always
+// DOUBLE because evalAggregateExpr divides in float64.
 func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) string {
-	argType := "TEXT"
-	if len(fn.Args) > 0 {
-		argType = inferExprType(fn.Args[0], resolve)
-	}
 	switch strings.ToUpper(fn.Name) {
 	case "COUNT":
 		return "BIGINT"
 	case "SUM":
-		return sumResultType(argType)
+		return sumResultType(firstArgType(fn, resolve))
 	case "TOTAL":
 		return "DOUBLE"
 	case "AVG":
-		if isRealTypeName(argType) {
-			return "DOUBLE"
-		}
-		return "NUMERIC"
+		return "DOUBLE"
 	case "MIN", "MAX":
 		// MIN/MAX return one of the input values unchanged.
-		return argType
+		return firstArgType(fn, resolve)
 	default:
 		return "TEXT"
 	}
+}
+
+// firstArgType reports the inferred type of a function's first argument.
+func firstArgType(fn *parser.FunctionCall, resolve columnTypeResolver) string {
+	if len(fn.Args) == 0 {
+		return "TEXT"
+	}
+	return inferExprType(fn.Args[0], resolve)
 }
 
 // sumResultType reports the SUM result type for an input type. The executor
 // accumulates integers in int64 and everything else in float64.
 func sumResultType(argType string) string {
 	switch {
-	case isRealTypeName(argType):
+	case isFloatCarrierTypeName(argType):
 		return "DOUBLE"
 	case isIntegerTypeName(argType):
 		return "BIGINT"
-	case isNumericTypeName(argType):
-		return "NUMERIC"
 	default:
 		return "TEXT"
 	}
@@ -278,14 +275,12 @@ func binaryResultType(e *parser.BinaryExpr, resolve columnTypeResolver) string {
 		left := inferExprType(e.Left, resolve)
 		right := inferExprType(e.Right, resolve)
 		switch {
-		case isRealTypeName(left) || isRealTypeName(right):
+		case isFloatCarrierTypeName(left) || isFloatCarrierTypeName(right):
 			return "DOUBLE"
 		case isIntegerTypeName(left) && isIntegerTypeName(right):
 			// Integer arithmetic is accumulated in int64, so report the wider
 			// integer type even when both operands are INTEGER.
 			return "BIGINT"
-		case isNumericTypeName(left) && isNumericTypeName(right):
-			return "NUMERIC"
 		default:
 			return "TEXT"
 		}
@@ -303,10 +298,14 @@ func unaryResultType(e *parser.UnaryExpr, resolve columnTypeResolver) string {
 		return "BIGINT"
 	case lexer.TokenMinus, lexer.TokenPlus:
 		operand := inferExprType(e.Operand, resolve)
-		if isNumericTypeName(operand) {
+		switch {
+		case isFloatCarrierTypeName(operand):
+			return "DOUBLE"
+		case isIntegerTypeName(operand):
 			return operand
+		default:
+			return "TEXT"
 		}
-		return "TEXT"
 	default:
 		return "TEXT"
 	}
@@ -348,23 +347,15 @@ func isIntegerTypeName(name string) bool {
 	}
 }
 
-// isRealTypeName reports whether a type name is a floating-point type.
-func isRealTypeName(name string) bool {
+// isFloatCarrierTypeName reports whether a type name is carried as float64.
+// NUMERIC and DECIMAL have no exact decimal carrier in the engine: their values
+// round-trip through JSON as float64, so they behave like floating-point types.
+func isFloatCarrierTypeName(name string) bool {
 	switch strings.ToUpper(strings.TrimSpace(name)) {
-	case "REAL", "FLOAT", "DOUBLE":
+	case "REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL":
 		return true
 	default:
 		return false
-	}
-}
-
-// isNumericTypeName reports whether a type name is any numeric type.
-func isNumericTypeName(name string) bool {
-	switch strings.ToUpper(strings.TrimSpace(name)) {
-	case "NUMERIC", "DECIMAL":
-		return true
-	default:
-		return isIntegerTypeName(name) || isRealTypeName(name)
 	}
 }
 
