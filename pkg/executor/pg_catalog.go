@@ -280,11 +280,14 @@ func (e *Executor) catalogRelationFor(ref parser.TableRef) (catalogRelationEntry
 		entry, ok := pgCatalogRelationIndex[informationSchemaName+"."+name]
 		return entry, ok
 	case "":
-		if e.session.TableExists(ref.Name) {
+		// Resolve the catalog name first: an ordinary table name then needs no
+		// session lookup, and a locked scan only asks the session whether a
+		// catalog-named relation is shadowed by a durable table.
+		entry, ok := pgCatalogRelationIndex[pgCatalogSchemaName+"."+name]
+		if !ok || e.catalogTableExists(ref.Name) {
 			return catalogRelationEntry{}, false
 		}
-		entry, ok := pgCatalogRelationIndex[pgCatalogSchemaName+"."+name]
-		return entry, ok
+		return entry, true
 	default:
 		// The emulated schemas are distinct: public.<name> names a durable
 		// relation, never pg_catalog.<name>, so a qualified miss falls through to
@@ -572,6 +575,14 @@ func (e *Executor) catalogSnapshotForQuery() (*catalogSnapshot, error) {
 	if e.pgCatalog != nil {
 		return e.pgCatalog, nil
 	}
+	if e.lockedScanDepth > 0 {
+		// Building a snapshot reads the session catalog, which takes the session
+		// lock; that lock is already held by the scan this predicate runs inside,
+		// so continuing would deadlock the connection and leak the table lock.
+		// Statements that can reach this point prime the snapshot before scanning
+		// (see primeCatalogSnapshot), so this is a guard, not a policy.
+		return nil, pgerror.Unsupported("catalog relations cannot be resolved inside a locked table scan")
+	}
 	snapshot, err := buildCatalogSnapshot(e)
 	if err != nil {
 		return nil, err
@@ -579,6 +590,236 @@ func (e *Executor) catalogSnapshotForQuery() (*catalogSnapshot, error) {
 	e.pgCatalog = snapshot
 	return snapshot, nil
 }
+
+// catalogSnapshotFunctionNames lists the catalog functions whose value is
+// resolved through the statement's virtual catalog snapshot.
+var catalogSnapshotFunctionNames = map[string]bool{
+	"FORMAT_TYPE":          true,
+	"PG_TABLE_IS_VISIBLE":  true,
+	"PG_GET_INDEXDEF":      true,
+	"PG_GET_CONSTRAINTDEF": true,
+	"HAS_TABLE_PRIVILEGE":  true,
+	"TO_REGCLASS":          true,
+	"TO_REGTYPE":           true,
+}
+
+// catalogSnapshotExprNeeded reports whether evaluating expr reads the virtual
+// catalog at value time: a regclass/regtype cast, a catalog function that
+// resolves names through the snapshot, or a subquery containing either.
+// AST fields are often typed nil pointers inside an interface, so every pointer
+// case checks for nil before reading it.
+func catalogSnapshotExprNeeded(expr parser.Expr) bool {
+	switch n := expr.(type) {
+	case nil, *parser.ColumnRef, *parser.LiteralExpr:
+		return false
+	case *parser.CastExpr:
+		if n == nil {
+			return false
+		}
+		switch strings.ToUpper(strings.TrimSpace(n.Type.SQLTypeName())) {
+		case "REGCLASS", "REGTYPE":
+			return true
+		}
+		return catalogSnapshotExprNeeded(n.Expr)
+	case *parser.FunctionCall:
+		if n == nil {
+			return false
+		}
+		if catalogSnapshotFunctionNames[strings.ToUpper(n.Name)] {
+			return true
+		}
+		for _, arg := range n.Args {
+			if catalogSnapshotExprNeeded(arg) {
+				return true
+			}
+		}
+		return false
+	case *parser.BinaryExpr:
+		return n != nil && (catalogSnapshotExprNeeded(n.Left) || catalogSnapshotExprNeeded(n.Right))
+	case *parser.UnaryExpr:
+		return n != nil && catalogSnapshotExprNeeded(n.Operand)
+	case *parser.BetweenExpr:
+		return n != nil && (catalogSnapshotExprNeeded(n.Left) || catalogSnapshotExprNeeded(n.Low) || catalogSnapshotExprNeeded(n.High))
+	case *parser.LikeExpr:
+		return n != nil && (catalogSnapshotExprNeeded(n.Left) || catalogSnapshotExprNeeded(n.Pattern) || catalogSnapshotExprNeeded(n.Escape))
+	case *parser.IsNullExpr:
+		return n != nil && catalogSnapshotExprNeeded(n.Left)
+	case *parser.IsDistinctExpr:
+		return n != nil && (catalogSnapshotExprNeeded(n.Left) || catalogSnapshotExprNeeded(n.Right))
+	case *parser.CaseExpr:
+		if n == nil {
+			return false
+		}
+		if catalogSnapshotExprNeeded(n.Operand) || catalogSnapshotExprNeeded(n.Else) {
+			return true
+		}
+		for _, when := range n.Whens {
+			if catalogSnapshotExprNeeded(when.Condition) || catalogSnapshotExprNeeded(when.Result) {
+				return true
+			}
+		}
+		return false
+	case *parser.ArrayExpr:
+		if n == nil {
+			return false
+		}
+		for _, element := range n.Elements {
+			if catalogSnapshotExprNeeded(element) {
+				return true
+			}
+		}
+		return false
+	case *parser.SubscriptExpr:
+		return n != nil && (catalogSnapshotExprNeeded(n.Expr) || catalogSnapshotExprNeeded(n.Index))
+	case *parser.AnyAllExpr:
+		return n != nil && (catalogSnapshotExprNeeded(n.Left) || catalogSnapshotExprNeeded(n.Array))
+	case *parser.InExpr:
+		if n == nil {
+			return false
+		}
+		if catalogSnapshotExprNeeded(n.Left) || catalogSnapshotSelectNeeded(n.Subquery) {
+			return true
+		}
+		for _, value := range n.Values {
+			if catalogSnapshotExprNeeded(value) {
+				return true
+			}
+		}
+		return false
+	case *parser.SubqueryExpr:
+		return n != nil && catalogSnapshotSelectNeeded(n.Query)
+	case *parser.ExistsExpr:
+		return n != nil && catalogSnapshotSelectNeeded(n.Subquery)
+	case *parser.ParenExpr:
+		return n != nil && catalogSnapshotExprNeeded(n.Expr)
+	default:
+		return false
+	}
+}
+
+// catalogSnapshotSelectNeeded reports whether a SELECT evaluates a catalog-backed
+// expression in any of its clauses or nested relations.
+func catalogSnapshotSelectNeeded(sel *parser.SelectStmt) bool {
+	if sel == nil {
+		return false
+	}
+	for _, cte := range sel.With {
+		if catalogSnapshotSelectNeeded(cte.Query) {
+			return true
+		}
+	}
+	if sel.Compound != nil && (catalogSnapshotSelectNeeded(sel.Compound.Left) || catalogSnapshotSelectNeeded(sel.Compound.Right)) {
+		return true
+	}
+	for _, column := range sel.Columns {
+		if catalogSnapshotExprNeeded(column.Expr) {
+			return true
+		}
+	}
+	for i := range sel.From {
+		if catalogSnapshotTableRefNeeded(&sel.From[i]) {
+			return true
+		}
+	}
+	for _, expr := range sel.GroupBy {
+		if catalogSnapshotExprNeeded(expr) {
+			return true
+		}
+	}
+	for _, item := range sel.OrderBy {
+		if catalogSnapshotExprNeeded(item.Expr) {
+			return true
+		}
+	}
+	return catalogSnapshotExprNeeded(sel.Where) ||
+		catalogSnapshotExprNeeded(sel.Having) ||
+		catalogSnapshotExprNeeded(sel.Limit) ||
+		catalogSnapshotExprNeeded(sel.Offset)
+}
+
+// catalogSnapshotTableRefNeeded reports whether a FROM entry evaluates a
+// catalog-backed expression in a derived table, table function, or join.
+func catalogSnapshotTableRefNeeded(ref *parser.TableRef) bool {
+	if ref == nil {
+		return false
+	}
+	if catalogSnapshotSelectNeeded(ref.Subquery) || catalogSnapshotExprNeeded(ref.Function) {
+		return true
+	}
+	if ref.Join != nil {
+		return catalogSnapshotTableRefNeeded(ref.Join.Table) || catalogSnapshotExprNeeded(ref.Join.Condition)
+	}
+	return false
+}
+
+// catalogSnapshotStatementNeeded reports whether the statement evaluates a
+// catalog-backed expression anywhere it can run during the statement.
+func catalogSnapshotStatementNeeded(stmt parser.Statement) bool {
+	switch s := stmt.(type) {
+	case *parser.SelectStmt:
+		return catalogSnapshotSelectNeeded(s)
+	case *parser.UpdateStmt:
+		for i := range s.From {
+			if catalogSnapshotTableRefNeeded(&s.From[i]) {
+				return true
+			}
+		}
+		for _, assignment := range s.Set {
+			if catalogSnapshotExprNeeded(assignment.Value) {
+				return true
+			}
+		}
+		return catalogSnapshotExprNeeded(s.Where) || catalogSnapshotReturningNeeded(s.Returning)
+	case *parser.DeleteStmt:
+		return catalogSnapshotExprNeeded(s.Where) || catalogSnapshotReturningNeeded(s.Returning)
+	case *parser.InsertStmt:
+		for _, row := range s.Values {
+			for _, value := range row {
+				if catalogSnapshotExprNeeded(value) {
+					return true
+				}
+			}
+		}
+		for _, assignment := range s.ConflictUpdate {
+			if catalogSnapshotExprNeeded(assignment.Value) {
+				return true
+			}
+		}
+		return catalogSnapshotSelectNeeded(s.Select) || catalogSnapshotReturningNeeded(s.Returning)
+	default:
+		return false
+	}
+}
+
+func catalogSnapshotReturningNeeded(columns []parser.SelectColumn) bool {
+	for _, column := range columns {
+		if catalogSnapshotExprNeeded(column.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// primeCatalogSnapshot builds the statement's virtual catalog snapshot before a
+// scan can take the session lock. A regclass/regtype cast or catalog function
+// evaluated inside a locked scan would otherwise call back into the session while
+// the scan holds its lock, which deadlocks the connection and leaks the table
+// lock to every other session. Statements whose value-time expressions cannot
+// reach the catalog skip the build entirely.
+func (e *Executor) primeCatalogSnapshot(stmt parser.Statement) error {
+	if e.pgCatalog != nil || !catalogSnapshotStatementNeeded(stmt) {
+		return nil
+	}
+	_, err := e.catalogSnapshotForQuery()
+	return err
+}
+
+// enterLockedScan marks the start of row-filter or update evaluation that runs
+// inside a session scan, where the session lock is already held.
+func (e *Executor) enterLockedScan() { e.lockedScanDepth++ }
+
+// exitLockedScan marks the end of one such evaluation.
+func (e *Executor) exitLockedScan() { e.lockedScanDepth-- }
 
 // visibleCatalogColumns drops the engine's hidden synthetic rowid column, which
 // is not a user-visible PostgreSQL attribute.
@@ -1815,10 +2056,51 @@ func (s *catalogSnapshot) informationSchemaSchemataRows() []storage.Row {
 // not shadowed by a durable table or a CTE.
 func (e *Executor) catalogSchemaByName(name string) (*storage.Schema, bool) {
 	entry, ok := pgCatalogRelationIndex[pgCatalogSchemaName+"."+strings.ToLower(name)]
-	if !ok || e.session.TableExists(name) || e.cteTableExists(name) {
+	if !ok || e.catalogTableExists(name) || e.cteTableExists(name) {
 		return nil, false
 	}
 	return entry.schema, true
+}
+
+// fromResolvesToCatalogRelations reports whether every FROM entry is a virtual
+// catalog relation or a materialized CTE, so the statement can be evaluated
+// without reading the durable schema. A statement with no FROM needs no schema
+// either.
+func (e *Executor) fromResolvesToCatalogRelations(from []parser.TableRef) bool {
+	for i := range from {
+		ref := &from[i]
+		if e.cteTableExists(ref.Name) {
+			continue
+		}
+		if _, ok := e.catalogRelationFor(*ref); !ok {
+			return false
+		}
+		for join := ref.Join; join != nil && join.Table != nil; join = join.Table.Join {
+			if e.cteTableExists(join.Table.Name) {
+				continue
+			}
+			if _, ok := e.catalogRelationFor(*join.Table); !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// catalogTableExists reports whether a durable table shadows an unqualified
+// catalog relation name. A scan that already holds the session lock cannot ask
+// the session, so the statement's pre-built snapshot answers instead; without
+// one the virtual catalog relation is assumed, which makes the catalog path
+// report the locked-scan guard error instead of deadlocking.
+func (e *Executor) catalogTableExists(name string) bool {
+	if e.lockedScanDepth > 0 {
+		if e.pgCatalog == nil {
+			return false
+		}
+		_, ok := e.pgCatalog.tableByName[strings.ToLower(name)]
+		return ok
+	}
+	return e.session.TableExists(name)
 }
 
 func (s *catalogSnapshot) informationSchemaViewsRows() []storage.Row {

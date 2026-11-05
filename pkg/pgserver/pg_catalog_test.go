@@ -1,9 +1,14 @@
 package pgserver
 
 import (
+	"net"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/danfragoso/pizzasql-next/pkg/storage"
+	"github.com/danfragoso/pizzasql-next/pkg/testkv"
 )
 
 func simpleQuery(sql string) *Message {
@@ -152,5 +157,62 @@ func TestPgCatalogRegprocWireType(t *testing.T) {
 	rows := catalogRows(t, msgs)
 	if len(rows) != 1 || rows[0][0] != "0" || rows[0][1] != "0" {
 		t.Fatalf("pg_type regproc values = %v, want 0/0", rows)
+	}
+}
+
+// A catalog-backed predicate in a write must not deadlock the session: the
+// engine resolves the snapshot before the locked scan. A deadlock here leaks the
+// table gate, so a second connection is probed for reads and writes after the
+// error, bounded by a read deadline.
+func TestPgCatalogWritePredicateKeepsSecondSessionUsable(t *testing.T) {
+	kv := testkv.New(t)
+	pool := kv.Pool(8)
+	t.Cleanup(func() { pool.Close() })
+	schema := storage.NewSchemaManager(pool, "pg_catalog_lock")
+	table := storage.NewTableManager(pool, schema, "pg_catalog_lock")
+
+	writer, writerClient := newDataConnectionFor(t, schema, table)
+	reader, readerClient := newDataConnectionFor(t, schema, table)
+
+	run := func(c *Connection, client net.Conn, sql string) []*Message {
+		t.Helper()
+		// A blocked statement never answers; bound the wait so a regression
+		// fails instead of hanging the suite.
+		if err := client.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			t.Fatalf("set deadline: %v", err)
+		}
+		defer func() { _ = client.SetReadDeadline(time.Time{}) }()
+		return runQuery(t, c, client, simpleQuery(sql))
+	}
+
+	for _, sql := range []string{
+		"CREATE TABLE locked_write (id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
+		"INSERT INTO locked_write VALUES (1, 'a')",
+	} {
+		if msgs := run(writer, writerClient, sql); errorCode(msgs[0]) != "" {
+			t.Fatalf("%s: %s", sql, errorMessage(msgs[0]))
+		}
+	}
+
+	msgs := run(writer, writerClient, `UPDATE locked_write SET v = 'z' WHERE v = 'a' AND 'missing_relation'::regclass IS NOT NULL`)
+	msg := findError(msgs)
+	if msg == nil {
+		t.Fatalf("expected an error for the unknown regclass, got %v", msgs)
+	}
+	if code := errorCode(msg); code != ErrCodeUndefinedTable {
+		t.Fatalf("SQLSTATE = %q, want %q (%s)", code, ErrCodeUndefinedTable, errorMessage(msg))
+	}
+
+	// The failed statement left no partial write and released its locks.
+	msgs = run(reader, readerClient, `SELECT count(*) FROM locked_write WHERE v = 'z'`)
+	if msg := findError(msgs); msg != nil {
+		t.Fatalf("second session SELECT failed: %s", errorMessage(msg))
+	}
+	if rows := catalogRows(t, msgs); len(rows) != 1 || rows[0][0] != "0" {
+		t.Fatalf("updated rows = %v, want 0", rows)
+	}
+	msgs = run(reader, readerClient, `INSERT INTO locked_write VALUES (2, 'b')`)
+	if msg := findError(msgs); msg != nil {
+		t.Fatalf("second session INSERT failed: %s", errorMessage(msg))
 	}
 }

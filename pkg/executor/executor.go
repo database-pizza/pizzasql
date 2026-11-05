@@ -42,8 +42,11 @@ type Executor struct {
 
 	// pgCatalog caches the virtual PostgreSQL catalog snapshot for the current
 	// statement. It is discarded by Execute so each statement observes DDL
-	// committed (or staged) since the previous one.
-	pgCatalog *catalogSnapshot
+	// committed (or staged) since the previous one. A statement that evaluates
+	// catalog-backed expressions primes it before scanning; lockedScanDepth then
+	// reports that the session lock is already held.
+	pgCatalog       *catalogSnapshot
+	lockedScanDepth int
 
 	// searchPath is the session search path used by current_schema() and SHOW
 	// search_path. Only public, pg_catalog, and information_schema are
@@ -297,6 +300,14 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		e.pgCatalog = nil
 	}()
 
+	// Catalog-backed expressions resolve names through a snapshot that reads the
+	// session catalog. That read must happen before a scan takes the session lock,
+	// so a statement using regclass/regtype or a catalog function primes the
+	// snapshot here.
+	if err := e.primeCatalogSnapshot(stmt); err != nil {
+		return nil, err
+	}
+
 	// PRAGMA doesn't need analysis. SQLite catalog-introspection pragmas
 	// (index_list, index_info, table_xinfo) are answered by the catalog agent
 	// first; everything else falls through to the built-in handler.
@@ -501,6 +512,23 @@ func isCountStarSingleTable(stmt *parser.SelectStmt) bool {
 
 // executeSelect executes a SELECT statement (or compound SELECT).
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	// A subquery evaluated inside a scan that already holds the session lock (a
+	// correlated predicate) cannot read the durable schema: doing so re-enters
+	// the session lock and deadlocks, leaking the table gate to every other
+	// session. Only a SELECT that resolves entirely from virtual catalog
+	// relations, materialized CTEs, or no FROM at all may run in that state.
+	if e.lockedScanDepth > 0 && !e.fromResolvesToCatalogRelations(stmt.From) {
+		return nil, pgerror.Unsupported("a correlated subquery cannot be evaluated inside a locked table scan; its predicate must not read the row being written")
+	}
+	// This SELECT may be a view or CTE body that the statement-level prime never
+	// saw, and its WHERE is pushed into the scan below, so resolve the catalog
+	// snapshot before the scan starts.
+	if e.pgCatalog == nil && catalogSnapshotSelectNeeded(stmt) {
+		if _, err := e.catalogSnapshotForQuery(); err != nil {
+			return nil, err
+		}
+	}
+
 	// The join scope is pushed below the snapshot so a real table's unqualified
 	// column keeps precedence; it answers for right-side derived tables and
 	// CTEs that the snapshot cannot read without materializing them again.
@@ -761,6 +789,8 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		if canFilterInScan {
 			appliedInScan = true
 			filter = func(row storage.Row) bool {
+				e.enterLockedScan()
+				defer e.exitLockedScan()
 				val, ferr := e.evalExpr(effectiveWhere, row)
 				if ferr != nil {
 					filterErr = ferr
@@ -3687,6 +3717,8 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	var filter func(storage.Row) bool
 	if stmt.Where != nil {
 		filter = func(row storage.Row) bool {
+			e.enterLockedScan()
+			defer e.exitLockedScan()
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
 				filterErr = err
@@ -3698,7 +3730,9 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 
 	// Use UpdateFunc to evaluate expressions per-row (supports self-referencing like balance = balance + 100).
 	// Generated columns are recomputed from the post-assignment row and written
-	// back so STORED values stay consistent.
+	// back so STORED values stay consistent. The storage session releases its
+	// lock around this callback (runUpdateFn), so SET expressions may read the
+	// session (a scalar subquery) while the surrounding scan holds nothing.
 	updateFn := func(row storage.Row) (storage.Row, error) {
 		updates := make(storage.Row)
 		merged := make(storage.Row, len(row))
@@ -4086,6 +4120,8 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	var filter func(storage.Row) bool
 	if stmt.Where != nil {
 		filter = func(row storage.Row) bool {
+			e.enterLockedScan()
+			defer e.exitLockedScan()
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
 				filterErr = err

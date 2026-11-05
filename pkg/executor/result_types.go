@@ -33,6 +33,12 @@ func (e *Executor) snapshotTypeResolver(refs []parser.TableRef) columnTypeResolv
 		if e.cteTableExists(ref.Name) {
 			continue
 		}
+		// A virtual catalog relation has no durable schema: its columns come from
+		// catalog metadata, and asking the session for them from inside a locked
+		// scan would deadlock on the session lock the scan already holds.
+		if _, ok := e.catalogRelationFor(ref); ok {
+			continue
+		}
 		schema, err := e.session.GetSchema(ref.Name)
 		if err != nil {
 			continue
