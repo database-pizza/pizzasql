@@ -545,7 +545,11 @@ func (s *Session) selectLocked(table string, filter func(Row) bool) ([]Row, erro
 
 	var rows []Row
 	err = s.table.scanRowsWithLSN(table, func(row Row, lsn uint64) (bool, error) {
-		key := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
+		pk, err := schema.PrimaryKeyForRow(row)
+		if err != nil {
+			return true, err
+		}
+		key := s.table.dataKey(table, pk)
 		if _, ok := overlay[key]; ok {
 			return false, nil
 		}
@@ -733,12 +737,10 @@ func (s *Session) insertLocked(table string, row Row) (int64, error) {
 		return 0, err
 	}
 	rowid, _ := rowIDFromRow(nr)
-	schema, err := s.schema.GetSchema(table)
-	if err != nil {
-		return 0, err
-	}
-	pk := fmt.Sprintf("%v", nr[schema.PrimaryKey])
 	tl := strings.ToLower(table)
+	// prepareInsert returned the durable key; duplicate reporting shows the same
+	// encoded primary-key component the key carries.
+	pk := strings.TrimPrefix(key, s.table.dataPrefix(table))
 
 	if e, ok := s.overlay[tl][key]; ok {
 		if !e.absent {
@@ -877,7 +879,11 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 	count := 0
 	for _, row := range rows {
 		oldRow := cloneRow(row)
-		oldKey := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
+		oldPK, err := schema.PrimaryKeyForRow(row)
+		if err != nil {
+			return count, err
+		}
+		oldKey := s.table.dataKey(table, oldPK)
 		updates, err := s.runUpdateFn(updateFn, row)
 		if err != nil {
 			return count, err
@@ -893,12 +899,16 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 		if err := s.schema.validateRowConstraints(schema, row); err != nil {
 			return count, err
 		}
-		newKey := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
+		newPK, err := schema.PrimaryKeyForRow(row)
+		if err != nil {
+			return count, err
+		}
+		newKey := s.table.dataKey(table, newPK)
 		if newKey != oldKey {
 			// The primary key changed: move the staged row instead of leaving a
 			// stale copy under the old key, and refuse to overwrite another row.
-			if _, gerr := s.getByPKLocked(table, fmt.Sprintf("%v", row[schema.PrimaryKey])); gerr == nil {
-				return count, &PrimaryKeyViolationError{Table: table, Key: fmt.Sprint(row[schema.PrimaryKey])}
+			if _, gerr := s.getByPKLocked(table, newPK); gerr == nil {
+				return count, &PrimaryKeyViolationError{Table: table, Key: newPK}
 			} else if gerr != ErrKeyNotFound {
 				return count, gerr
 			}
@@ -929,8 +939,11 @@ func (s *Session) Delete(table string, filter func(Row) bool) (int, error) {
 	}
 	count := 0
 	for _, row := range rows {
-		key := s.table.dataKey(table, fmt.Sprintf("%v", row[schema.PrimaryKey]))
-		s.stageDelete(table, key, row)
+		pk, err := schema.PrimaryKeyForRow(row)
+		if err != nil {
+			return count, err
+		}
+		s.stageDelete(table, s.table.dataKey(table, pk), row)
 		count++
 	}
 	return count, nil

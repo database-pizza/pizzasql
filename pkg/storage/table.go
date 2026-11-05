@@ -468,65 +468,26 @@ func (m *TableManager) dataPrefix(table string) string {
 // prepareInsert validates and normalizes an insert row, generating the ROWID
 // when required. It returns the normalized row and the full data key without
 // writing anything, so both the autocommit path (compare-and-swap) and the
-// buffered transaction path (staging) can share it. The input row has its
-// primary key populated as a side effect.
+// buffered transaction path (staging) can share it.
 func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error) {
 	schema, err := m.schema.GetSchema(table)
 	if err != nil {
 		return nil, "", err
 	}
-
-	// Get primary key value
-	pkValue, ok := row[schema.PrimaryKey]
-	if !ok {
-		for k, v := range row {
-			if strings.EqualFold(k, schema.PrimaryKey) {
-				pkValue = v
-				ok = true
-				break
-			}
-		}
+	normalizedRow, key, _, err := m.normalizeInsertRow(table, schema, row)
+	if err != nil {
+		return nil, "", err
 	}
+	return normalizedRow, key, nil
+}
 
-	pkCol, _ := schema.GetColumn(schema.PrimaryKey)
-	isIntegerPK := pkCol != nil && isIntegerType(pkCol.Type)
-
-	var rowid int64
-	if !ok || pkValue == nil {
-		if isIntegerPK || !ok {
-			rowid, err = m.schema.GetNextRowID(table)
-			if err != nil {
-				return nil, "", err
-			}
-			pkValue = rowid
-			row[schema.PrimaryKey] = rowid
-			ok = true
-		} else {
-			return nil, "", fmt.Errorf("missing primary key: %s", schema.PrimaryKey)
-		}
-	} else if isIntegerPK {
-		switch v := pkValue.(type) {
-		case int64:
-			rowid = v
-		case float64:
-			if math.Trunc(v) != v {
-				return nil, "", fmt.Errorf("invalid integer primary key: %v", v)
-			}
-			rowid = int64(v)
-		case int:
-			rowid = int64(v)
-		default:
-			rowid = 0
-		}
-		if rowid > 0 {
-			if err := m.schema.UpdateMaxRowID(table, rowid); err != nil {
-				return nil, "", err
-			}
-		}
-	}
-
-	pk := fmt.Sprintf("%v", pkValue)
-
+// normalizeInsertRow completes a row image for an insert: it copies the caller's
+// columns case-insensitively, applies catalog defaults, assigns the ROWID (or
+// the INTEGER PRIMARY KEY rowid alias), encodes the primary key, and validates
+// the row constraints. It is shared by the point insert and bulk insert paths so
+// both key rows identically. The returned rowid is the row's ROWID alias, or 0
+// when the caller must not treat the primary key as a rowid.
+func (m *TableManager) normalizeInsertRow(table string, schema *Schema, row Row) (Row, string, int64, error) {
 	normalizedRow := make(Row)
 	for _, col := range schema.Columns {
 		for k, v := range row {
@@ -542,10 +503,48 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 		}
 		value, hasDefault, err := m.schema.columnDefaultValue(col, m.schema.defaultNow())
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 		if hasDefault {
 			normalizedRow[col.Name] = value
+		}
+	}
+
+	// Only a single-column INTEGER PRIMARY KEY is a ROWID alias. A composite key
+	// is never an alias, so its rows always carry an engine-assigned _rowid_.
+	var rowid int64
+	if schema.IsSingleColumnPrimaryKey() && !schema.UsesSyntheticRowID() {
+		pkColumn := schema.PrimaryKey
+		pkCol, _ := schema.GetColumn(pkColumn)
+		if pkCol != nil && isIntegerType(pkCol.Type) {
+			pkValue := normalizedRow[pkColumn]
+			if pkValue == nil {
+				nextRowID, err := m.schema.GetNextRowID(table)
+				if err != nil {
+					return nil, "", 0, err
+				}
+				rowid = nextRowID
+				normalizedRow[pkColumn] = rowid
+			} else {
+				switch v := pkValue.(type) {
+				case int64:
+					rowid = v
+				case float64:
+					if math.Trunc(v) != v {
+						return nil, "", 0, fmt.Errorf("invalid integer primary key: %v", v)
+					}
+					rowid = int64(v)
+				case int:
+					rowid = int64(v)
+				default:
+					rowid = 0
+				}
+				if rowid > 0 {
+					if err := m.schema.UpdateMaxRowID(table, rowid); err != nil {
+						return nil, "", 0, err
+					}
+				}
+			}
 		}
 	}
 
@@ -554,15 +553,28 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 	} else {
 		newRowID, err := m.schema.GetNextRowID(table)
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 		normalizedRow["_rowid_"] = newRowID
 	}
 
-	if err := m.schema.validateRowConstraints(schema, normalizedRow); err != nil {
-		return nil, "", err
+	key, err := schema.PrimaryKeyForRow(normalizedRow)
+	if err != nil {
+		return nil, "", 0, err
 	}
-	return normalizedRow, m.dataKey(table, pk), nil
+	if err := m.schema.validateRowConstraints(schema, normalizedRow); err != nil {
+		return nil, "", 0, err
+	}
+	// Callers read the resolved key back from the row they passed in: RETURNING
+	// needs an auto-assigned INTEGER PRIMARY KEY, and a composite table needs key
+	// components that came from a catalog DEFAULT because the conflict-matching
+	// and fetch paths run before the next storage call.
+	for _, column := range schema.PrimaryKeyList() {
+		if value, ok := normalizedRow[column]; ok {
+			row[column] = value
+		}
+	}
+	return normalizedRow, m.dataKey(table, key), rowid, nil
 }
 
 // Insert inserts a new row. The duplicate check and write are one atomic
@@ -708,102 +720,29 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 	}
 	wasInit := m.countInitialized(table)
 
-	pkCol, _ := schema.GetColumn(schema.PrimaryKey)
-	isIntegerPK := pkCol != nil && isIntegerType(pkCol.Type)
-
-	// Normalize rows and assign _rowid_.
+	// Normalize rows, assigning the ROWID and encoding the primary key exactly as
+	// the point insert path does.
 	normalized := make([]Row, 0, len(rows))
-	var maxRowID int64
+	dataKeys := make([]string, 0, len(rows))
 	for _, row := range rows {
-		nr := make(Row)
-		for _, col := range schema.Columns {
-			for k, v := range row {
-				if strings.EqualFold(k, col.Name) {
-					nr[col.Name] = v
-					break
-				}
-			}
-		}
-		for _, col := range schema.Columns {
-			if _, ok := nr[col.Name]; ok {
-				continue
-			}
-			value, hasDefault, err := m.schema.columnDefaultValue(col, m.schema.defaultNow())
-			if err != nil {
-				return 0, 0, err
-			}
-			if hasDefault {
-				nr[col.Name] = value
-			}
-		}
-		var rowid int64
-		var hasRowid bool
-		if isIntegerPK {
-			switch v := nr[schema.PrimaryKey].(type) {
-			case float64:
-				if math.Trunc(v) != v {
-					return 0, 0, fmt.Errorf("invalid integer primary key: %v", v)
-				}
-				rowid = int64(v)
-				hasRowid = true
-			case int64:
-				rowid = v
-				hasRowid = true
-			case int:
-				rowid = int64(v)
-				hasRowid = true
-			}
-		}
-		if !hasRowid {
-			// Auto-generate for an INTEGER primary key or the synthetic _rowid_,
-			// mirroring prepareInsert so INSERT ... SELECT works on AUTOINCREMENT
-			// tables.
-			if isIntegerPK || schema.PrimaryKey == "_rowid_" {
-				rowid, err = m.schema.GetNextRowID(table)
-				if err != nil {
-					return 0, 0, err
-				}
-				if isIntegerPK {
-					nr[schema.PrimaryKey] = rowid
-				} else {
-					nr["_rowid_"] = rowid
-				}
-			} else {
-				pk, ok := nr[schema.PrimaryKey]
-				if !ok || pk == nil {
-					return 0, 0, fmt.Errorf("missing primary key: %s", schema.PrimaryKey)
-				}
-				rowid, err = m.schema.GetNextRowID(table)
-				if err != nil {
-					return 0, 0, err
-				}
-			}
-		}
-		nr["_rowid_"] = rowid
-		if err := m.schema.validateRowConstraints(schema, nr); err != nil {
+		nr, key, _, err := m.normalizeInsertRow(table, schema, row)
+		if err != nil {
 			return 0, 0, err
 		}
-		if rowid > maxRowID {
-			maxRowID = rowid
-		}
 		normalized = append(normalized, nr)
-	}
-
-	if maxRowID > 0 {
-		m.schema.UpdateMaxRowID(table, maxRowID)
+		dataKeys = append(dataKeys, key)
 	}
 
 	// Serialize all rows into batch operations. A parallel slice keeps the
 	// normalized Row for each op for index maintenance after the write.
 	ops := make([]BatchOp, 0, len(normalized))
 	encoded := make([]Row, 0, len(normalized))
-	for _, nr := range normalized {
-		pk := fmt.Sprintf("%v", nr[schema.PrimaryKey])
+	for i, nr := range normalized {
 		data, err := encodeRow(nr)
 		if err != nil {
 			return 0, 0, err
 		}
-		ops = append(ops, BatchOp{Op: batchPut, Key: []byte(m.dataKey(table, pk)), Value: data})
+		ops = append(ops, BatchOp{Op: batchPut, Key: []byte(dataKeys[i]), Value: data})
 		encoded = append(encoded, nr)
 	}
 	keys := make([][]byte, len(ops))
@@ -1425,8 +1364,12 @@ func (m *TableManager) ensureIndex(index *Index) error {
 			return true, err
 		}
 		valueKey := formatIndexValue(colValue)
+		pk, err := tableSchema.PrimaryKeyForRow(row)
+		if err != nil {
+			return true, err
+		}
 		values[valueKey] = append(values[valueKey], rowid)
-		rowKeys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
+		rowKeys[rowid] = pk
 		return false, nil
 	}); err != nil {
 		return err
@@ -1571,8 +1514,12 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 		if err != nil {
 			return true, err
 		}
+		pk, err := tableSchema.PrimaryKeyForRow(row)
+		if err != nil {
+			return true, err
+		}
 		values[formatIndexValue(colValue)] = append(values[formatIndexValue(colValue)], rowid)
-		rowKeys[rowid] = fmt.Sprintf("%v", row[tableSchema.PrimaryKey])
+		rowKeys[rowid] = pk
 		return false, nil
 	}); err != nil {
 		return err

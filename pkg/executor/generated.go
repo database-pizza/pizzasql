@@ -70,7 +70,9 @@ func generatedColumnSet(schema *storage.Schema) map[string]bool {
 // integer primary key are left to the storage layer, which assigns the hidden
 // _rowid_ during the insert.
 func (e *Executor) ensureGeneratedRowID(tableName string, schema *storage.Schema, row storage.Row) error {
-	if schema.PrimaryKey == "" || schema.PrimaryKey == "_rowid_" {
+	// Only a single-column INTEGER PRIMARY KEY is generated before evaluation; a
+	// composite key is never a rowid alias.
+	if !schema.IsSingleColumnPrimaryKey() || schema.UsesSyntheticRowID() {
 		return nil
 	}
 	if v, ok := lookupRowValue(row, schema.PrimaryKey); ok && v != nil {
@@ -109,7 +111,6 @@ func isIntegerColumnType(typeName string) bool {
 // conflictMatcher describes one uniqueness constraint used to resolve an
 // INSERT conflict. index is nil for the primary key.
 type conflictMatcher struct {
-	name       string
 	index      *storage.Index
 	primaryKey bool
 }
@@ -121,7 +122,7 @@ type conflictMatcher struct {
 func (e *Executor) insertConflictMatchers(tableName string, schema *storage.Schema, stmtReplace bool) ([]conflictMatcher, error) {
 	var matchers []conflictMatcher
 	if stmtReplace {
-		matchers = append(matchers, conflictMatcher{name: schema.PrimaryKey, primaryKey: true})
+		matchers = append(matchers, conflictMatcher{primaryKey: true})
 	}
 	indexes, err := e.schema.ListTableIndexes(tableName)
 	if err != nil {
@@ -134,7 +135,7 @@ func (e *Executor) insertConflictMatchers(tableName string, schema *storage.Sche
 		if !stmtReplace && !strings.EqualFold(idx.OnConflict, "REPLACE") {
 			continue
 		}
-		matchers = append(matchers, conflictMatcher{name: idx.Name, index: idx})
+		matchers = append(matchers, conflictMatcher{index: idx})
 	}
 	return matchers, nil
 }
@@ -144,11 +145,13 @@ func (e *Executor) insertConflictMatchers(tableName string, schema *storage.Sche
 // index-key lookup rather than a full table scan.
 func (e *Executor) matcherConflicts(tableName string, schema *storage.Schema, m conflictMatcher, candidate storage.Row) ([]storage.Row, error) {
 	if m.primaryKey {
-		pkValue, ok := lookupRowValue(candidate, schema.PrimaryKey)
-		if !ok || pkValue == nil {
+		pk, err := schema.PrimaryKeyForRow(candidate)
+		if err != nil {
+			// A missing or NULL key component cannot conflict; the insert fails
+			// its NOT NULL constraint instead.
 			return nil, nil
 		}
-		row, err := e.session.GetByPK(tableName, fmt.Sprintf("%v", pkValue))
+		row, err := e.session.GetByPK(tableName, pk)
 		if err == storage.ErrKeyNotFound {
 			return nil, nil
 		}
@@ -176,14 +179,14 @@ func (e *Executor) matcherConflicts(tableName string, schema *storage.Schema, m 
 // statement-level OR IGNORE and targetless DO NOTHING apply to any conflict,
 // not just the primary key.
 func (e *Executor) hasAnyInsertConflict(tableName string, schema *storage.Schema, candidate storage.Row) (bool, error) {
-	matchers := []conflictMatcher{{name: schema.PrimaryKey, primaryKey: true}}
+	matchers := []conflictMatcher{{primaryKey: true}}
 	indexes, err := e.schema.ListTableIndexes(tableName)
 	if err != nil {
 		return false, err
 	}
 	for _, index := range indexes {
 		if index.Unique {
-			matchers = append(matchers, conflictMatcher{name: index.Name, index: index})
+			matchers = append(matchers, conflictMatcher{index: index})
 		}
 	}
 	for _, matcher := range matchers {
@@ -219,15 +222,19 @@ func (e *Executor) resolveInsertConflicts(tableName string, schema *storage.Sche
 			return err
 		}
 		for _, row := range rows {
-			toDelete[fmt.Sprintf("%v", row[schema.PrimaryKey])] = row
+			pk, err := schema.PrimaryKeyForRow(row)
+			if err != nil {
+				return err
+			}
+			toDelete[pk] = row
 		}
 	}
 	if len(toDelete) == 0 {
 		return nil
 	}
 
-	for _, row := range toDelete {
-		if _, deleted, derr := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", row[schema.PrimaryKey])); derr != nil {
+	for pk := range toDelete {
+		if _, deleted, derr := e.session.DeleteByPK(tableName, pk); derr != nil {
 			return derr
 		} else if !deleted {
 			return fmt.Errorf("ON CONFLICT REPLACE row disappeared during delete")

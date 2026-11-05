@@ -120,3 +120,30 @@ func TestDDLNotesDescribeCheckDependencies(t *testing.T) {
 		t.Fatalf("add_column_backfill notes = %q, want the CHECK backfill failure", doc.DDL.AddColumnBackfill.Notes)
 	}
 }
+
+// Composite primary keys are advertised as supported, with the SQLSTATE callers
+// should expect for a duplicate key.
+func TestCompositePrimaryKeyIsAdvertised(t *testing.T) {
+	doc := Current()
+	composite := doc.Constraints.CompositePK
+	if !composite.Supported {
+		t.Fatalf("composite_primary_key = %+v, want supported", composite)
+	}
+	if composite.Status == "rejected" {
+		t.Fatalf("composite_primary_key status = %q, want a supported status", composite.Status)
+	}
+	if composite.SQLState != "23505" {
+		t.Fatalf("composite_primary_key SQLSTATE = %q, want 23505", composite.SQLState)
+	}
+	if !doc.Constraints.PrimaryKey.Supported {
+		t.Fatalf("primary_key = %+v, want supported", doc.Constraints.PrimaryKey)
+	}
+
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"composite_primary_key":{"supported":true`) {
+		t.Fatalf("document does not advertise composite_primary_key as supported: %s", body)
+	}
+}
