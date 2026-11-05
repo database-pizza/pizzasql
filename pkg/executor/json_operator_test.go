@@ -98,3 +98,64 @@ func TestJSONArrowInWhereOrderByAndUpdate(t *testing.T) {
 		}
 	}
 }
+
+// The -> operator returns JSON text (with the engine's internal JSON subtype),
+// not a plain string. Numeric, boolean, and comparison coercions must still
+// read the text form, exactly as they do for SQL TEXT; otherwise arithmetic
+// silently treats every extracted number as 0.
+func TestJSONArrowOperatorValueCoercions(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE metrics (id INTEGER PRIMARY KEY, doc TEXT)")
+	execMust(t, e, `INSERT INTO metrics VALUES (1, '{"n":2,"big":10,"flag":1}')`)
+	execMust(t, e, `INSERT INTO metrics VALUES (2, '{"n":10,"big":20,"flag":0}')`)
+
+	// Arithmetic uses the text numeric value. Like '2' + 1 elsewhere in the
+	// engine, the result is REAL rather than INTEGER for JSON text.
+	res := execMust(t, e, `SELECT (doc -> 'n') + 1 FROM metrics WHERE id = 1`)
+	if got := res.Rows[0][0]; got != float64(3) {
+		t.Fatalf("(doc -> 'n') + 1 = %v (%T), want 3", got, got)
+	}
+
+	// Bitwise operators coerce through toInt64.
+	res = execMust(t, e, `SELECT (doc -> 'n') & 3 FROM metrics WHERE id = 1`)
+	if got := res.Rows[0][0]; got != int64(2) {
+		t.Fatalf("(doc -> 'n') & 3 = %v (%T), want int64 2", got, got)
+	}
+
+	// Numeric comparison must not fall back to string comparison, where
+	// "10" < "9" and multi-digit values order incorrectly.
+	res = execMust(t, e, `SELECT id FROM metrics WHERE doc -> 'big' > 9 ORDER BY id`)
+	if res.RowCount != 2 || res.Rows[0][0] != int64(1) || res.Rows[1][0] != int64(2) {
+		t.Fatalf("WHERE doc -> 'big' > 9 rows = %v, want ids 1, 2", res.Rows)
+	}
+	res = execMust(t, e, `SELECT id FROM metrics WHERE doc -> 'big' = 10`)
+	if res.RowCount != 1 || res.Rows[0][0] != int64(1) {
+		t.Fatalf("WHERE doc -> 'big' = 10 rows = %v, want id 1", res.Rows)
+	}
+
+	// CAST goes through toFloat.
+	res = execMust(t, e, `SELECT CAST(doc -> 'big' AS INTEGER) FROM metrics WHERE id = 1`)
+	if got := res.Rows[0][0]; got != int64(10) {
+		t.Fatalf("CAST(doc -> 'big' AS INTEGER) = %v (%T), want int64 10", got, got)
+	}
+
+	// WHERE truthiness goes through toBool.
+	res = execMust(t, e, `SELECT id FROM metrics WHERE doc -> 'flag'`)
+	if res.RowCount != 1 || res.Rows[0][0] != int64(1) {
+		t.Fatalf("WHERE doc -> 'flag' rows = %v, want id 1", res.Rows)
+	}
+
+	// ORDER BY compares the extracted values numerically.
+	res = execMust(t, e, `SELECT id FROM metrics ORDER BY doc -> 'n'`)
+	if res.RowCount != 2 || res.Rows[0][0] != int64(1) || res.Rows[1][0] != int64(2) {
+		t.Fatalf("ORDER BY doc -> 'n' rows = %v, want ids 1, 2", res.Rows)
+	}
+
+	// The JSON subtype must survive -> so JSON functions embed the extracted
+	// value as JSON rather than as a quoted string.
+	res = execMust(t, e, `SELECT json_array(doc -> 'n') FROM metrics WHERE id = 1`)
+	if got := res.Rows[0][0]; got != "[2]" {
+		t.Fatalf("json_array(doc -> 'n') = %v, want [2]", got)
+	}
+}
