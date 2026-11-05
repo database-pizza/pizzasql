@@ -773,22 +773,26 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 	case "INFORMATION_SCHEMA.TABLE_CONSTRAINTS", "INFORMATION_SCHEMA.KEY_COLUMN_USAGE":
 		for _, table := range tables {
 			schema, schemaErr := c.schema.GetSchema(table)
-			if schemaErr != nil || schema.PrimaryKey == "" || schema.PrimaryKey == "_rowid_" {
+			if schemaErr != nil || schema.UsesSyntheticRowID() {
 				continue
 			}
-			row := map[string]interface{}{
-				"constraint_catalog": c.database, "constraint_schema": "public", "constraint_name": table + "_pkey",
-				"table_catalog": c.database, "table_schema": "public", "table_name": table,
-			}
+			columns := schema.PrimaryKeyList()
 			if source == "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" {
-				row["constraint_type"] = "PRIMARY KEY"
-				row["is_deferrable"] = "NO"
-				row["initially_deferred"] = "NO"
-			} else {
-				row["column_name"] = schema.PrimaryKey
-				row["ordinal_position"] = int64(1)
+				rows = append(rows, map[string]interface{}{
+					"constraint_catalog": c.database, "constraint_schema": "public", "constraint_name": table + "_pkey",
+					"table_catalog": c.database, "table_schema": "public", "table_name": table,
+					"constraint_type": "PRIMARY KEY", "is_deferrable": "NO", "initially_deferred": "NO",
+				})
+				continue
 			}
-			rows = append(rows, row)
+			// KEY_COLUMN_USAGE reports one row per key column, in key order.
+			for i, column := range columns {
+				rows = append(rows, map[string]interface{}{
+					"constraint_catalog": c.database, "constraint_schema": "public", "constraint_name": table + "_pkey",
+					"table_catalog": c.database, "table_schema": "public", "table_name": table,
+					"column_name": column, "ordinal_position": int64(i + 1),
+				})
+			}
 		}
 	case "PG_INDEXES":
 		for _, table := range tables {

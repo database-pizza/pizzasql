@@ -70,7 +70,9 @@ func generatedColumnSet(schema *storage.Schema) map[string]bool {
 // integer primary key are left to the storage layer, which assigns the hidden
 // _rowid_ during the insert.
 func (e *Executor) ensureGeneratedRowID(tableName string, schema *storage.Schema, row storage.Row) error {
-	if schema.PrimaryKey == "" || schema.PrimaryKey == "_rowid_" {
+	// Only a single-column INTEGER PRIMARY KEY is generated before evaluation; a
+	// composite key is never a rowid alias.
+	if !schema.IsSingleColumnPrimaryKey() || schema.UsesSyntheticRowID() {
 		return nil
 	}
 	if v, ok := lookupRowValue(row, schema.PrimaryKey); ok && v != nil {
@@ -144,11 +146,13 @@ func (e *Executor) insertConflictMatchers(tableName string, schema *storage.Sche
 // index-key lookup rather than a full table scan.
 func (e *Executor) matcherConflicts(tableName string, schema *storage.Schema, m conflictMatcher, candidate storage.Row) ([]storage.Row, error) {
 	if m.primaryKey {
-		pkValue, ok := lookupRowValue(candidate, schema.PrimaryKey)
-		if !ok || pkValue == nil {
+		pk, err := schema.PrimaryKeyForRow(candidate)
+		if err != nil {
+			// A missing or NULL key component cannot conflict; the insert fails
+			// its NOT NULL constraint instead.
 			return nil, nil
 		}
-		row, err := e.session.GetByPK(tableName, fmt.Sprintf("%v", pkValue))
+		row, err := e.session.GetByPK(tableName, pk)
 		if err == storage.ErrKeyNotFound {
 			return nil, nil
 		}
@@ -219,15 +223,19 @@ func (e *Executor) resolveInsertConflicts(tableName string, schema *storage.Sche
 			return err
 		}
 		for _, row := range rows {
-			toDelete[fmt.Sprintf("%v", row[schema.PrimaryKey])] = row
+			pk, err := schema.PrimaryKeyForRow(row)
+			if err != nil {
+				return err
+			}
+			toDelete[pk] = row
 		}
 	}
 	if len(toDelete) == 0 {
 		return nil
 	}
 
-	for _, row := range toDelete {
-		if _, deleted, derr := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", row[schema.PrimaryKey])); derr != nil {
+	for pk := range toDelete {
+		if _, deleted, derr := e.session.DeleteByPK(tableName, pk); derr != nil {
 			return derr
 		} else if !deleted {
 			return fmt.Errorf("ON CONFLICT REPLACE row disappeared during delete")

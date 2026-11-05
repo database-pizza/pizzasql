@@ -555,7 +555,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		for _, condition := range splitANDClauses(effectiveWhere) {
 			colName, colValue, isEquality := e.extractSelectLookupCondition(condition, stmt.From[0])
 			if isEquality {
-				if strings.EqualFold(schema.PrimaryKey, colName) && safePrimaryKeyLiteral(colValue) {
+				if schema.IsSingleColumnPrimaryKey() && strings.EqualFold(schema.PrimaryKey, colName) && safePrimaryKeyLiteral(colValue) {
 					row, getErr := e.session.GetByPK(tableName, fmt.Sprintf("%v", colValue))
 					if getErr == nil {
 						normalizeRowBySchema(row, schema)
@@ -2104,7 +2104,7 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 		if err != nil {
 			return nil, err
 		}
-		if canHash && strings.EqualFold(rightSchema.PrimaryKey, rightKey) && len(leftRows) <= 256 {
+		if canHash && rightSchema.IsSingleColumnPrimaryKey() && strings.EqualFold(rightSchema.PrimaryKey, rightKey) && len(leftRows) <= 256 {
 			seen := make(map[string]bool, len(leftRows))
 			for _, left := range leftRows {
 				key := joinKeyString(left, leftKey)
@@ -2621,12 +2621,14 @@ func isConflictError(err error) bool {
 // target uses an indexed lookup; only an unindexed composite target falls back
 // to a scan.
 func (e *Executor) findConflictRow(table string, schema *storage.Schema, row storage.Row, columns []string) (storage.Row, bool, error) {
-	if len(columns) == 1 && strings.EqualFold(columns[0], schema.PrimaryKey) {
-		pkValue, ok := lookupRowValue(row, schema.PrimaryKey)
-		if !ok || pkValue == nil {
+	if schema.PrimaryKeyMatches(columns) {
+		pk, err := schema.PrimaryKeyForRow(row)
+		if err != nil {
+			// A missing or NULL key component cannot conflict: the insert itself
+			// fails with the NOT NULL violation.
 			return nil, false, nil
 		}
-		found, err := e.session.GetByPK(table, fmt.Sprintf("%v", pkValue))
+		found, err := e.session.GetByPK(table, pk)
 		if err == storage.ErrKeyNotFound {
 			return nil, false, nil
 		}
@@ -2699,7 +2701,10 @@ func (e *Executor) applyUpsert(table string, schema *storage.Schema, existing, r
 		context["excluded."+k] = v
 	}
 
-	pk := fmt.Sprintf("%v", existing[schema.PrimaryKey])
+	pk, err := schema.PrimaryKeyForRow(existing)
+	if err != nil {
+		return err
+	}
 	_, updated, err := e.session.UpdateByPK(table, pk, func(current storage.Row) (storage.Row, error) {
 		updates := make(storage.Row)
 		merged := make(storage.Row, len(current))
@@ -2918,8 +2923,8 @@ func (e *Executor) insertOneRow(tableName string, schema *storage.Schema, row st
 	}
 	if stmt.ConflictDoNothing || len(stmt.ConflictUpdate) > 0 {
 		columns := stmt.ConflictTarget
-		if len(columns) == 0 && schema.PrimaryKey != "" && schema.PrimaryKey != "_rowid_" {
-			columns = []string{schema.PrimaryKey}
+		if len(columns) == 0 && !schema.UsesSyntheticRowID() {
+			columns = schema.PrimaryKeyList()
 		}
 		if len(columns) > 0 {
 			existing, found, err := e.findConflictRow(tableName, schema, row, columns)
@@ -2936,13 +2941,13 @@ func (e *Executor) insertOneRow(tableName string, schema *storage.Schema, row st
 						return 0, false, false, nil, fmt.Errorf("cannot UPDATE generated column %s", assignment.Column)
 					}
 				}
-				existingPK, _ := lookupRowValue(existing, schema.PrimaryKey)
+				existingPK, _ := schema.PrimaryKeyForRow(existing)
 				if err := e.applyUpsert(tableName, schema, existing, row, stmt.ConflictUpdate); err != nil {
 					return 0, false, false, nil, err
 				}
 				var stored storage.Row
 				if wantStored {
-					stored = e.fetchByPK(tableName, fmt.Sprintf("%v", existingPK))
+					stored = e.fetchByPK(tableName, existingPK)
 				}
 				return 0, false, true, stored, nil
 			}
@@ -2966,9 +2971,9 @@ func (e *Executor) insertOneRow(tableName string, schema *storage.Schema, row st
 			case parser.ConflictIgnore:
 				return 0, false, false, nil, nil
 			case parser.ConflictReplace:
-				pkValue := row[schema.PrimaryKey]
-				if pkValue != nil {
-					if _, deleted, delErr := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", pkValue)); delErr == nil && deleted {
+				pk, pkErr := schema.PrimaryKeyForRow(row)
+				if pkErr == nil {
+					if _, deleted, delErr := e.session.DeleteByPK(tableName, pk); delErr == nil && deleted {
 						replacedID, replaceErr := e.session.InsertWithRowID(tableName, row)
 						if replaceErr != nil {
 							return 0, false, false, nil, replaceErr
@@ -2992,11 +2997,11 @@ func (e *Executor) fetchIfRequested(tableName string, schema *storage.Schema, ro
 	if !want {
 		return nil
 	}
-	pkValue, ok := lookupRowValue(row, schema.PrimaryKey)
-	if !ok || pkValue == nil {
+	pk, err := schema.PrimaryKeyForRow(row)
+	if err != nil {
 		return row
 	}
-	return e.fetchByPK(tableName, fmt.Sprintf("%v", pkValue))
+	return e.fetchByPK(tableName, pk)
 }
 
 // fetchByPK reads a stored row, falling back to nil on a read error; RETURNING
@@ -3120,11 +3125,11 @@ func (e *Executor) isPointMutation(table string, where parser.Expr, assignments 
 		return false
 	}
 	schema, err := e.schema.GetSchema(table)
-	if err != nil || !strings.EqualFold(column, schema.PrimaryKey) {
+	if err != nil || !schema.IsSingleColumnPrimaryKey() || !strings.EqualFold(column, schema.PrimaryKey) {
 		return false
 	}
 	for _, assignment := range assignments {
-		if strings.EqualFold(assignment.Column, schema.PrimaryKey) {
+		if schema.IsPrimaryKeyColumn(assignment.Column) {
 			return false
 		}
 	}
@@ -3293,12 +3298,12 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		column, value, equality := e.extractIndexableCondition(stmt.Where)
 		updatesPrimaryKey := false
 		for _, assignment := range stmt.Set {
-			if strings.EqualFold(assignment.Column, schema.PrimaryKey) {
+			if schema.IsPrimaryKeyColumn(assignment.Column) {
 				updatesPrimaryKey = true
 				break
 			}
 		}
-		if equality && safePrimaryKeyLiteral(value) && strings.EqualFold(column, schema.PrimaryKey) && !updatesPrimaryKey {
+		if equality && safePrimaryKeyLiteral(value) && schema.IsSingleColumnPrimaryKey() && strings.EqualFold(column, schema.PrimaryKey) && !updatesPrimaryKey {
 			pk := fmt.Sprintf("%v", value)
 			_, updated, err := e.session.UpdateByPK(tableName, pk, updateFn)
 			if err != nil {
@@ -3330,11 +3335,11 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 			if merr != nil {
 				return nil, merr
 			}
-			key, ok := lookupRowValue(merged, schema.PrimaryKey)
-			if !ok || key == nil {
-				key, _ = lookupRowValue(r, schema.PrimaryKey)
+			key, keyErr := schema.PrimaryKeyForRow(merged)
+			if keyErr != nil {
+				key, _ = schema.PrimaryKeyForRow(r)
 			}
-			returningPKs = append(returningPKs, fmt.Sprintf("%v", key))
+			returningPKs = append(returningPKs, key)
 		}
 	}
 
@@ -3456,8 +3461,12 @@ func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Sc
 		if err := e.applyGeneratedColumns(schema, row); err != nil {
 			return nil, err
 		}
+		oldPK, err := schema.PrimaryKeyForRow(target)
+		if err != nil {
+			return nil, err
+		}
 		plans = append(plans, updateFromPlan{
-			oldPK: fmt.Sprintf("%v", target[schema.PrimaryKey]),
+			oldPK: oldPK,
 			row:   row,
 		})
 	}
@@ -3466,8 +3475,10 @@ func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Sc
 	var affected []storage.Row
 	err = e.runDMLAtomicForce(tableName, true, func() error {
 		for _, plan := range plans {
-			newPKVal, _ := lookupRowValue(plan.row, schema.PrimaryKey)
-			newPK := fmt.Sprintf("%v", newPKVal)
+			newPK, newPKErr := schema.PrimaryKeyForRow(plan.row)
+			if newPKErr != nil {
+				return newPKErr
+			}
 			if newPK != plan.oldPK {
 				if _, gerr := e.session.GetByPK(tableName, newPK); gerr == nil {
 					return &storage.PrimaryKeyViolationError{Table: tableName, Key: newPK}
@@ -3648,7 +3659,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 
 	if stmt.Where != nil {
 		column, value, equality := e.extractIndexableCondition(stmt.Where)
-		if equality && safePrimaryKeyLiteral(value) && strings.EqualFold(column, schema.PrimaryKey) {
+		if equality && safePrimaryKeyLiteral(value) && schema.IsSingleColumnPrimaryKey() && strings.EqualFold(column, schema.PrimaryKey) {
 			deletedRow, deleted, err := e.session.DeleteByPK(tableName, fmt.Sprintf("%v", value))
 			if err != nil {
 				return nil, err
@@ -3703,6 +3714,10 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		Name: stmt.Table.Name,
 	}
 
+	// A column-level PRIMARY KEY is recorded separately so more than one, or a
+	// mix with a table-level PRIMARY KEY, is rejected instead of silently
+	// choosing one of them.
+	var inlinePrimaryKeyColumns []string
 	for _, colDef := range stmt.Columns {
 		col := storage.Column{
 			Name:     colDef.Name,
@@ -3727,7 +3742,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			case parser.ConstraintPrimaryKey:
 				col.PrimaryKey = true
 				col.Nullable = false
-				schema.PrimaryKey = col.Name
+				inlinePrimaryKeyColumns = append(inlinePrimaryKeyColumns, col.Name)
 			case parser.ConstraintNotNull:
 				col.Nullable = false
 			case parser.ConstraintDefault:
@@ -3758,20 +3773,42 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	// Handle table-level constraints. CHECK predicates are persisted and
 	// enforced; FOREIGN KEY is still rejected because the engine never validates
 	// referential integrity.
+	var tablePrimaryKeyColumns []string
 	for _, constraint := range stmt.Constraints {
 		switch constraint.Type {
 		case parser.ConstraintPrimaryKey:
-			if len(constraint.Columns) > 0 {
-				if len(constraint.Columns) > 1 {
-					return nil, fmt.Errorf("%w: composite primary keys are not supported; declare a single-column PRIMARY KEY", ErrUnsupportedFeature)
+			if len(constraint.Columns) == 0 {
+				break
+			}
+			if len(tablePrimaryKeyColumns) > 0 {
+				return nil, pgerror.Unsupported(
+					"table %s declares more than one PRIMARY KEY; declare exactly one column list",
+					stmt.Table.Name,
+				)
+			}
+			if len(inlinePrimaryKeyColumns) > 0 {
+				return nil, pgerror.Unsupported(
+					"table %s mixes an inline PRIMARY KEY with a table-level PRIMARY KEY; use one form, and list every key column in the table-level PRIMARY KEY (a, b) for a composite key",
+					stmt.Table.Name,
+				)
+			}
+			seen := make(map[string]bool, len(constraint.Columns))
+			for _, name := range constraint.Columns {
+				column, ok := schema.GetColumn(name)
+				if !ok {
+					return nil, pgerror.Unsupported(
+						"PRIMARY KEY column %q does not exist in table %s",
+						name, stmt.Table.Name,
+					)
 				}
-				schema.PrimaryKey = constraint.Columns[0]
-				for i := range schema.Columns {
-					if strings.EqualFold(schema.Columns[i].Name, schema.PrimaryKey) {
-						schema.Columns[i].PrimaryKey = true
-						schema.Columns[i].Nullable = false
-					}
+				if seen[strings.ToLower(column.Name)] {
+					return nil, pgerror.Unsupported(
+						"column %q appears more than once in the PRIMARY KEY of table %s",
+						column.Name, stmt.Table.Name,
+					)
 				}
+				seen[strings.ToLower(column.Name)] = true
+				tablePrimaryKeyColumns = append(tablePrimaryKeyColumns, column.Name)
 			}
 		case parser.ConstraintCheck:
 			// Handled with the column-level predicates once every column is known.
@@ -3779,6 +3816,22 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			return nil, pgerror.Unsupported(
 				"FOREIGN KEY constraints are not supported: enforce referential integrity in the application instead (the engine never validated foreign keys)",
 			)
+		}
+	}
+
+	if len(inlinePrimaryKeyColumns) > 1 {
+		return nil, pgerror.Unsupported(
+			"table %s declares more than one inline PRIMARY KEY; use a table-level PRIMARY KEY (%s) instead",
+			stmt.Table.Name, strings.Join(inlinePrimaryKeyColumns, ", "),
+		)
+	}
+	if len(tablePrimaryKeyColumns) > 0 {
+		schema.PrimaryKeyColumns = tablePrimaryKeyColumns
+		for i := range schema.Columns {
+			if schema.IsPrimaryKeyColumn(schema.Columns[i].Name) {
+				schema.Columns[i].PrimaryKey = true
+				schema.Columns[i].Nullable = false
+			}
 		}
 	}
 
@@ -4755,11 +4808,7 @@ func (e *Executor) pragmaTableInfo(tableName string) (*Result, error) {
 		if !col.Nullable {
 			notnull = 1
 		}
-		pk := 0
-		if col.PrimaryKey {
-			pk = 1
-		}
-		result.AddRow(int64(i), col.Name, col.Type, int64(notnull), col.DefaultLiteral(), int64(pk))
+		result.AddRow(int64(i), col.Name, col.Type, int64(notnull), col.DefaultLiteral(), int64(primaryKeyOrdinal(schema, col.Name)))
 	}
 
 	return result, nil

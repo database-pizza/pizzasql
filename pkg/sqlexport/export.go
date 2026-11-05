@@ -106,57 +106,52 @@ func ExportTable(schema *storage.SchemaManager, table *storage.TableManager, tab
 
 // generateCreateTable generates a CREATE TABLE statement from schema.
 func generateCreateTable(schema *storage.Schema) string {
-	var sb strings.Builder
-
-	sb.WriteString(fmt.Sprintf("CREATE TABLE %s (\n", quoteIdentifier(schema.Name)))
-
-	// Generate column definitions
-	for i, col := range schema.Columns {
+	compositeKey := schema.IsCompositePrimaryKey()
+	defs := make([]string, 0, len(schema.Columns)+1)
+	for _, col := range schema.Columns {
 		// Skip internal _rowid_ column
 		if col.Name == "_rowid_" {
 			continue
 		}
 
-		sb.WriteString("    ")
-		sb.WriteString(quoteIdentifier(col.Name))
-		sb.WriteString(" ")
-		sb.WriteString(col.Type)
+		var b strings.Builder
+		b.WriteString(quoteIdentifier(col.Name))
+		b.WriteString(" ")
+		b.WriteString(col.Type)
 
-		// Add PRIMARY KEY constraint
-		if col.PrimaryKey {
-			sb.WriteString(" PRIMARY KEY")
+		// A single-column key keeps its inline PRIMARY KEY; a composite key is
+		// emitted once at the end so no column claims the key by itself.
+		inlineKey := col.PrimaryKey && !compositeKey
+		if inlineKey {
+			b.WriteString(" PRIMARY KEY")
 		}
 
-		// Add NOT NULL constraint
-		if !col.Nullable && !col.PrimaryKey {
-			sb.WriteString(" NOT NULL")
+		if !col.Nullable && !inlineKey {
+			b.WriteString(" NOT NULL")
 		}
 
 		// Add DEFAULT value. A non-constant default is emitted as its stored SQL
 		// text so the dump keeps evaluating it instead of freezing a value.
 		if col.DefaultExpr != "" {
-			sb.WriteString(" DEFAULT ")
-			sb.WriteString(col.DefaultExpr)
+			b.WriteString(" DEFAULT ")
+			b.WriteString(col.DefaultExpr)
 		} else if col.Default != nil {
-			sb.WriteString(" DEFAULT ")
-			sb.WriteString(formatValue(col.Default, col.Type))
+			b.WriteString(" DEFAULT ")
+			b.WriteString(formatValue(col.Default, col.Type))
 		}
 
-		// Add comma if not last column
-		if i < len(schema.Columns)-1 {
-			// Check if next column is _rowid_
-			if i+1 < len(schema.Columns) && schema.Columns[i+1].Name != "_rowid_" {
-				sb.WriteString(",")
-			} else if i+2 < len(schema.Columns) {
-				sb.WriteString(",")
-			}
+		defs = append(defs, "    "+b.String())
+	}
+	if compositeKey {
+		columns := schema.PrimaryKeyList()
+		quoted := make([]string, len(columns))
+		for i, name := range columns {
+			quoted[i] = quoteIdentifier(name)
 		}
-		sb.WriteString("\n")
+		defs = append(defs, "    PRIMARY KEY ("+strings.Join(quoted, ", ")+")")
 	}
 
-	sb.WriteString(");")
-
-	return sb.String()
+	return fmt.Sprintf("CREATE TABLE %s (\n%s\n);", quoteIdentifier(schema.Name), strings.Join(defs, ",\n"))
 }
 
 // generateInserts generates INSERT statements for rows.

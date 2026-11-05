@@ -122,7 +122,11 @@ func TestCompatibilitySuite(t *testing.T) {
 	expectRows("upsert.result", `SELECT plan FROM accounts WHERE id = 2`, "pro")
 
 	expectCode("constraints.unique_23505", `INSERT INTO accounts (id, email) VALUES (3, 'a@x')`, "23505")
-	expectCode("ddl.composite_pk_0A000", `CREATE TABLE bad_pk (a INTEGER, b INTEGER, PRIMARY KEY (a, b))`, "0A000")
+	expectOK("ddl.composite_pk", `CREATE TABLE composite_pk (a INTEGER, b TEXT, PRIMARY KEY (a, b))`)
+	expectOK("dml.composite_pk_insert", `INSERT INTO composite_pk (a, b) VALUES (1, 'x')`)
+	expectRows("dml.composite_pk_select", `SELECT count(*) FROM composite_pk WHERE a = 1 AND b = 'x'`, "1")
+	expectCode("constraints.composite_pk_23505", `INSERT INTO composite_pk (a, b) VALUES (1, 'x')`, "23505")
+	expectCode("constraints.composite_pk_23502", `INSERT INTO composite_pk (a) VALUES (2)`, "23502")
 	expectOK("ddl.timestamp_default", `CREATE TABLE stamped (id INTEGER PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`)
 	expectOK("ddl.timestamp_default_insert", `INSERT INTO stamped (id) VALUES (1)`)
 	expectRows("ddl.timestamp_default_applied", `SELECT count(*) FROM stamped WHERE created_at IS NOT NULL`, "1")

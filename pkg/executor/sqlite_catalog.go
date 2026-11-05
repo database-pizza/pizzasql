@@ -290,10 +290,7 @@ func (e *Executor) pragmaTableXInfo(table string) (*Result, error) {
 		if !col.Nullable {
 			notnull = 1
 		}
-		pk := int64(0)
-		if col.PrimaryKey {
-			pk = 1
-		}
+		pk := int64(primaryKeyOrdinal(schema, col.Name))
 		// Hidden flag: 0 normal, 2 generated VIRTUAL, 3 generated STORED.
 		hidden := int64(0)
 		if col.GeneratedExpr != "" {
@@ -312,14 +309,25 @@ func (e *Executor) pragmaTableXInfo(table string) (*Result, error) {
 // implicit _rowid_ (and its aliases) are stripped, and identifiers are quoted so
 // xorm's IsColumnExist / GORM's HasColumn LIKE patterns match.
 func recreateCreateTableSQL(s *storage.Schema) string {
-	cols := make([]string, 0, len(s.Columns)+len(s.Checks))
+	compositeKey := s.IsCompositePrimaryKey()
+	cols := make([]string, 0, len(s.Columns)+len(s.Checks)+1)
 	for _, col := range s.Columns {
 		// Strip only the engine-injected hidden rowid column, never user
 		// columns that happen to be named oid/rowid/_rowid_.
-		if s.PrimaryKey == "_rowid_" && col.Name == "_rowid_" {
+		if s.UsesSyntheticRowID() && col.Name == "_rowid_" {
 			continue
 		}
-		cols = append(cols, recreateColumnDef(s, col))
+		cols = append(cols, recreateColumnDef(s, col, compositeKey))
+	}
+	// A composite key is rendered as one table-level constraint, as it was
+	// declared; a single-column key keeps its inline PRIMARY KEY form.
+	if compositeKey {
+		columns := s.PrimaryKeyList()
+		quoted := make([]string, len(columns))
+		for i, name := range columns {
+			quoted[i] = quoteIdent(name)
+		}
+		cols = append(cols, "PRIMARY KEY ("+strings.Join(quoted, ", ")+")")
 	}
 	// Inline and table-level CHECK declarations are stored uniformly, so they
 	// are all rendered as table-level constraints: `CREATE TABLE t (a INTEGER,
@@ -334,15 +342,16 @@ func recreateCreateTableSQL(s *storage.Schema) string {
 	return fmt.Sprintf("CREATE TABLE %s (%s)", quoteIdent(s.Name), strings.Join(cols, ", "))
 }
 
-func recreateColumnDef(s *storage.Schema, col storage.Column) string {
+func recreateColumnDef(s *storage.Schema, col storage.Column, compositeKey bool) string {
 	var b strings.Builder
 	b.WriteString(quoteIdent(col.Name))
 	b.WriteString(" ")
 	b.WriteString(col.Type)
-	if col.PrimaryKey {
+	inlineKey := col.PrimaryKey && !compositeKey
+	if inlineKey {
 		b.WriteString(" PRIMARY KEY")
 	}
-	if col.PrimaryKey && s.AutoIncrement {
+	if inlineKey && s.AutoIncrement {
 		b.WriteString(" AUTOINCREMENT")
 	}
 	if !col.Nullable {
@@ -368,6 +377,18 @@ func recreateColumnDef(s *storage.Schema, col storage.Column) string {
 		}
 	}
 	return b.String()
+}
+
+// primaryKeyOrdinal returns the column's 1-based position in the primary key,
+// or 0 when it is not part of it. PRAGMA table_info/table_xinfo report the
+// ordinal, so a composite key is distinguishable from several single keys.
+func primaryKeyOrdinal(s *storage.Schema, columnName string) int {
+	for i, name := range s.PrimaryKeyList() {
+		if strings.EqualFold(name, columnName) {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 func recreateCreateIndexSQL(idx *storage.Index) string {

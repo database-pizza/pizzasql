@@ -2,10 +2,12 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -138,6 +140,80 @@ func TestPizzaKVIntegration(t *testing.T) {
 	}
 	if schemas.TableExists("events") {
 		t.Fatal("table still exists")
+	}
+}
+
+// A composite key must survive a real engine restart: the encoded key is the
+// durable row key, so both reads and duplicate detection keep working after the
+// schema and rows are reloaded from PizzaKV.
+func TestPizzaKVCompositePrimaryKeyIntegration(t *testing.T) {
+	binary := os.Getenv("PIZZAKV_BIN")
+	if binary == "" {
+		t.Skip("PIZZAKV_BIN is not set")
+	}
+
+	dir := t.TempDir()
+	socket := shortPizzaKVSocket(t)
+	database := filepath.Join(dir, "composite.pkvdb")
+	stop := startPizzaKVTest(t, binary, socket, database)
+	pool := waitPizzaKVPool(t, socket)
+
+	schemas := NewSchemaManager(pool, "composite")
+	tables := NewTableManager(pool, schemas, "composite")
+	if err := schemas.CreateTable(&Schema{
+		Name:              "pairs",
+		PrimaryKeyColumns: []string{"a", "b"},
+		Columns: []Column{
+			{Name: "a", Type: "TEXT", Nullable: false},
+			{Name: "b", Type: "INTEGER", Nullable: false},
+			{Name: "v", Type: "TEXT", Nullable: true},
+		},
+	}); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for _, row := range []Row{
+		{"a": "x", "b": int64(1), "v": "one"},
+		{"a": "x", "b": int64(2), "v": "two"},
+	} {
+		if err := tables.Insert("pairs", row); err != nil {
+			t.Fatalf("insert %v: %v", row, err)
+		}
+	}
+
+	if err := pool.Close(); err != nil {
+		t.Fatalf("close pool: %v", err)
+	}
+	stop()
+	startPizzaKVTest(t, binary, socket, database)
+	pool = waitPizzaKVPool(t, socket)
+	defer pool.Close()
+
+	schemas = NewSchemaManager(pool, "composite")
+	tables = NewTableManager(pool, schemas, "composite")
+	schema, err := schemas.GetSchema("pairs")
+	if err != nil {
+		t.Fatalf("reload schema: %v", err)
+	}
+	if strings.Join(schema.PrimaryKeyList(), ",") != "a,b" {
+		t.Fatalf("reloaded key = %v, want [a b]", schema.PrimaryKeyList())
+	}
+	row, err := tables.GetByPK("pairs", "1:x1:1")
+	if err != nil || row["v"] != "one" {
+		t.Fatalf("point read after restart = %v, err %v", row, err)
+	}
+	rows, err := tables.Select("pairs", nil)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("scan after restart = %v, err %v", rows, err)
+	}
+	var duplicate *PrimaryKeyViolationError
+	if err := tables.Insert("pairs", Row{"a": "x", "b": int64(1), "v": "again"}); !errors.As(err, &duplicate) {
+		t.Fatalf("duplicate after restart = %v, want PrimaryKeyViolationError", err)
+	}
+	if err := tables.Insert("pairs", Row{"a": "x", "b": int64(3), "v": "three"}); err != nil {
+		t.Fatalf("insert after restart: %v", err)
+	}
+	if count, err := tables.CountFast("pairs"); err != nil || count != 3 {
+		t.Fatalf("count after restart = %d, err %v", count, err)
 	}
 }
 

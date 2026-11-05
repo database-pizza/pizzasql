@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,12 +20,20 @@ var ErrIndexNotFound = errors.New("index not found")
 
 // Schema represents a table schema.
 type Schema struct {
-	Name          string    `json:"name"`
-	Columns       []Column  `json:"columns"`
-	PrimaryKey    string    `json:"primary_key"`
-	CreatedAt     time.Time `json:"created_at"`
-	NextRowID     int64     `json:"next_rowid"`
-	AutoIncrement bool      `json:"autoincrement"`
+	Name    string   `json:"name"`
+	Columns []Column `json:"columns"`
+	// PrimaryKey is the single primary-key column. It stays the source of truth
+	// for pre-existing catalogs that do not carry PrimaryKeyColumns, and it is
+	// empty for a composite key so a caller cannot mistake one member for the
+	// whole key. Use PrimaryKeyList instead of reading either field directly.
+	PrimaryKey string `json:"primary_key"`
+	// PrimaryKeyColumns is the ordered primary-key column list for a composite
+	// key. It is omitted for single-column keys so the catalog keeps its
+	// historical shape; normalizePrimaryKey fills it in when a schema is loaded.
+	PrimaryKeyColumns []string  `json:"primary_key_columns,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	NextRowID         int64     `json:"next_rowid"`
+	AutoIncrement     bool      `json:"autoincrement"`
 	// Checks holds the row predicates declared with CHECK, at column and table
 	// level alike. Inline and table-level declarations are equivalent once
 	// parsed, so both live in this one list.
@@ -319,20 +328,10 @@ func (m *SchemaManager) CreateTable(schema *Schema) error {
 	schema = cloneSchema(schema)
 	schema.CreatedAt = time.Now()
 
-	// Determine primary key if not set
-	if schema.PrimaryKey == "" {
-		for _, col := range schema.Columns {
-			if col.PrimaryKey {
-				schema.PrimaryKey = col.Name
-				break
-			}
-		}
-		// No explicit primary key declared — use synthetic _rowid_ so user
-		// columns remain unconstrained and can hold duplicate or NULL values.
-		if schema.PrimaryKey == "" {
-			schema.PrimaryKey = "_rowid_"
-		}
-	}
+	// Determine the primary key if not set. A schema with no declared key uses
+	// the synthetic _rowid_ so user columns remain unconstrained and can hold
+	// duplicate or NULL values.
+	schema.normalizePrimaryKey()
 
 	// Serialize schema
 	data, err := json.Marshal(schema)
@@ -458,6 +457,7 @@ func (m *SchemaManager) GetSchema(name string) (*Schema, error) {
 	if err := json.Unmarshal([]byte(data), &schema); err != nil {
 		return nil, fmt.Errorf("failed to parse schema: %w", err)
 	}
+	schema.normalizePrimaryKey()
 
 	m.cache[strings.ToLower(name)] = &schema
 	return cloneSchema(&schema), nil
@@ -470,6 +470,7 @@ func cloneSchema(schema *Schema) *Schema {
 	cloned := *schema
 	cloned.Columns = append([]Column(nil), schema.Columns...)
 	cloned.Checks = append([]CheckConstraint(nil), schema.Checks...)
+	cloned.PrimaryKeyColumns = append([]string(nil), schema.PrimaryKeyColumns...)
 	return &cloned
 }
 
@@ -591,6 +592,125 @@ func (s *Schema) ToAnalyzerTableInfo() *analyzer.TableInfo {
 	}
 
 	return info
+}
+
+// normalizePrimaryKey derives the ordered primary-key column list from the
+// legacy single-column field or from the columns marked PRIMARY KEY, and keeps
+// both representations consistent. Primary-key columns are implicitly NOT NULL.
+func (s *Schema) normalizePrimaryKey() {
+	if len(s.PrimaryKeyColumns) == 0 {
+		if s.PrimaryKey != "" {
+			s.PrimaryKeyColumns = []string{s.PrimaryKey}
+		} else {
+			for _, col := range s.Columns {
+				if col.PrimaryKey {
+					s.PrimaryKeyColumns = append(s.PrimaryKeyColumns, col.Name)
+				}
+			}
+			if len(s.PrimaryKeyColumns) == 0 {
+				s.PrimaryKeyColumns = []string{"_rowid_"}
+			}
+		}
+	}
+	if len(s.PrimaryKeyColumns) == 1 {
+		// A single-column key keeps the historical catalog shape: only the
+		// scalar field, so existing schema bytes stay unchanged.
+		s.PrimaryKey = s.PrimaryKeyColumns[0]
+		s.PrimaryKeyColumns = nil
+	} else {
+		s.PrimaryKey = ""
+	}
+	for i := range s.Columns {
+		if s.IsPrimaryKeyColumn(s.Columns[i].Name) {
+			s.Columns[i].PrimaryKey = true
+			s.Columns[i].Nullable = false
+		}
+	}
+}
+
+// PrimaryKeyList returns the ordered primary-key columns. A schema always has
+// at least one: an explicit key, or the synthetic _rowid_.
+func (s *Schema) PrimaryKeyList() []string {
+	if len(s.PrimaryKeyColumns) > 0 {
+		return append([]string(nil), s.PrimaryKeyColumns...)
+	}
+	if s.PrimaryKey != "" {
+		return []string{s.PrimaryKey}
+	}
+	return []string{"_rowid_"}
+}
+
+// UsesSyntheticRowID reports whether the table declares no primary key, so rows
+// are stored under the engine-assigned ROWID.
+func (s *Schema) UsesSyntheticRowID() bool {
+	columns := s.PrimaryKeyList()
+	return len(columns) == 1 && strings.EqualFold(columns[0], "_rowid_")
+}
+
+// IsCompositePrimaryKey reports whether the primary key spans more than one
+// column.
+func (s *Schema) IsCompositePrimaryKey() bool {
+	return len(s.PrimaryKeyList()) > 1
+}
+
+// IsSingleColumnPrimaryKey reports whether the primary key is exactly one
+// column, which is the only shape a durable point lookup may address with one
+// value.
+func (s *Schema) IsSingleColumnPrimaryKey() bool {
+	return len(s.PrimaryKeyList()) == 1
+}
+
+// IsPrimaryKeyColumn reports whether name is one of the primary-key columns.
+func (s *Schema) IsPrimaryKeyColumn(name string) bool {
+	for _, column := range s.PrimaryKeyList() {
+		if strings.EqualFold(column, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// PrimaryKeyMatches reports whether columns is the complete primary-key column
+// list in declaration order.
+func (s *Schema) PrimaryKeyMatches(columns []string) bool {
+	primary := s.PrimaryKeyList()
+	if len(primary) != len(columns) {
+		return false
+	}
+	for i := range primary {
+		if !strings.EqualFold(primary[i], columns[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// PrimaryKeyForRow returns the row's primary key encoded the way the table's
+// durable row keys encode it. A single-column key keeps the historical
+// "<value>" form, so existing databases are read and written unchanged. A
+// composite key length-prefixes each component ("<len>:<value>" repeated), a
+// prefix-free encoding, so ("ab","c") and ("a","bc") cannot collide. A NULL or
+// missing component is a NOT NULL violation: no rowid is auto-assigned.
+func (s *Schema) PrimaryKeyForRow(row Row) (string, error) {
+	columns := s.PrimaryKeyList()
+	parts := make([]string, len(columns))
+	for i, column := range columns {
+		value, ok := rowColumnValue(row, column)
+		if !ok || value == nil {
+			return "", &NotNullViolationError{Table: s.Name, Column: column}
+		}
+		parts[i] = fmt.Sprintf("%v", value)
+	}
+	if len(parts) == 1 {
+		return parts[0], nil
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		b.WriteString(strconv.Itoa(len(part)))
+		b.WriteByte(':')
+		b.WriteString(part)
+	}
+	return b.String(), nil
 }
 
 // GetColumn returns a column by name.
@@ -781,6 +901,7 @@ func (m *SchemaManager) getSchemaLocked(name string) (*Schema, error) {
 	if err := json.Unmarshal([]byte(data), &schema); err != nil {
 		return nil, fmt.Errorf("failed to parse schema: %w", err)
 	}
+	schema.normalizePrimaryKey()
 
 	m.cache[strings.ToLower(name)] = &schema
 	return &schema, nil
@@ -1265,7 +1386,7 @@ func (m *SchemaManager) DropColumn(table, columnName string) error {
 	}
 
 	// Cannot drop primary key column
-	if strings.EqualFold(schema.PrimaryKey, columnName) {
+	if schema.IsPrimaryKeyColumn(columnName) {
 		return fmt.Errorf("cannot drop primary key column: %s", columnName)
 	}
 
@@ -1596,7 +1717,13 @@ func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 			schema.Columns[i].Name = newName
 			found = true
 
-			// Update primary key reference if needed
+			// Update primary key references if needed. Renaming keeps the column
+			// order, so a composite key's encoding is unchanged.
+			for i, pkColumn := range schema.PrimaryKeyColumns {
+				if strings.EqualFold(pkColumn, oldName) {
+					schema.PrimaryKeyColumns[i] = newName
+				}
+			}
 			if strings.EqualFold(schema.PrimaryKey, oldName) {
 				schema.PrimaryKey = newName
 			}
@@ -1840,6 +1967,7 @@ func (m *SchemaManager) getSchemaUnsafe(table string) (*Schema, error) {
 	if err := json.Unmarshal([]byte(data), &schema); err != nil {
 		return nil, err
 	}
+	schema.normalizePrimaryKey()
 
 	m.cache[tableLower] = &schema
 	return &schema, nil

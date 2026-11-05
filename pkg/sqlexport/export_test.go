@@ -45,3 +45,37 @@ func TestExportPreservesDefaultExpression(t *testing.T) {
 		t.Fatalf("dump lost the default expression:\n%s", dump)
 	}
 }
+
+// A composite key must be dumped as one table-level constraint; emitting an
+// inline PRIMARY KEY on each key column would describe two keys.
+func TestExportCompositePrimaryKey(t *testing.T) {
+	kv := testkv.New(t)
+	pool := kv.Pool(4)
+	t.Cleanup(func() { pool.Close() })
+
+	schemaManager := storage.NewSchemaManager(pool, "testdb")
+	tableManager := storage.NewTableManager(pool, schemaManager, "testdb")
+
+	if err := schemaManager.CreateTable(&storage.Schema{
+		Name:              "pairs",
+		PrimaryKeyColumns: []string{"a", "b"},
+		Columns: []storage.Column{
+			{Name: "a", Type: "TEXT", Nullable: false},
+			{Name: "b", Type: "TEXT", Nullable: false},
+			{Name: "v", Type: "TEXT", Nullable: true},
+		},
+	}); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	dump, err := ExportDatabase(schemaManager, tableManager, ExportOptions{Tables: []string{"pairs"}})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if got := strings.Count(dump, "PRIMARY KEY"); got != 1 {
+		t.Fatalf("dump has %d PRIMARY KEY clauses, want 1:\n%s", got, dump)
+	}
+	if !strings.Contains(dump, "PRIMARY KEY (a, b)") {
+		t.Fatalf("dump lost the composite key:\n%s", dump)
+	}
+}
