@@ -62,13 +62,19 @@ func nextBackendPID() int32 {
 }
 
 type preparedStatement struct {
-	query     string
+	query string
+	// paramOIDs is the negotiated parameter type list: the client's non-zero
+	// Parse OIDs plus inferred types for the zeros. Describe reports it and
+	// Bind decodes with it.
 	paramOIDs []int32
 }
 
 type portal struct {
 	query    string
 	executed bool
+	// paramOIDs copies the bound statement's negotiated types so Describe
+	// (Portal) reports the same ParameterDescription as Describe (Statement).
+	paramOIDs []int32
 }
 
 // NewConnection creates a new connection handler
@@ -532,7 +538,7 @@ func (c *Connection) handleParse(msg *Message) error {
 	if !isSingleStatementSQL(query) {
 		return c.failExtended(ErrCodeSyntaxError, fmt.Errorf("prepared statements must contain one command"))
 	}
-	c.statements[name] = &preparedStatement{query: query, paramOIDs: oids}
+	c.statements[name] = &preparedStatement{query: query, paramOIDs: c.negotiateParameterOIDs(query, oids)}
 	return c.writeMessage(MsgParseComplete, nil)
 }
 
@@ -614,7 +620,7 @@ func (c *Connection) handleBind(msg *Message) error {
 		}
 		return c.failExtended(code, err)
 	}
-	c.portals[portalName] = &portal{query: query}
+	c.portals[portalName] = &portal{query: query, paramOIDs: append([]int32(nil), statement.paramOIDs...)}
 	return c.writeMessage(MsgBindComplete, nil)
 }
 
@@ -635,17 +641,16 @@ func (c *Connection) handleDescribe(msg *Message) error {
 		if !ok {
 			return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("prepared statement %q does not exist", name))
 		}
-		mb := NewMessageBuilder()
-		mb.WriteInt16(int16(len(statement.paramOIDs)))
-		for _, oid := range statement.paramOIDs {
-			mb.WriteInt32(oid)
-		}
-		if err := c.writeMessage(MsgParameterDescription, mb.Bytes()); err != nil {
+		if err := c.sendParameterDescription(statement.paramOIDs); err != nil {
 			return err
 		}
 	case 'P':
-		if _, ok := c.portals[name]; !ok {
+		portal, ok := c.portals[name]
+		if !ok {
 			return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("portal %q does not exist", name))
+		}
+		if err := c.sendParameterDescription(portal.paramOIDs); err != nil {
+			return err
 		}
 	default:
 		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Describe target"))
@@ -1110,70 +1115,20 @@ func parameterFormat(formats []int16, index int) int16 {
 
 func bindQuery(query string, params []boundParameter) (string, error) {
 	var result strings.Builder
-	var quote byte
-	for i := 0; i < len(query); {
-		ch := query[i]
-		if quote != 0 {
-			result.WriteByte(ch)
-			i++
-			if ch == quote {
-				if i < len(query) && query[i] == quote {
-					result.WriteByte(query[i])
-					i++
-				} else {
-					quote = 0
-				}
-			}
-			continue
+	last := 0
+	for _, reference := range scanParameters(query) {
+		result.WriteString(query[last:reference.start])
+		if reference.number < 1 || reference.number > len(params) {
+			return "", fmt.Errorf("parameter %s was not provided", query[reference.start:reference.end])
 		}
-		if i+1 < len(query) && ch == '-' && query[i+1] == '-' {
-			end := strings.IndexByte(query[i:], '\n')
-			if end < 0 {
-				result.WriteString(query[i:])
-				break
-			}
-			result.WriteString(query[i : i+end+1])
-			i += end + 1
-			continue
+		literal, err := parameterLiteral(params[reference.number-1])
+		if err != nil {
+			return "", fmt.Errorf("parameter $%d: %w", reference.number, err)
 		}
-		if i+1 < len(query) && ch == '/' && query[i+1] == '*' {
-			end := strings.Index(query[i+2:], "*/")
-			if end < 0 {
-				result.WriteString(query[i:])
-				break
-			}
-			result.WriteString(query[i : i+end+4])
-			i += end + 4
-			continue
-		}
-		// Only string literals and quoted identifiers are skipped. Brackets are
-		// not a quoted region: a subscript such as tags[$1] must bind $1.
-		if ch == '\'' || ch == '"' || ch == '`' {
-			quote = ch
-			result.WriteByte(ch)
-			i++
-			continue
-		}
-		if ch == '$' && i+1 < len(query) && query[i+1] >= '0' && query[i+1] <= '9' {
-			end := i + 1
-			for end < len(query) && query[end] >= '0' && query[end] <= '9' {
-				end++
-			}
-			n, err := strconv.Atoi(query[i+1 : end])
-			if err != nil || n < 1 || n > len(params) {
-				return "", fmt.Errorf("parameter %s was not provided", query[i:end])
-			}
-			literal, err := parameterLiteral(params[n-1])
-			if err != nil {
-				return "", fmt.Errorf("parameter $%d: %w", n, err)
-			}
-			result.WriteString(literal)
-			i = end
-			continue
-		}
-		result.WriteByte(ch)
-		i++
+		result.WriteString(literal)
+		last = reference.end
 	}
+	result.WriteString(query[last:])
 	return result.String(), nil
 }
 
@@ -1182,8 +1137,8 @@ func parameterLiteral(param boundParameter) (string, error) {
 		return "NULL", nil
 	}
 	if param.format == 1 {
-		if _, isArray := arrayParamElementType(param.oid); isArray {
-			return "", fmt.Errorf("%w: binary array parameter format for OID %d; send arrays in text format", pgerror.ErrFeatureNotSupported, param.oid)
+		if element, isArray := arrayParamElementType(param.oid); isArray {
+			return binaryArrayLiteral(element, param.value)
 		}
 		if param.oid == 3802 {
 			// PostgreSQL's binary jsonb format is a version byte followed by the
@@ -1201,6 +1156,10 @@ func parameterLiteral(param boundParameter) (string, error) {
 			return "'" + strings.ReplaceAll(canonical, "'", "''") + "'::jsonb", nil
 		}
 		switch param.oid {
+		case 700, 701:
+			return binaryFloatText(param.oid, param.value)
+		case 1700:
+			return binaryNumericText(param.value)
 		case 16:
 			if len(param.value) != 1 {
 				return "", fmt.Errorf("invalid binary boolean")
@@ -1453,6 +1412,17 @@ func (c *Connection) sendReadyForQuery() error {
 // sendEmptyQueryResponse sends empty query response
 func (c *Connection) sendEmptyQueryResponse() error {
 	return c.writeMessage(MsgEmptyQueryResponse, []byte{})
+}
+
+// sendParameterDescription reports the negotiated parameter types of a
+// prepared statement or a bound portal.
+func (c *Connection) sendParameterDescription(oids []int32) error {
+	mb := NewMessageBuilder()
+	mb.WriteInt16(int16(len(oids)))
+	for _, oid := range oids {
+		mb.WriteInt32(oid)
+	}
+	return c.writeMessage(MsgParameterDescription, mb.Bytes())
 }
 
 // sendRowDescription sends row description (column metadata)

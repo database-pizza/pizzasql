@@ -209,10 +209,10 @@ func TestArraysAreAdvertised(t *testing.T) {
 	if !params.Supported {
 		t.Fatalf("parameters.arrays = %+v, want supported", params)
 	}
-	if params.Status != "text_format" {
-		t.Fatalf("parameters.arrays status = %q, want text_format", params.Status)
+	if params.Status != "text_and_binary" {
+		t.Fatalf("parameters.arrays status = %q, want text_and_binary", params.Status)
 	}
-	for _, want := range []string{"1009", "1007", "1016", "1000", "1022", "1021", "1231", "1015", "0A000"} {
+	for _, want := range []string{"1009", "1007", "1016", "1000", "1022", "1021", "1231", "1015", "0A000", "binary", "22P02"} {
 		if !strings.Contains(params.Notes, want) {
 			t.Errorf("parameters.arrays notes do not mention %q", want)
 		}

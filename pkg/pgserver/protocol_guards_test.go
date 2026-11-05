@@ -177,7 +177,7 @@ func TestTypicalExtendedSequenceWithDescribeSucceeds(t *testing.T) {
 			row = dataRowValues(t, message)
 		}
 	}
-	if string(types) != "12nTDCZ" {
+	if string(types) != "12tnTDCZ" {
 		t.Fatalf("message sequence = %q", types)
 	}
 	if len(row) != 1 || row[0] != "7" {
