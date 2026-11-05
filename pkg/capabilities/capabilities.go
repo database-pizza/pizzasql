@@ -170,7 +170,7 @@ func Current() *Document {
 			PrimaryKey:    Feature{Supported: true, Status: "enforced", SQLState: "23505", Notes: "single-column only"},
 			CompositePK:   Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "declare a single-column primary key"},
 			ForeignKey:    Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level FOREIGN KEY are rejected; enforce referential integrity in the application, cascades are not implemented"},
-			Check:         Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "inline and table-level CHECK are rejected; enforce the rule in the application"},
+			Check:         Feature{Supported: true, Status: "enforced", SQLState: "23514", Notes: "inline and table-level CHECK are evaluated on INSERT, multi-row INSERT, UPDATE, and ON CONFLICT DO UPDATE; NULL/unknown results pass; predicates are restricted to deterministic, subquery-free expressions over unqualified columns; exposed in sqlite_master/sqlite_schema table SQL only (pg_constraint and information_schema.check_constraints are not emulated)"},
 			DefaultValues: Feature{Supported: true, Status: "constant_only", SQLState: "0A000", Notes: "non-constant defaults (CURRENT_TIMESTAMP, function calls) are rejected instead of being frozen at DDL time"},
 		},
 
@@ -224,6 +224,7 @@ func Current() *Document {
 		ErrorCodes: map[string]string{
 			"23502": "not_null_violation",
 			"23505": "unique_violation",
+			"23514": "check_violation",
 			"40001": "serialization_failure",
 			"0A000": "feature_not_supported",
 			"42501": "insufficient_privilege (managed proxy)",

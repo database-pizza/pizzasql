@@ -446,6 +446,15 @@ func sqlStateHTTPError(err error) *HTTPError {
 			Message: message,
 		}
 	}
+	if strings.HasPrefix(message, "CHECK constraint failed: ") {
+		constraint := strings.TrimPrefix(message, "CHECK constraint failed: ")
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    "23514",
+			Message: message,
+			Details: map[string]interface{}{"constraint": constraint},
+		}
+	}
 	if errors.Is(err, storage.ErrSerialization) {
 		return &HTTPError{
 			Status:  http.StatusConflict,

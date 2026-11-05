@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
@@ -67,5 +68,25 @@ func TestAddColumnBackfillIsAdvertised(t *testing.T) {
 	}
 	if doc.DDL.AddColumn.Status == "metadata_only" {
 		t.Fatalf("add_column status = %q, but a constant DEFAULT rewrites rows", doc.DDL.AddColumn.Status)
+	}
+}
+
+func TestCheckConstraintIsAdvertised(t *testing.T) {
+	doc := Current()
+	check := doc.Constraints.Check
+	if !check.Supported {
+		t.Fatalf("check = %+v, want supported", check)
+	}
+	if check.Status != "enforced" {
+		t.Fatalf("check status = %q, want enforced", check.Status)
+	}
+	if check.SQLState != pgerror.CodeCheckViolation {
+		t.Fatalf("check SQLSTATE = %q, want %q", check.SQLState, pgerror.CodeCheckViolation)
+	}
+	if check.Notes == "" {
+		t.Fatal("check notes must describe the enforcement surface")
+	}
+	if got := doc.ErrorCodes[pgerror.CodeCheckViolation]; got != "check_violation" {
+		t.Fatalf("23514 mapping = %q, want check_violation", got)
 	}
 }

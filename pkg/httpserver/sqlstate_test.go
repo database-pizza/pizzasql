@@ -46,6 +46,31 @@ func TestHTTPUniqueViolationReturns23505(t *testing.T) {
 	}
 }
 
+func TestHTTPCheckViolationReturns23514(t *testing.T) {
+	server := setupKVTestServer(t)
+	queryHTTP(t, server, "CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER, CONSTRAINT positive_age CHECK (age > 0))")
+
+	body, _ := json.Marshal(QueryRequest{SQL: "INSERT INTO t (id, age) VALUES (1, -1)"})
+	r := httptest.NewRequest(http.MethodPost, "/query", strings.NewReader(string(body)))
+	w := httptest.NewRecorder()
+	server.handleQuery(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body %s", w.Code, w.Body.String())
+	}
+	var resp httpErrorBody
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Error.Code != "23514" {
+		t.Fatalf("code = %q, want 23514", resp.Error.Code)
+	}
+	constraint, _ := resp.Error.Details["constraint"].(string)
+	if constraint != "positive_age" {
+		t.Fatalf("details.constraint = %q, want positive_age", constraint)
+	}
+}
+
 func TestSQLStateHTTPErrorMapping(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -55,6 +80,7 @@ func TestSQLStateHTTPErrorMapping(t *testing.T) {
 	}{
 		{"unique", fmt.Errorf("UNIQUE constraint failed: uniq_users_email"), http.StatusConflict, "23505"},
 		{"not null", fmt.Errorf("NOT NULL constraint failed: t.v"), http.StatusBadRequest, "23502"},
+		{"check", fmt.Errorf("CHECK constraint failed: positive_age"), http.StatusBadRequest, "23514"},
 		{"serialization", fmt.Errorf("commit: %w", storage.ErrSerialization), http.StatusConflict, "40001"},
 		{"unsupported", fmt.Errorf("feature not supported: DEFAULT is not constant"), http.StatusBadRequest, "0A000"},
 		{"other", errors.New("boom"), http.StatusInternalServerError, "EXECUTION_ERROR"},

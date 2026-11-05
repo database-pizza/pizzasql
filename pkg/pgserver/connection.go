@@ -413,11 +413,17 @@ func (c *Connection) handleQuery(msg *Message) error {
 			var primaryKeyErr *storage.PrimaryKeyViolationError
 			var uniqueErr *storage.UniqueViolationError
 			var notNullErr *storage.NotNullViolationError
+			var checkErr *storage.CheckViolationError
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
 			} else if errors.As(err, &notNullErr) {
 				code = "23502"
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if errors.As(err, &checkErr) {
+				code = ErrCodeCheckViolation
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
@@ -656,11 +662,17 @@ func (c *Connection) handleExecute(msg *Message) error {
 		var primaryKeyErr *storage.PrimaryKeyViolationError
 		var uniqueErr *storage.UniqueViolationError
 		var notNullErr *storage.NotNullViolationError
+		var checkErr *storage.CheckViolationError
 		if errors.Is(err, storage.ErrSerialization) {
 			code = ErrCodeSerializationFailure
 			c.txStatus = TxStatusIdle
 		} else if errors.As(err, &notNullErr) {
 			code = "23502"
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+		} else if errors.As(err, &checkErr) {
+			code = ErrCodeCheckViolation
 			if c.txStatus == TxStatusInBlock {
 				c.txStatus = TxStatusFailed
 			}
