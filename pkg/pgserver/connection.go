@@ -1077,7 +1077,12 @@ func bindQuery(query string, params []boundParameter) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parameter $%d: %w", reference.number, err)
 		}
+		// Mark substituted parameters so result-type inference does not treat
+		// them as user-written constants. A cast over a parameter must keep the
+		// carrier type instead of narrowing to the literal's width.
+		result.WriteString("pizzasql_param(")
 		result.WriteString(literal)
+		result.WriteString(")")
 		last = reference.end
 	}
 	result.WriteString(query[last:])

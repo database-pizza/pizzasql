@@ -272,6 +272,7 @@ var builtinFunctions = map[string]FunctionSignature{
 	// SQLite specific
 	"SQLITE_VERSION":   {Name: "SQLITE_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
 	"PIZZASQL_VERSION": {Name: "PIZZASQL_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
+	"PIZZASQL_PARAM":   {Name: "PIZZASQL_PARAM", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
 	"PG_BACKEND_PID":   {Name: "PG_BACKEND_PID", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
 	"VERSION":          {Name: "VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
 

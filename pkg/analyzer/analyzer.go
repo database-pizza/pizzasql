@@ -1346,7 +1346,7 @@ func (a *Analyzer) analyzeFunctionCall(e *parser.FunctionCall) (*ExprInfo, error
 // first argument rather than a fixed signature type.
 func isPolymorphicFunction(name string) bool {
 	switch strings.ToUpper(name) {
-	case "MIN", "MAX", "COALESCE", "IFNULL", "NVL", "NULLIF", "IIF":
+	case "MIN", "MAX", "COALESCE", "IFNULL", "NVL", "NULLIF", "IIF", "PIZZASQL_PARAM":
 		return true
 	}
 	return false

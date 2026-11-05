@@ -6174,6 +6174,15 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		args[i] = val
 	}
 
+	if name == "PIZZASQL_PARAM" {
+		// Internal marker for a bound parameter: it returns its argument
+		// unchanged so casts over parameters stay on the carrier type.
+		if len(args) != 1 {
+			return nil, fmt.Errorf("pizzasql_param expects exactly one argument")
+		}
+		return args[0], nil
+	}
+
 	// Native jsonb functions and JSON1 scalar functions are dispatched
 	// separately to keep this switch tidy.
 	if val, handled, err := e.evalJSONBFunction(name, fn, args); handled {

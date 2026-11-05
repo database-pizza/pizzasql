@@ -7,12 +7,12 @@ import (
 
 func TestBindQuerySkipsCommentsAndQuotedRegions(t *testing.T) {
 	for _, tc := range []struct{ query, want string }{
-		{"SELECT $1 /* ' $99 */ + $2", "SELECT 1 /* ' $99 */ + 2"},
-		{"SELECT $1 -- '$99\n + $2", "SELECT 1 -- '$99\n + 2"},
-		{"SELECT $1 -- $99", "SELECT 1 -- $99"},
+		{"SELECT $1 /* ' $99 */ + $2", "SELECT pizzasql_param(1) /* ' $99 */ + pizzasql_param(2)"},
+		{"SELECT $1 -- '$99\n + $2", "SELECT pizzasql_param(1) -- '$99\n + pizzasql_param(2)"},
+		{"SELECT $1 -- $99", "SELECT pizzasql_param(1) -- $99"},
 		// Brackets are not a quoted region: a subscript such as tags[$1] binds.
-		{"SELECT '$99''$88', \"$77\", `$66`, tags[$1]", "SELECT '$99''$88', \"$77\", `$66`, tags[1]"},
-		{"SELECT '$1 /* no comment */', $2", "SELECT '$1 /* no comment */', 2"},
+		{"SELECT '$99''$88', \"$77\", `$66`, tags[$1]", "SELECT '$99''$88', \"$77\", `$66`, tags[pizzasql_param(1)]"},
+		{"SELECT '$1 /* no comment */', $2", "SELECT '$1 /* no comment */', pizzasql_param(2)"},
 	} {
 		got, err := bindQuery(tc.query, []boundParameter{{value: []byte("1")}, {value: []byte("2")}})
 		if err != nil || got != tc.want {

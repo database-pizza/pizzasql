@@ -568,6 +568,11 @@ func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) str
 		return "REGCLASS"
 	case "TO_REGTYPE":
 		return "REGTYPE"
+	case "PIZZASQL_PARAM":
+		// Internal marker for a bound parameter. It returns its argument
+		// unchanged, and reporting the carrier type keeps cast metadata
+		// independent of the bound value.
+		return firstArgType(fn, resolve)
 	default:
 		return "TEXT"
 	}
