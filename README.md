@@ -527,6 +527,15 @@ no partial statement effects; in an explicit transaction, earlier successful
 statements remain staged. Mutations exceeding a single storage transaction's
 limits fail rather than being split into independently committed chunks.
 
+DDL is transactional as well: inside an explicit transaction, `CREATE TABLE`,
+`DROP TABLE`, `ALTER TABLE` (add/drop/rename column, rename table), and
+`CREATE`/`DROP INDEX` are staged. The issuing session sees them immediately,
+other sessions keep reading the committed catalog, `ROLLBACK` restores the prior
+schema and rows, and `COMMIT` publishes the whole migration in the same atomic
+batch as the transaction's rows. A statement that fails leaves the transaction's
+earlier DDL intact, and DDL that conflicts with a concurrently committed DDL
+fails with a serialization error. Autocommit DDL is unchanged.
+
 Simple autocommit scans with a literal non-negative `LIMIT`/`OFFSET` can stop
 after enough matching rows. Queries requiring sorting, grouping, DISTINCT,
 windows, subquery projections, or explicit-transaction overlay validation keep

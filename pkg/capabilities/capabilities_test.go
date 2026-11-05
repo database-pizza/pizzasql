@@ -59,6 +59,16 @@ func TestJSONArrowOperatorsAreAdvertised(t *testing.T) {
 	}
 }
 
+func TestTransactionalDDLIsAdvertised(t *testing.T) {
+	ddl := Current().DDL
+	if !ddl.Transactional.Supported {
+		t.Fatalf("transactional DDL = %+v, want supported", ddl.Transactional)
+	}
+	if ddl.Transactional.Status != "staged_until_commit" {
+		t.Fatalf("transactional DDL status = %q, want staged_until_commit", ddl.Transactional.Status)
+	}
+}
+
 func TestAddColumnBackfillIsAdvertised(t *testing.T) {
 	doc := Current()
 	if !doc.DDL.AddColumnBackfill.Supported {

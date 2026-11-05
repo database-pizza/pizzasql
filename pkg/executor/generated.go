@@ -82,7 +82,7 @@ func (e *Executor) ensureGeneratedRowID(tableName string, schema *storage.Schema
 	if !ok || !isIntegerColumnType(pkCol.Type) {
 		return nil
 	}
-	id, err := e.schema.GetNextRowID(tableName)
+	id, err := e.session.GetNextRowID(tableName)
 	if err != nil {
 		return err
 	}
@@ -124,7 +124,7 @@ func (e *Executor) insertConflictMatchers(tableName string, schema *storage.Sche
 	if stmtReplace {
 		matchers = append(matchers, conflictMatcher{primaryKey: true})
 	}
-	indexes, err := e.schema.ListTableIndexes(tableName)
+	indexes, err := e.session.ListTableIndexes(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +180,7 @@ func (e *Executor) matcherConflicts(tableName string, schema *storage.Schema, m 
 // not just the primary key.
 func (e *Executor) hasAnyInsertConflict(tableName string, schema *storage.Schema, candidate storage.Row) (bool, error) {
 	matchers := []conflictMatcher{{primaryKey: true}}
-	indexes, err := e.schema.ListTableIndexes(tableName)
+	indexes, err := e.session.ListTableIndexes(tableName)
 	if err != nil {
 		return false, err
 	}

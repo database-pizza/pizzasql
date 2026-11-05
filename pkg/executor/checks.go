@@ -112,7 +112,7 @@ func schemaWithColumn(schema *storage.Schema, column storage.Column) *storage.Sc
 // cannot rewrite them; leaving the old identifier behind would make the
 // constraint evaluate to NULL and silently stop enforcing it.
 func (e *Executor) rejectCheckColumnChange(table, column, action string) error {
-	schema, err := e.schema.GetSchema(table)
+	schema, err := e.session.GetSchema(table)
 	if err != nil {
 		return err
 	}

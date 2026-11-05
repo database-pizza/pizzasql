@@ -344,6 +344,79 @@ func (m *SchemaManager) rowIDKey(table string) string {
 	return fmt.Sprintf("%s:_sys:rowid:%s", m.database, strings.ToLower(table))
 }
 
+// readDurable reads a catalog key straight from durable storage, bypassing the
+// in-memory caches, and reports the LSN the store observed it at. Transactional
+// DDL uses it so a staged catalog change is pinned to the exact durable version
+// it was derived from, and a concurrent committed DDL fails the commit instead
+// of being silently overwritten.
+func (m *SchemaManager) readDurable(key string) (value string, lsn uint64, found bool, err error) {
+	err = m.pool.WithClient(func(c *KVClient) error {
+		var rerr error
+		value, lsn, found, rerr = c.ReadWithLSN(key)
+		return rerr
+	})
+	return value, lsn, found, err
+}
+
+// catalogTablesDurable returns the committed table catalog and its LSN.
+func (m *SchemaManager) catalogTablesDurable() ([]string, uint64, error) {
+	data, lsn, found, err := m.readDurable(m.catalogKey())
+	if err != nil {
+		return nil, 0, err
+	}
+	if !found {
+		return nil, lsn, nil
+	}
+	var tables []string
+	if err := json.Unmarshal([]byte(data), &tables); err != nil {
+		return nil, 0, fmt.Errorf("failed to parse catalog: %w", err)
+	}
+	return tables, lsn, nil
+}
+
+// indexListDurable returns the committed index catalog and its LSN.
+func (m *SchemaManager) indexListDurable() ([]string, uint64, error) {
+	data, lsn, found, err := m.readDurable(m.indexListKey())
+	if err != nil {
+		return nil, 0, err
+	}
+	if !found {
+		return nil, lsn, nil
+	}
+	var indexes []string
+	if err := json.Unmarshal([]byte(data), &indexes); err != nil {
+		return nil, 0, fmt.Errorf("failed to parse index list: %w", err)
+	}
+	return indexes, lsn, nil
+}
+
+// invalidateCommittedDDL publishes a committed transactional DDL change to
+// readers: every cache derived from the catalog is dropped and the version is
+// bumped so the foreign-key metadata and session analyzers reload. The caches
+// are rebuilt lazily from the durable catalog, which the commit already wrote.
+//
+// Only the touched tables lose their ROWID allocator. Wiping every allocator
+// would let a concurrent transaction that staged a TEXT/composite-key insert
+// (whose ROWID is not durable yet) derive the same ROWID again and publish a
+// duplicate, so untouched tables keep their derived counters.
+func (m *SchemaManager) invalidateCommittedDDL(tables []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cache = make(map[string]*Schema)
+	m.indexCache = make(map[string]*Index)
+	m.indexListCache = nil
+	m.indexListCached = false
+	m.rowIDMu.Lock()
+	for _, table := range tables {
+		delete(m.rowIDAlloc, strings.ToLower(table))
+	}
+	m.rowIDMu.Unlock()
+	m.fkCatalogMu.Lock()
+	m.fkCatalog = nil
+	m.fkCatalogMu.Unlock()
+	m.bumpVersionLocked()
+}
+
 // CreateTable creates a new table.
 func (m *SchemaManager) CreateTable(schema *Schema) error {
 	m.mu.Lock()
@@ -1809,8 +1882,9 @@ func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 
 	// Publish the renamed schema before the index definitions: reads of the new
 	// column name resolve against rewritten rows as soon as the schema lands.
-	// Index DDL is not transactional (as elsewhere in this engine), so a failure
-	// here leaves stale index metadata for the caller to drop and recreate.
+	// Autocommit index DDL is not covered by this write, so a failure here leaves
+	// stale index metadata for the caller to drop and recreate; inside a
+	// transaction the whole statement is staged and published atomically.
 	if err := m.updateSchemaUnsafe(schema); err != nil {
 		return err
 	}

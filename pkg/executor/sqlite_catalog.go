@@ -72,14 +72,14 @@ func (e *Executor) sqliteCatalogSelect(stmt *parser.SelectStmt) (*Result, bool, 
 func (e *Executor) sqliteCatalogRows() ([]storage.Row, error) {
 	var rows []storage.Row
 
-	tables, err := e.schema.ListTables()
+	tables, err := e.session.ListTables()
 	if err != nil {
 		return nil, err
 	}
 	tableNames := append([]string(nil), tables...)
 	sort.Strings(tableNames)
 	for _, name := range tableNames {
-		schema, err := e.schema.GetSchema(name)
+		schema, err := e.session.GetSchema(name)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite_catalog: resolve table %q: %w", name, err)
 		}
@@ -92,14 +92,14 @@ func (e *Executor) sqliteCatalogRows() ([]storage.Row, error) {
 		})
 	}
 
-	indexes, err := e.schema.ListIndexes()
+	indexes, err := e.session.ListIndexes()
 	if err != nil {
 		return nil, err
 	}
 	indexNames := append([]string(nil), indexes...)
 	sort.Strings(indexNames)
 	for _, name := range indexNames {
-		idx, err := e.schema.GetIndex(name)
+		idx, err := e.session.GetIndex(name)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite_catalog: resolve index %q: %w", name, err)
 		}
@@ -219,7 +219,7 @@ func (e *Executor) pragmaIndexList(table string) (*Result, error) {
 	if table == "" {
 		return nil, fmt.Errorf("index_list requires a table name")
 	}
-	indexes, err := e.schema.ListTableIndexes(table)
+	indexes, err := e.session.ListTableIndexes(table)
 	if err != nil {
 		return nil, err
 	}
@@ -244,11 +244,11 @@ func (e *Executor) pragmaIndexInfo(name string) (*Result, error) {
 	if name == "" {
 		return nil, fmt.Errorf("index_info requires an index name")
 	}
-	idx, err := e.schema.GetIndex(name)
+	idx, err := e.session.GetIndex(name)
 	if err != nil {
 		return nil, err
 	}
-	schema, err := e.schema.GetSchema(idx.Table)
+	schema, err := e.session.GetSchema(idx.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +276,7 @@ func (e *Executor) pragmaTableXInfo(table string) (*Result, error) {
 	if table == "" {
 		return nil, fmt.Errorf("table_xinfo requires a table name")
 	}
-	schema, err := e.schema.GetSchema(table)
+	schema, err := e.session.GetSchema(table)
 	if err != nil {
 		return nil, err
 	}

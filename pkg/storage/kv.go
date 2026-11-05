@@ -739,6 +739,21 @@ func (c *KVClient) Read(key string) (string, error) {
 	return string(res.Value), nil
 }
 
+// ReadWithLSN reads a key together with the LSN the store observed it at. A
+// missing key reports found=false and LSN 0, which is exactly the compare value
+// a later CreateIfAbsent-style check needs. Transactional DDL uses it to pin
+// the catalog generation each staged record was derived from.
+func (c *KVClient) ReadWithLSN(key string) (value string, lsn uint64, found bool, err error) {
+	res, err := c.Get([]byte(key))
+	if err == ErrKeyNotFound {
+		return "", 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, err
+	}
+	return string(res.Value), res.LSN, true, nil
+}
+
 func (c *KVClient) Delete(key string) error {
 	_, err := c.Del([]byte(key))
 	return err

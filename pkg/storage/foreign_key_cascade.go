@@ -226,7 +226,7 @@ func (s *Session) stageCascadeDelete(table, key string, row Row, exp *cascadeExp
 // cascadeAfterDelete applies the ON DELETE actions triggered by removing row
 // from table.
 func (s *Session) cascadeAfterDelete(table string, row Row, exp *cascadeExpansion) error {
-	refs, err := s.schema.referencingForeignKeys(table)
+	refs, err := s.referencingForeignKeysLocked(table)
 	if err != nil {
 		return err
 	}
@@ -257,7 +257,7 @@ func (s *Session) cascadeAfterDelete(table string, row Row, exp *cascadeExpansio
 // the child's foreign-key columns and then propagate as an update, because those
 // columns can themselves be a key another table references.
 func (s *Session) applyDeleteAction(ref referencingForeignKey, child Row, action ReferentialAction, exp *cascadeExpansion) error {
-	schema, err := s.schema.GetSchema(ref.Table)
+	schema, err := s.getSchemaLocked(ref.Table)
 	if err != nil {
 		return err
 	}
@@ -305,7 +305,7 @@ func (s *Session) applySetAction(schema *Schema, fk ForeignKeyConstraint, child 
 // cascadeAfterUpdate applies the ON UPDATE actions triggered by changing a
 // parent row whose referenced key moved from oldRow to newRow.
 func (s *Session) cascadeAfterUpdate(table string, oldRow, newRow Row, exp *cascadeExpansion) error {
-	refs, err := s.schema.referencingForeignKeys(table)
+	refs, err := s.referencingForeignKeysLocked(table)
 	if err != nil {
 		return err
 	}
@@ -330,7 +330,7 @@ func (s *Session) cascadeAfterUpdate(table string, oldRow, newRow Row, exp *casc
 		if err != nil {
 			return err
 		}
-		childSchema, err := s.schema.GetSchema(ref.Table)
+		childSchema, err := s.getSchemaLocked(ref.Table)
 		if err != nil {
 			return err
 		}
@@ -372,7 +372,7 @@ func (s *Session) cascadeAfterUpdate(table string, oldRow, newRow Row, exp *casc
 // commit; FK and UNIQUE validity are validated against the transaction's final
 // state at commit.
 func (s *Session) stageCascadeUpdate(table string, oldRow, newRow Row, exp *cascadeExpansion) error {
-	schema, err := s.schema.GetSchema(table)
+	schema, err := s.getSchemaLocked(table)
 	if err != nil {
 		return err
 	}

@@ -25,6 +25,13 @@ func (m *TableManager) prepareUniqueRows(table string, entries map[string]*overl
 	if err != nil {
 		return nil, err
 	}
+	return m.prepareUniqueRowsWith(table, entries, indexes)
+}
+
+// prepareUniqueRowsWith is prepareUniqueRows against an explicit UNIQUE index
+// list, so a transaction validates its staged rows against the indexes it can
+// see rather than the committed catalog alone.
+func (m *TableManager) prepareUniqueRowsWith(table string, entries map[string]*overlayEntry, indexes []*Index) (uniqueCachePlan, error) {
 	if len(indexes) == 0 {
 		return nil, nil
 	}

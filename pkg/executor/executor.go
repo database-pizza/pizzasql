@@ -45,9 +45,9 @@ type Executor struct {
 	currentDatabase   string                         // current database alias (default is "main")
 
 	// Transaction state
-	inTransaction      bool
-	savepoints         []string // stack of savepoint names
-	savepointPositions []int    // session mutation-log positions for each savepoint
+	inTransaction   bool
+	savepoints      []string                    // stack of savepoint names
+	savepointStates []*storage.SessionSavepoint // full session state (rows and staged DDL) per savepoint
 
 	// LISTEN/NOTIFY state. The hub and subscriber are per database instance;
 	// listenOps and notifyQueue are staged until COMMIT so LISTEN and NOTIFY
@@ -163,9 +163,16 @@ func (e *Executor) NewSessionExecutor() *Executor {
 	return exec
 }
 
+// Session exposes the executor's catalog and row session. Protocol layers that
+// emulate system catalogs must read through it so their introspection observes
+// DDL staged by an open transaction, exactly like the SQL executor does.
+func (e *Executor) Session() *storage.Session {
+	return e.session
+}
+
 // SyncCatalog synchronizes the analyzer catalog with the storage schema.
 func (e *Executor) SyncCatalog() error {
-	tables, err := e.schema.ListTables()
+	tables, err := e.session.ListTables()
 	if err != nil {
 		return err
 	}
@@ -173,7 +180,7 @@ func (e *Executor) SyncCatalog() error {
 	storageTables := make(map[string]struct{}, len(tables))
 	for _, tableName := range tables {
 		storageTables[strings.ToUpper(tableName)] = struct{}{}
-		schema, err := e.schema.GetSchema(tableName)
+		schema, err := e.session.GetSchema(tableName)
 		if err != nil {
 			continue
 		}
@@ -190,7 +197,7 @@ func (e *Executor) SyncCatalog() error {
 		}
 	}
 
-	e.catalogVersion = e.schema.Version()
+	e.catalogVersion = e.session.Version()
 	return nil
 }
 
@@ -291,22 +298,39 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		}
 		return e.executeAtomicMutation(func() (*Result, error) { return e.executeDelete(s) })
 	case *parser.CreateTableStmt:
-		return e.executeCreateTable(s)
+		return e.executeDDL(func() (*Result, error) { return e.executeCreateTable(s) })
 	case *parser.DropTableStmt:
-		return e.executeDropTable(s)
+		return e.executeDDL(func() (*Result, error) { return e.executeDropTable(s) })
 	case *parser.CreateIndexStmt:
-		return e.executeCreateIndex(s)
+		return e.executeDDL(func() (*Result, error) { return e.executeCreateIndex(s) })
 	case *parser.DropIndexStmt:
-		return e.executeDropIndex(s)
+		return e.executeDDL(func() (*Result, error) { return e.executeDropIndex(s) })
 	case *parser.AlterTableStmt:
-		return e.executeAlterTable(s)
+		return e.executeDDL(func() (*Result, error) { return e.executeAlterTable(s) })
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", stmt)
 	}
 }
 
+// executeDDL runs a schema-changing statement with a statement savepoint. A
+// failing DDL statement discards every catalog and row effect it staged and
+// leaves the transaction's prior schema intact, whether or not a transaction is
+// open.
+func (e *Executor) executeDDL(apply func() (*Result, error)) (*Result, error) {
+	if !e.session.InTx() {
+		return apply()
+	}
+	savepoint := e.session.Savepoint()
+	result, err := apply()
+	if err != nil {
+		e.session.RollbackToSavepoint(savepoint)
+		_ = e.SyncCatalog()
+	}
+	return result, err
+}
+
 func (e *Executor) analyzeWithCatalogRetry(stmt parser.Statement) error {
-	if e.catalogVersion != e.schema.Version() {
+	if e.catalogVersion != e.session.Version() {
 		if err := e.SyncCatalog(); err != nil {
 			return err
 		}
@@ -447,7 +471,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return e.executeSelectFromSubquery(&modifiedStmt)
 	}
 
-	schema, err := e.schema.GetSchema(tableName)
+	schema, err := e.session.GetSchema(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -569,7 +593,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					}
 				} else {
 					// Look for an index on this column
-					indexes, _ := e.schema.ListTableIndexes(tableName)
+					indexes, _ := e.session.ListTableIndexes(tableName)
 					for _, idx := range indexes {
 						if len(idx.Columns) == 1 && strings.EqualFold(idx.Columns[0].Name, colName) {
 							rows, err = e.session.SelectByIndex(tableName, idx.Name, colValue)
@@ -727,7 +751,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			if alias == "" {
 				alias = tref.Name
 			}
-			sch, _ := e.schema.GetSchema(tref.Name)
+			sch, _ := e.session.GetSchema(tref.Name)
 			cols := map[string]bool{}
 			if sch != nil {
 				for _, c := range sch.Columns {
@@ -965,7 +989,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			if rerr != nil {
 				return nil, rerr
 			}
-			seedSchema, _ := e.schema.GetSchema(stmt.From[seed].Name)
+			seedSchema, _ := e.session.GetSchema(stmt.From[seed].Name)
 			for j := range seedRows {
 				normalizeRowBySchema(seedRows[j], seedSchema)
 				seedRows[j] = e.addTableAlias(seedRows[j], allTableInfos[seed].alias)
@@ -1007,7 +1031,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if rerr != nil {
 					return nil, rerr
 				}
-				nextSchema, _ := e.schema.GetSchema(stmt.From[nextC].Name)
+				nextSchema, _ := e.session.GetSchema(stmt.From[nextC].Name)
 				for j := range nextRows {
 					normalizeRowBySchema(nextRows[j], nextSchema)
 					nextRows[j] = e.addTableAlias(nextRows[j], allTableInfos[nextC].alias)
@@ -1092,7 +1116,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if err != nil {
 					return nil, err
 				}
-				firstSchema, _ := e.schema.GetSchema(stmt.From[first].Name)
+				firstSchema, _ := e.session.GetSchema(stmt.From[first].Name)
 				for i := range rows {
 					normalizeRowBySchema(rows[i], firstSchema)
 					rows[i] = e.addTableAlias(rows[i], allTableInfos[first].alias)
@@ -1118,7 +1142,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if rerr != nil {
 					return nil, rerr
 				}
-				rightSchema, _ := e.schema.GetSchema(stmt.From[idx].Name)
+				rightSchema, _ := e.session.GetSchema(stmt.From[idx].Name)
 				for j := range rightRows {
 					normalizeRowBySchema(rightRows[j], rightSchema)
 					rightRows[j] = e.addTableAlias(rightRows[j], ti.alias)
@@ -1190,7 +1214,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if rightAlias == "" {
 					rightAlias = rightRef.Name
 				}
-				rightSchema, _ := e.schema.GetSchema(rightRef.Name)
+				rightSchema, _ := e.session.GetSchema(rightRef.Name)
 				for j := range rightRows {
 					normalizeRowBySchema(rightRows[j], rightSchema)
 					rightRows[j] = e.addTableAlias(rightRows[j], rightAlias)
@@ -1281,7 +1305,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if isMultiTable || hasJoin {
 					// For multi-table SELECT *, extract columns using qualified names
 					for _, tref := range allTableRefs {
-						sch, _ := e.schema.GetSchema(tref.Name)
+						sch, _ := e.session.GetSchema(tref.Name)
 						if sch != nil {
 							for _, c := range sch.Columns {
 								qualKey := tref.Alias + "." + c.Name
@@ -2100,7 +2124,7 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 		rightRows = cloneRows(cte.rows)
 		rightSchema = schemaFromColumns(cte.columns)
 	default:
-		rightSchema, err = e.schema.GetSchema(rightTable)
+		rightSchema, err = e.session.GetSchema(rightTable)
 		if err != nil {
 			return nil, err
 		}
@@ -2416,7 +2440,7 @@ func makeNullRow(rightRows []storage.Row, rightTable string, e *Executor) storag
 			nullRight[k] = nil
 		}
 	} else {
-		rightSchema, err := e.schema.GetSchema(rightTable)
+		rightSchema, err := e.session.GetSchema(rightTable)
 		if err == nil {
 			for _, col := range rightSchema.Columns {
 				nullRight[col.Name] = nil
@@ -2519,7 +2543,7 @@ func (e *Executor) selectColumnNames(stmt *parser.SelectStmt, schema *storage.Sc
 		case col.Star:
 			if multiTable || hasJoin {
 				for _, ref := range refs {
-					if refSchema, err := e.schema.GetSchema(ref.Name); err == nil {
+					if refSchema, err := e.session.GetSchema(ref.Name); err == nil {
 						for _, c := range refSchema.Columns {
 							names = append(names, c.Name)
 						}
@@ -2556,7 +2580,7 @@ func (e *Executor) resolveTableStar(from []parser.TableRef, qualifier string) ([
 	refs := collectAllTableRefs(from)
 	for _, ref := range refs {
 		if strings.EqualFold(ref.Alias, qualifier) {
-			sch, err := e.schema.GetSchema(ref.Name)
+			sch, err := e.session.GetSchema(ref.Name)
 			if err != nil {
 				return nil, "", err
 			}
@@ -2565,7 +2589,7 @@ func (e *Executor) resolveTableStar(from []parser.TableRef, qualifier string) ([
 	}
 	for _, ref := range refs {
 		if strings.EqualFold(ref.Name, qualifier) {
-			sch, err := e.schema.GetSchema(ref.Name)
+			sch, err := e.session.GetSchema(ref.Name)
 			if err != nil {
 				return nil, "", err
 			}
@@ -2638,7 +2662,7 @@ func (e *Executor) findConflictRow(table string, schema *storage.Schema, row sto
 		return found, true, nil
 	}
 
-	indexes, err := e.schema.ListTableIndexes(table)
+	indexes, err := e.session.ListTableIndexes(table)
 	if err != nil {
 		return nil, false, err
 	}
@@ -2742,7 +2766,7 @@ func (e *Executor) applyUpsert(table string, schema *storage.Schema, existing, r
 // executeInsert executes an INSERT statement.
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	tableName := stmt.Table.Name
-	schema, err := e.schema.GetSchema(tableName)
+	schema, err := e.session.GetSchema(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -3139,7 +3163,7 @@ func (e *Executor) isPointMutation(table string, where parser.Expr, assignments 
 	if !equality || !safePrimaryKeyLiteral(value) {
 		return false
 	}
-	schema, err := e.schema.GetSchema(table)
+	schema, err := e.session.GetSchema(table)
 	if err != nil || !schema.IsSingleColumnPrimaryKey() || !strings.EqualFold(column, schema.PrimaryKey) {
 		return false
 	}
@@ -3240,7 +3264,7 @@ func (e *Executor) primeSubqueries(expr parser.Expr) {
 // executeUpdate executes an UPDATE statement.
 func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	tableName := stmt.Table.Name
-	schema, err := e.schema.GetSchema(tableName)
+	schema, err := e.session.GetSchema(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -3638,7 +3662,7 @@ func (e *Executor) materializeFrom(from []parser.TableRef) ([]storage.Row, error
 // executeDelete executes a DELETE statement.
 func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	tableName := stmt.Table.Name
-	schema, err := e.schema.GetSchema(tableName)
+	schema, err := e.session.GetSchema(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -3704,7 +3728,7 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 // executeCreateTable executes a CREATE TABLE statement.
 func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, error) {
 	// Check if exists
-	if e.schema.TableExists(stmt.Table.Name) {
+	if e.session.TableExists(stmt.Table.Name) {
 		if stmt.IfNotExists {
 			result := NewResult("CREATE TABLE")
 			return result, nil
@@ -3890,7 +3914,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	}
 	schema.ForeignKeys = foreignKeys
 
-	if err := e.schema.CreateTable(schema); err != nil {
+	if err := e.session.CreateTable(schema); err != nil {
 		if stmt.IfNotExists && strings.Contains(err.Error(), "table already exists") {
 			return NewResult("CREATE TABLE"), nil
 		}
@@ -3898,14 +3922,16 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	}
 
 	// Register each materialized unique index. On failure, best-effort cleanup of
-	// the table and any indexes already created for it (DDL is not transactional).
+	// the table and any indexes already created for it; outside a transaction the
+	// statement's DDL is already durable, while inside one the statement savepoint
+	// discards it.
 	var created []*storage.Index
 	for _, idx := range uniqIndexes {
-		if err := e.schema.CreateIndex(idx); err != nil {
+		if err := e.session.CreateIndex(idx); err != nil {
 			for _, c := range created {
-				e.schema.DropIndex(c.Name)
+				e.session.DropIndex(c.Name)
 			}
-			e.schema.DropTable(stmt.Table.Name)
+			e.session.DropTable(stmt.Table.Name)
 			return nil, err
 		}
 		created = append(created, idx)
@@ -3993,7 +4019,7 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 	}
 
 	for _, tableRef := range stmt.Tables {
-		if !e.schema.TableExists(tableRef.Name) {
+		if !e.session.TableExists(tableRef.Name) {
 			if stmt.IfExists {
 				continue
 			}
@@ -4004,7 +4030,7 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 		}
 
 		// First, drop all indexes associated with this table
-		indexes, _ := e.schema.ListTableIndexes(tableRef.Name)
+		indexes, _ := e.session.ListTableIndexes(tableRef.Name)
 		for _, idx := range indexes {
 			// Clear index entries
 			columns := make([]string, len(idx.Columns))
@@ -4013,11 +4039,11 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 			}
 			e.session.ClearIndex(idx.Name, tableRef.Name, columns)
 			// Drop the index schema
-			e.schema.DropIndex(idx.Name)
+			e.session.DropIndex(idx.Name)
 		}
 
 		// DropTable removes durable rows and schema state together.
-		if err := e.schema.DropTable(tableRef.Name); err != nil {
+		if err := e.session.DropTable(tableRef.Name); err != nil {
 			return nil, err
 		}
 		e.session.InvalidateCache(tableRef.Name)
@@ -4034,7 +4060,7 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 // executeCreateIndex creates a new index.
 func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, error) {
 	// Check if index already exists
-	if e.schema.IndexExists(stmt.Name) {
+	if e.session.IndexExists(stmt.Name) {
 		if stmt.IfNotExists {
 			result := NewResult("CREATE INDEX")
 			return result, nil
@@ -4043,12 +4069,12 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 	}
 
 	// Verify table exists
-	if !e.schema.TableExists(stmt.Table) {
+	if !e.session.TableExists(stmt.Table) {
 		return nil, fmt.Errorf("table not found: %s", stmt.Table)
 	}
 
 	// Verify columns exist
-	schema, err := e.schema.GetSchema(stmt.Table)
+	schema, err := e.session.GetSchema(stmt.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -4090,23 +4116,14 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 		index.Columns = append(index.Columns, ic)
 	}
 
-	if stmt.Unique {
-		// Validate existing rows and register the index under the table's
-		// exclusive gate so no concurrent writer can insert a conflicting value
-		// between validation and registration.
-		if err := e.table.CreateUniqueIndex(index); err != nil {
-			if stmt.IfNotExists && strings.Contains(err.Error(), "index already exists") {
-				return NewResult("CREATE INDEX"), nil
-			}
-			return nil, err
+	// A UNIQUE index is validated against the rows this session observes (the
+	// autocommit path does so under the table's exclusive gate), and inside a
+	// transaction the definition is staged for the commit instead.
+	if err := e.session.CreateIndex(index); err != nil {
+		if stmt.IfNotExists && strings.Contains(err.Error(), "index already exists") {
+			return NewResult("CREATE INDEX"), nil
 		}
-	} else {
-		if err := e.schema.CreateIndex(index); err != nil {
-			if stmt.IfNotExists && strings.Contains(err.Error(), "index already exists") {
-				return NewResult("CREATE INDEX"), nil
-			}
-			return nil, err
-		}
+		return nil, err
 	}
 
 	// Build index entries for existing rows
@@ -4116,7 +4133,7 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 	}
 	if err := e.session.BuildIndex(stmt.Name, stmt.Table, columns); err != nil {
 		// Rollback index creation on failure
-		e.schema.DropIndex(stmt.Name)
+		e.session.DropIndex(stmt.Name)
 		return nil, fmt.Errorf("failed to build index: %w", err)
 	}
 
@@ -4126,7 +4143,7 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 
 // executeDropIndex drops an index.
 func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error) {
-	if !e.schema.IndexExists(stmt.Name) {
+	if !e.session.IndexExists(stmt.Name) {
 		if stmt.IfExists {
 			result := NewResult("DROP INDEX")
 			return result, nil
@@ -4135,7 +4152,7 @@ func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error)
 	}
 
 	// Get index info to clear entries
-	index, err := e.schema.GetIndex(stmt.Name)
+	index, err := e.session.GetIndex(stmt.Name)
 	if err == nil && index != nil {
 		columns := make([]string, len(index.Columns))
 		for i, col := range index.Columns {
@@ -4144,7 +4161,7 @@ func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error)
 		e.session.ClearIndex(stmt.Name, index.Table, columns)
 	}
 
-	if err := e.schema.DropIndex(stmt.Name); err != nil {
+	if err := e.session.DropIndex(stmt.Name); err != nil {
 		return nil, err
 	}
 
@@ -4190,7 +4207,7 @@ func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, erro
 	// For SELECT *, pull columns from the underlying table(s).
 	if hasStar && len(stmt.Select.From) > 0 {
 		baseName := stmt.Select.From[0].Name
-		if schema, err := e.schema.GetSchema(baseName); err == nil {
+		if schema, err := e.session.GetSchema(baseName); err == nil {
 			for _, c := range schema.Columns {
 				viewCols = append(viewCols, analyzer.ColumnInfo{
 					Name:      c.Name,
@@ -4250,7 +4267,7 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 // one is evaluated at a single instant sampled for the ALTER statement, so
 // validation and the backfill write the same CURRENT_TIMESTAMP value.
 func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddColumnAction) (*Result, error) {
-	schema, err := e.schema.GetSchema(table)
+	schema, err := e.session.GetSchema(table)
 	if err != nil {
 		return nil, err
 	}
@@ -4330,7 +4347,7 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 		return nil, err
 	}
 
-	if err := e.schema.AddColumn(table, col, checks, uniqueIndex); err != nil {
+	if err := e.session.AddColumn(table, col, checks, uniqueIndex); err != nil {
 		if action.IfNotExists && strings.Contains(err.Error(), "column already exists") {
 			return NewResult("ALTER TABLE"), nil
 		}
@@ -4354,7 +4371,7 @@ func (e *Executor) addColumnUniqueIndex(table, column string, constraint *parser
 		base = constraint.Name
 	}
 	name := base
-	for n := 2; e.schema.IndexExists(name); n++ {
+	for n := 2; e.session.IndexExists(name); n++ {
 		name = fmt.Sprintf("%s_%d", base, n)
 	}
 	index := &storage.Index{
@@ -4377,7 +4394,7 @@ func (e *Executor) executeAlterTableDropColumn(table string, action *parser.Drop
 	if err := e.rejectForeignKeyColumnChange(table, action.Column, "drop"); err != nil {
 		return nil, err
 	}
-	if err := e.schema.DropColumn(table, action.Column); err != nil {
+	if err := e.session.DropColumn(table, action.Column); err != nil {
 		return nil, err
 	}
 
@@ -4393,7 +4410,7 @@ func (e *Executor) executeAlterTableRename(table string, action *parser.RenameTa
 	if err := e.rejectForeignKeyTableRename(table); err != nil {
 		return nil, err
 	}
-	if err := e.schema.RenameTable(table, action.NewName); err != nil {
+	if err := e.session.RenameTable(table, action.NewName); err != nil {
 		return nil, err
 	}
 	e.session.InvalidateCache(table)
@@ -4417,7 +4434,7 @@ func (e *Executor) executeAlterTableRenameColumn(table string, action *parser.Re
 	if err := e.rejectForeignKeyColumnChange(table, action.OldName, "rename"); err != nil {
 		return nil, err
 	}
-	if err := e.schema.RenameColumn(table, action.OldName, action.NewName); err != nil {
+	if err := e.session.RenameColumn(table, action.OldName, action.NewName); err != nil {
 		return nil, err
 	}
 
@@ -4434,7 +4451,7 @@ func (e *Executor) executeAlterTableRenameColumn(table string, action *parser.Re
 // UNIQUE expression index, because its rows no longer resolve the referenced
 // column.
 func (e *Executor) rejectExpressionIndexRename(table, column string) error {
-	indexes, err := e.schema.ListTableIndexes(table)
+	indexes, err := e.session.ListTableIndexes(table)
 	if err != nil {
 		return err
 	}
@@ -4471,7 +4488,7 @@ func (e *Executor) executeBegin(stmt *parser.BeginStmt) (*Result, error) {
 	}
 	e.inTransaction = true
 	e.savepoints = nil
-	e.savepointPositions = nil
+	e.savepointStates = nil
 	e.clearNotificationState()
 
 	result := NewResult("BEGIN")
@@ -4488,14 +4505,14 @@ func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 	if err != nil {
 		e.inTransaction = false
 		e.savepoints = nil
-		e.savepointPositions = nil
+		e.savepointStates = nil
 		e.finishRollback()
 		return nil, err
 	}
 
 	e.inTransaction = false
 	e.savepoints = nil
-	e.savepointPositions = nil
+	e.savepointStates = nil
 	e.finishCommit(lsn)
 
 	result := NewResult("COMMIT")
@@ -4519,7 +4536,7 @@ func (e *Executor) executeRollback(stmt *parser.RollbackStmt) (*Result, error) {
 	}
 	e.inTransaction = false
 	e.savepoints = nil
-	e.savepointPositions = nil
+	e.savepointStates = nil
 	e.finishRollback()
 	// total_changes() is monotonic (SQLite semantics): it is NOT decremented on
 	// rollback. last_insert_rowid() and changes() also intentionally hold.
@@ -4537,13 +4554,13 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 		}
 		e.inTransaction = true
 		e.savepoints = nil
-		e.savepointPositions = nil
+		e.savepointStates = nil
 		e.clearNotificationState()
 	}
 
 	// Add savepoint marker
 	e.savepoints = append(e.savepoints, stmt.Name)
-	e.savepointPositions = append(e.savepointPositions, e.session.Snapshot())
+	e.savepointStates = append(e.savepointStates, e.session.Savepoint())
 	e.notificationSaves = append(e.notificationSaves, e.notificationSnapshot())
 
 	result := NewResult("SAVEPOINT")
@@ -4561,7 +4578,7 @@ func (e *Executor) executeRelease(stmt *parser.ReleaseStmt) (*Result, error) {
 	for i := len(e.savepoints) - 1; i >= 0; i-- {
 		if e.savepoints[i] == stmt.Name {
 			e.savepoints = e.savepoints[:i]
-			e.savepointPositions = e.savepointPositions[:i]
+			e.savepointStates = e.savepointStates[:i]
 			if i <= len(e.notificationSaves) {
 				e.notificationSaves = e.notificationSaves[:i]
 			}
@@ -4660,8 +4677,7 @@ func (e *Executor) rollbackToSavepoint(name string) (*Result, error) {
 		return nil, fmt.Errorf("no such savepoint: %s", name)
 	}
 
-	logPosition := e.savepointPositions[savepointIdx]
-	e.session.RollbackTo(logPosition)
+	e.session.RollbackToSavepoint(e.savepointStates[savepointIdx])
 	if savepointIdx < len(e.notificationSaves) {
 		e.rollbackNotificationsTo(e.notificationSaves[savepointIdx])
 		e.notificationSaves = e.notificationSaves[:savepointIdx+1]
@@ -4669,7 +4685,7 @@ func (e *Executor) rollbackToSavepoint(name string) (*Result, error) {
 
 	// Remove savepoints after the target
 	e.savepoints = e.savepoints[:savepointIdx+1]
-	e.savepointPositions = e.savepointPositions[:savepointIdx+1]
+	e.savepointStates = e.savepointStates[:savepointIdx+1]
 
 	result := NewResult("ROLLBACK")
 	return result, nil
@@ -4851,7 +4867,7 @@ func (e *Executor) pragmaTableInfo(tableName string) (*Result, error) {
 		return nil, fmt.Errorf("table_info requires a table name")
 	}
 
-	schema, err := e.schema.GetSchema(tableName)
+	schema, err := e.session.GetSchema(tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -4877,7 +4893,7 @@ func (e *Executor) pragmaTableInfo(tableName string) (*Result, error) {
 
 // pragmaTableList returns a list of all tables.
 func (e *Executor) pragmaTableList() (*Result, error) {
-	tables, err := e.schema.ListTables()
+	tables, err := e.session.ListTables()
 	if err != nil {
 		return nil, err
 	}
