@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
@@ -519,13 +520,68 @@ func TestNumericArrayPrecision(t *testing.T) {
 		t.Fatalf("numeric cast type = %q, want NUMERIC[]", res.ColumnTypes[0])
 	}
 
-	// Trailing zeros and big values compare against themselves exactly.
-	for _, sql := range []string{
-		`SELECT count(*) FROM t WHERE amounts = '{12345678901234567890,1.10,1e+3}'`,
-		`SELECT count(*) FROM t WHERE amounts @> '{1}'`,
+	// Whole-array equality is numeric-aware for NUMERIC[]: spelling differences
+	// (1.10 vs 1.1, 1e+3 vs 1000) compare equal, while a changed digit does not.
+	cases := []struct {
+		sql  string
+		want interface{}
+	}{
+		{`SELECT count(*) FROM t WHERE amounts = '{12345678901234567890,1.10,1e+3}'`, int64(1)},
+		{`SELECT count(*) FROM t WHERE amounts = '{12345678901234567890,1.1,1000}'`, int64(1)},
+		{`SELECT count(*) FROM t WHERE amounts = '{12345678901234567891,1.10,1e+3}'`, int64(0)},
+		{`SELECT count(*) FROM t WHERE amounts <> '{12345678901234567890,1.1,1000}'`, int64(0)},
+		{`SELECT amounts = '{12345678901234567890,1.1,1000}' FROM t`, true},
+		{`SELECT amounts IS DISTINCT FROM '{12345678901234567890,1.1,1000}' FROM t`, false},
+		{`SELECT '{1.10}'::NUMERIC[] = '{1.1}'::NUMERIC[]`, true},
+		{`SELECT '{1.10}'::NUMERIC[] <> '{1.1}'::NUMERIC[]`, false},
+		{`SELECT '{1.10,2.50}'::NUMERIC[] = '{1.1,2.5}'::NUMERIC[]`, true},
+		// Element comparison is exact too, so a float64 rounding cannot make two
+		// adjacent 20-digit values equal.
+		{`SELECT count(*) FROM t WHERE amounts[1] = '12345678901234567890'`, int64(1)},
+		{`SELECT count(*) FROM t WHERE amounts[1] = '12345678901234567891'`, int64(0)},
+		{`SELECT count(*) FROM t WHERE amounts[2] = '1.1'`, int64(1)},
+		{`SELECT count(*) FROM t WHERE amounts[2] = '1.10'`, int64(1)},
+		{`SELECT count(*) FROM t WHERE amounts[2] = ANY('{1.1}')`, int64(1)},
+		{`SELECT count(*) FROM t WHERE amounts[2] = ANY('{1.11}')`, int64(0)},
+		{`SELECT count(*) FROM t WHERE amounts IN ('{12345678901234567890,1.1,1000}')`, int64(1)},
+	}
+	for _, tc := range cases {
+		res := execMust(t, e, tc.sql)
+		if got := res.Rows[0][0]; got != tc.want {
+			t.Errorf("%s = %#v, want %#v", tc.sql, got, tc.want)
+		}
+	}
+}
+
+// NUMERIC element text is trimmed and a leading + is normalized; non-decimal
+// spellings ParseFloat would accept (hex, NaN, Inf) are rejected.
+func TestNumericArrayValidation(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	for _, tc := range []struct{ sql, want string }{
+		{`SELECT '{" 1.10 "}'::NUMERIC[]`, "{1.10}"},
+		{`SELECT '{+1.10}'::NUMERIC[]`, "{1.10}"},
+		{`SELECT '{-1.10,+.5}'::NUMERIC[]`, "{-1.10,.5}"},
+		{`SELECT '{1e+3,2E-2}'::NUMERIC[]`, "{1e+3,2E-2}"},
 	} {
-		if _, err := execSQL(e, sql); err != nil && sql[:20] != "SELECT count(*) FROM" {
-			t.Fatal(err)
+		res := execMust(t, e, tc.sql)
+		if got := res.Rows[0][0]; got != tc.want {
+			t.Errorf("%s = %v, want %s", tc.sql, got, tc.want)
+		}
+	}
+
+	for _, sql := range []string{
+		`SELECT '{0x1p4}'::NUMERIC[]`,
+		`SELECT '{NaN}'::NUMERIC[]`,
+		`SELECT '{Inf}'::NUMERIC[]`,
+		`SELECT '{Infinity}'::NUMERIC[]`,
+		`SELECT '{1.2.3}'::NUMERIC[]`,
+		`SELECT '{1e}'::NUMERIC[]`,
+		`SELECT '{+}'::NUMERIC[]`,
+	} {
+		if _, err := execSQL(e, sql); !errors.Is(err, pgerror.ErrInvalidText) {
+			t.Errorf("%s error = %v, want ErrInvalidText", sql, err)
 		}
 	}
 }
@@ -716,5 +772,200 @@ func TestArrayOperandMemoizesConstantExpressions(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("column operand evaluated %d times, want 3", calls)
+	}
+}
+
+// Column typing survives a derived table: the outer statement must decode
+// boolean subscripts instead of treating "t"/"f" as text.
+func TestDerivedTableArrayTyping(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (id INTEGER PRIMARY KEY, flags BOOLEAN[], tags TEXT[])`)
+	execMust(t, e, `INSERT INTO t VALUES (1, '{t,f}', '{a,b}'), (2, '{f,t}', '{c}')`)
+
+	cases := []struct {
+		sql  string
+		want interface{}
+	}{
+		{`SELECT count(*) FROM (SELECT flags FROM t) x WHERE flags[1]`, int64(1)},
+		{`SELECT count(*) FROM (SELECT flags FROM t) x WHERE NOT flags[1]`, int64(1)},
+		{`SELECT count(*) FROM (SELECT flags FROM t) x WHERE flags[1] = TRUE`, int64(1)},
+		{`SELECT count(*) FROM (SELECT flags FROM t) x WHERE flags[1] = ANY('{true}')`, int64(1)},
+		{`SELECT count(*) FROM (SELECT tags FROM t) x WHERE tags = '{a, b}'`, int64(1)},
+		{`SELECT count(*) FROM (SELECT tags FROM t) x WHERE tags = '{"a","b"}'`, int64(1)},
+	}
+	for _, tc := range cases {
+		res := execMust(t, e, tc.sql)
+		if got := res.Rows[0][0]; got != tc.want {
+			t.Errorf("%s = %#v, want %#v", tc.sql, got, tc.want)
+		}
+	}
+}
+
+// Column typing survives a CTE, including NOT over a boolean element.
+func TestCTEArrayTyping(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (id INTEGER PRIMARY KEY, flags BOOLEAN[], nums INTEGER[])`)
+	execMust(t, e, `INSERT INTO t VALUES (1, '{t,f}', '{10,20}'), (2, '{f,t}', '{30,40}')`)
+
+	cases := []struct {
+		sql  string
+		want interface{}
+	}{
+		{`WITH c AS (SELECT flags FROM t) SELECT count(*) FROM c WHERE flags[1]`, int64(1)},
+		{`WITH c AS (SELECT flags FROM t) SELECT count(*) FROM c WHERE NOT flags[1]`, int64(1)},
+		{`WITH c AS (SELECT flags FROM t) SELECT count(*) FROM c WHERE flags[1] = ANY('{true}')`, int64(1)},
+		{`WITH c AS (SELECT nums FROM t) SELECT count(*) FROM c WHERE nums[1] = 10`, int64(1)},
+		{`WITH c AS (SELECT nums FROM t) SELECT count(*) FROM c WHERE nums = '{10,20}'`, int64(1)},
+		{`WITH c AS (SELECT nums FROM t) SELECT count(*) FROM c WHERE nums = '{10, 20}'`, int64(1)},
+	}
+	for _, tc := range cases {
+		res := execMust(t, e, tc.sql)
+		if got := res.Rows[0][0]; got != tc.want {
+			t.Errorf("%s = %#v, want %#v", tc.sql, got, tc.want)
+		}
+	}
+}
+
+// A materialized CTE shadows a real table with the same name. Its own column
+// types must win; reading the shadowed table's schema would decode INTEGER[]
+// elements as text or report a spurious invalid-array error.
+func TestCTEShadowingRealTableUsesCTETypes(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE shadow (tags INTEGER[], flags TEXT[])`)
+	execMust(t, e, `INSERT INTO shadow VALUES ('{1}', '{"not a bool"}')`)
+	execMust(t, e, `CREATE TABLE docs (id INTEGER PRIMARY KEY, tags TEXT[], flags BOOLEAN[])`)
+	execMust(t, e, `INSERT INTO docs VALUES (1, '{a,b}', '{f}')`)
+
+	// Boolean NOT only flips when the CTE's BOOLEAN[] type is used.
+	res := execMust(t, e, `WITH shadow AS (SELECT flags FROM docs) SELECT count(*) FROM shadow WHERE NOT flags[1]`)
+	if res.Rows[0][0] != int64(1) {
+		t.Fatalf("CTE boolean shadow count = %v, want 1", res.Rows[0][0])
+	}
+	// TEXT[] element access accepts 'a'; the shadowed INTEGER[] type would fail.
+	res = execMust(t, e, `WITH shadow AS (SELECT tags FROM docs) SELECT count(*) FROM shadow WHERE tags[1] = 'a'`)
+	if res.Rows[0][0] != int64(1) {
+		t.Fatalf("CTE text shadow count = %v, want 1", res.Rows[0][0])
+	}
+	// Comparison canonicalization also uses the CTE's type.
+	res = execMust(t, e, `WITH shadow AS (SELECT tags FROM docs) SELECT count(*) FROM shadow WHERE tags = '{a, b}'`)
+	if res.Rows[0][0] != int64(1) {
+		t.Fatalf("CTE comparison shadow count = %v, want 1", res.Rows[0][0])
+	}
+}
+
+// The deadlock fix must hold for a locked in-transaction scan that evaluates an
+// array subscript: a SELECT over the table followed by an UPDATE must not
+// re-enter the session lock.
+func TestArraySubscriptInTransactionScan(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (id INTEGER PRIMARY KEY, flags BOOLEAN[], n INTEGER)`)
+	execMust(t, e, `INSERT INTO t VALUES (1, '{t,f}', 0), (2, '{f,t}', 0)`)
+
+	execMust(t, e, `BEGIN`)
+	runWithTimeout(t, 5*time.Second, func() {
+		res := execMust(t, e, `SELECT count(*) FROM t WHERE flags[1]`)
+		if res.Rows[0][0] != int64(1) {
+			t.Errorf("in-transaction count = %v, want 1", res.Rows[0][0])
+		}
+	})
+	runWithTimeout(t, 5*time.Second, func() {
+		execMust(t, e, `UPDATE t SET n = n + 1 WHERE flags[1]`)
+	})
+	execMust(t, e, `COMMIT`)
+
+	res := execMust(t, e, `SELECT n FROM t ORDER BY id`)
+	if res.Rows[0][0] != int64(1) || res.Rows[1][0] != int64(0) {
+		t.Fatalf("post-commit values = %v", res.Rows)
+	}
+}
+
+// canonicalArrayValue memoizes a constant comparison literal per statement and
+// still re-canonicalizes changed text or a different target type.
+func TestCanonicalArrayValueMemoizes(t *testing.T) {
+	e := &Executor{arrayCanonicalCache: make(map[parser.Expr]*arrayCanonicalEntry)}
+	e.pushTypeScope(func(_, column string) (string, bool) {
+		if strings.EqualFold(column, "tags") {
+			return "TEXT[]", true
+		}
+		return "", false
+	})
+	expr := &parser.ColumnRef{Column: "tags"}
+
+	first, err := e.canonicalArrayValue(expr, "{a, b}")
+	if err != nil || first != "{a,b}" {
+		t.Fatalf("canonical = %v, %v", first, err)
+	}
+	if _, ok := e.arrayCanonicalCache[expr]; !ok {
+		t.Fatal("canonical literal was not cached")
+	}
+	second, err := e.canonicalArrayValue(expr, "{a, b}")
+	if err != nil || second != "{a,b}" {
+		t.Fatalf("cached canonical = %v, %v", second, err)
+	}
+	changed, err := e.canonicalArrayValue(expr, "{c}")
+	if err != nil || changed != "{c}" {
+		t.Fatalf("changed canonical = %v, %v", changed, err)
+	}
+
+	if _, err := e.canonicalArrayValue(expr, "not-an-array"); !errors.Is(err, pgerror.ErrInvalidText) {
+		t.Fatalf("malformed literal error = %v, want ErrInvalidText", err)
+	}
+	if _, err := e.canonicalArrayValue(expr, "not-an-array"); !errors.Is(err, pgerror.ErrInvalidText) {
+		t.Fatalf("cached malformed literal error = %v, want ErrInvalidText", err)
+	}
+}
+
+// A derived table or CTE materialized on the right side of a JOIN also keeps
+// its column types for the outer WHERE.
+func TestJoinedDerivedAndCTEArrayTyping(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (id INTEGER PRIMARY KEY, flags BOOLEAN[])`)
+	execMust(t, e, `INSERT INTO t VALUES (1, '{t,f}'), (2, '{f,t}')`)
+	execMust(t, e, `CREATE TABLE u (id INTEGER PRIMARY KEY, flags BOOLEAN[], tags TEXT[])`)
+	execMust(t, e, `INSERT INTO u VALUES (1, '{f,t}', '{a,b}'), (2, '{t,f}', '{c}')`)
+
+	cases := []struct {
+		sql  string
+		want interface{}
+	}{
+		{`SELECT count(*) FROM t JOIN (SELECT id, flags FROM u) x ON x.id = t.id WHERE NOT x.flags[1]`, int64(1)},
+		{`SELECT count(*) FROM t JOIN (SELECT id, flags FROM u) x ON x.id = t.id WHERE x.flags[1] = ANY('{true}')`, int64(1)},
+		{`SELECT count(*) FROM t JOIN (SELECT id, tags FROM u) x ON x.id = t.id WHERE x.tags = '{a, b}'`, int64(1)},
+		{`WITH x AS (SELECT id, flags FROM u) SELECT count(*) FROM t JOIN x ON x.id = t.id WHERE NOT x.flags[1]`, int64(1)},
+		{`WITH x AS (SELECT id, tags FROM u) SELECT count(*) FROM t JOIN x ON x.id = t.id WHERE x.tags = '{a, b}'`, int64(1)},
+	}
+	for _, tc := range cases {
+		res := execMust(t, e, tc.sql)
+		if got := res.Rows[0][0]; got != tc.want {
+			t.Errorf("%s = %#v, want %#v", tc.sql, got, tc.want)
+		}
+	}
+}
+
+// A view expands to a derived table, so it keeps the same typing guarantees.
+func TestViewArrayTyping(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (id INTEGER PRIMARY KEY, flags BOOLEAN[], tags TEXT[])`)
+	execMust(t, e, `INSERT INTO t VALUES (1, '{t,f}', '{a,b}'), (2, '{f,t}', '{c}')`)
+	execMust(t, e, `CREATE VIEW v AS SELECT flags, tags FROM t`)
+
+	for _, tc := range []struct {
+		sql  string
+		want interface{}
+	}{
+		{`SELECT count(*) FROM v WHERE NOT flags[1]`, int64(1)},
+		{`SELECT count(*) FROM v WHERE flags[1] = ANY('{true}')`, int64(1)},
+		{`SELECT count(*) FROM v WHERE tags = '{a, b}'`, int64(1)},
+	} {
+		res := execMust(t, e, tc.sql)
+		if got := res.Rows[0][0]; got != tc.want {
+			t.Errorf("%s = %#v, want %#v", tc.sql, got, tc.want)
+		}
 	}
 }

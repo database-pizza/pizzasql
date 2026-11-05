@@ -28,6 +28,11 @@ func (e *Executor) snapshotTypeResolver(refs []parser.TableRef) columnTypeResolv
 		if ref.Subquery != nil || ref.Function != nil || ref.Name == "" {
 			continue
 		}
+		// A materialized CTE shadows a real table with the same name; never
+		// read the table's schema for a name the query resolves as a CTE.
+		if e.cteTableExists(ref.Name) {
+			continue
+		}
 		schema, err := e.session.GetSchema(ref.Name)
 		if err != nil {
 			continue
@@ -50,6 +55,93 @@ func (e *Executor) snapshotTypeResolver(refs []parser.TableRef) columnTypeResolv
 			if table != "" {
 				break
 			}
+		}
+		return "", false
+	}
+}
+
+// joinTypeScope collects the column types of relations materialized while
+// executing a join (derived tables and CTEs on the right side). The statement's
+// WHERE and projection resolve through it after the join rows are built, so
+// array subscripts and comparisons still decode their elements.
+type joinTypeScope struct {
+	qualified   map[string]string
+	unqualified map[string]string
+}
+
+func newJoinTypeScope() *joinTypeScope {
+	return &joinTypeScope{qualified: make(map[string]string), unqualified: make(map[string]string)}
+}
+
+// record stores one column's type. Unqualified lookups keep the first relation
+// that declared the name, matching how merged join rows keep the left value.
+func (s *joinTypeScope) record(qualifier, name, typeName string) {
+	if s == nil {
+		return
+	}
+	if qualifier != "" {
+		s.qualified[strings.ToUpper(qualifier+"."+name)] = typeName
+	}
+	key := strings.ToUpper(name)
+	if _, exists := s.unqualified[key]; !exists {
+		s.unqualified[key] = typeName
+	}
+}
+
+// resolve implements columnTypeResolver over the recorded join columns.
+func (s *joinTypeScope) resolve(table, column string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	if table != "" {
+		if typeName, ok := s.qualified[strings.ToUpper(table+"."+column)]; ok {
+			return typeName, true
+		}
+		return "", false
+	}
+	if typeName, ok := s.unqualified[strings.ToUpper(column)]; ok {
+		return typeName, true
+	}
+	return "", false
+}
+
+// recordJoinColumns adds a materialized right relation's columns to the current
+// statement's join scope.
+func (e *Executor) recordJoinColumns(qualifier string, columns, types []string) {
+	if len(e.joinTypeScopes) == 0 {
+		return
+	}
+	scope := e.joinTypeScopes[len(e.joinTypeScopes)-1]
+	for i, column := range columns {
+		scope.record(qualifier, column, typeAt(types, i))
+	}
+}
+
+// materializedTypeResolver builds a resolver over a materialized relation's
+// columns. columns and types are positionally aligned; qualifiers holds the
+// table name or alias each column can be referenced through (one entry per
+// column). A known column with no recorded type returns ("", true) so an outer
+// scope cannot supply a type for a name that is shadowed.
+func materializedTypeResolver(columns, types, qualifiers []string) columnTypeResolver {
+	if len(columns) == 0 {
+		return nil
+	}
+	return func(table, column string) (string, bool) {
+		for i, name := range columns {
+			if !strings.EqualFold(name, column) {
+				continue
+			}
+			qualifier := ""
+			if i < len(qualifiers) {
+				qualifier = qualifiers[i]
+			}
+			if table != "" && !strings.EqualFold(table, qualifier) {
+				continue
+			}
+			if i < len(types) && types[i] != "" {
+				return types[i], true
+			}
+			return "", true
 		}
 		return "", false
 	}

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -265,10 +266,10 @@ func canonicalArrayElement(element *string, kind arrayElementKind, typeName stri
 		canonical := strconv.FormatFloat(f, 'g', -1, 64)
 		return &canonical, nil
 	case arrayElementNumeric:
-		if !isNumericArrayElement(raw) {
+		canonical, ok := normalizeNumericArrayElement(raw)
+		if !ok {
 			return nil, pgerror.InvalidText("invalid input syntax for type %s: %q", typeName, raw)
 		}
-		canonical := raw
 		return &canonical, nil
 	case arrayElementBoolean:
 		value, ok := parseArrayBoolean(raw)
@@ -324,11 +325,12 @@ func arrayElementValue(element *string, elementType string) (interface{}, error)
 		}
 		return f, nil
 	case arrayElementNumeric:
-		if !isNumericArrayElement(raw) {
+		canonical, ok := normalizeNumericArrayElement(raw)
+		if !ok {
 			return nil, pgerror.InvalidText("invalid input syntax for type numeric: %q", raw)
 		}
 		// Return the text so a value above 2^53 keeps every digit.
-		return raw, nil
+		return canonical, nil
 	case arrayElementBoolean:
 		value, ok := parseArrayBoolean(raw)
 		if !ok {
@@ -340,15 +342,137 @@ func arrayElementValue(element *string, elementType string) (interface{}, error)
 	}
 }
 
-// isNumericArrayElement reports whether text is a valid SQL numeric spelling.
-// NUMERIC elements are not rewritten, so this is validation only.
-func isNumericArrayElement(raw string) bool {
+// normalizeNumericArrayElement validates SQL NUMERIC syntax and returns the
+// canonical spelling: surrounding whitespace trimmed and a leading + removed.
+// Go's ParseFloat is not used because it also accepts hex floats, NaN, and Inf,
+// which NUMERIC has no representation for here.
+func normalizeNumericArrayElement(raw string) (string, bool) {
 	text := strings.TrimSpace(raw)
 	if text == "" {
-		return false
+		return "", false
 	}
-	_, err := strconv.ParseFloat(text, 64)
-	return err == nil
+	if text[0] == '+' {
+		text = text[1:]
+	}
+	if text == "" {
+		return "", false
+	}
+	i := 0
+	if text[i] == '-' {
+		i++
+	}
+	digits := 0
+	for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+		i++
+		digits++
+	}
+	if i < len(text) && text[i] == '.' {
+		i++
+		for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+			i++
+			digits++
+		}
+	}
+	if digits == 0 {
+		return "", false
+	}
+	if i < len(text) && (text[i] == 'e' || text[i] == 'E') {
+		i++
+		if i < len(text) && (text[i] == '+' || text[i] == '-') {
+			i++
+		}
+		exponentDigits := 0
+		for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+			i++
+			exponentDigits++
+		}
+		if exponentDigits == 0 {
+			return "", false
+		}
+	}
+	if i != len(text) {
+		return "", false
+	}
+	return text, true
+}
+
+// numericValueRat converts an evaluated value to an exact rational. Strings and
+// floats use their decimal spelling, so a column value "1.10" and the float
+// literal 1.1 both compare as 11/10 rather than through binary rounding.
+func numericValueRat(value interface{}) (*big.Rat, bool) {
+	var text string
+	switch v := value.(type) {
+	case string:
+		normalized, ok := normalizeNumericArrayElement(v)
+		if !ok {
+			return nil, false
+		}
+		text = normalized
+	case int64:
+		return new(big.Rat).SetInt64(v), true
+	case int:
+		return new(big.Rat).SetInt64(int64(v)), true
+	case float64:
+		text = strconv.FormatFloat(v, 'g', -1, 64)
+	default:
+		return nil, false
+	}
+	rat, ok := new(big.Rat).SetString(text)
+	return rat, ok
+}
+
+// compareNumericValues compares two values exactly when both are numeric.
+func compareNumericValues(left, right interface{}) (int, bool) {
+	leftRat, ok := numericValueRat(left)
+	if !ok {
+		return 0, false
+	}
+	rightRat, ok := numericValueRat(right)
+	if !ok {
+		return 0, false
+	}
+	return leftRat.Cmp(rightRat), true
+}
+
+// numericArrayTextEqual reports whether two canonical NUMERIC array texts are
+// equal element-wise, with NULL elements equal to each other. Other array types
+// compare by their canonical bytes.
+func numericArrayTextEqual(left, right, typeName string) (bool, error) {
+	kind, err := arrayElementKindOf(typeName)
+	if err != nil {
+		return false, err
+	}
+	if kind != arrayElementNumeric {
+		return left == right, nil
+	}
+	leftElements, err := parseArrayLiteral(left)
+	if err != nil {
+		return false, err
+	}
+	rightElements, err := parseArrayLiteral(right)
+	if err != nil {
+		return false, err
+	}
+	if len(leftElements) != len(rightElements) {
+		return false, nil
+	}
+	for i := range leftElements {
+		leftElement, rightElement := leftElements[i], rightElements[i]
+		if leftElement == nil || rightElement == nil {
+			if leftElement != nil || rightElement != nil {
+				return false, nil
+			}
+			continue
+		}
+		cmp, ok := compareNumericValues(*leftElement, *rightElement)
+		if !ok {
+			return false, pgerror.InvalidText("invalid input syntax for type numeric: %q", *leftElement)
+		}
+		if cmp != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // arrayValueElement renders one evaluated expression value as a canonical array
@@ -452,6 +576,84 @@ func (e *Executor) parsedArray(expr parser.Expr, value interface{}) ([]*string, 
 	return elements, err
 }
 
+// isNumericExprType reports whether an expression's declared type is NUMERIC or
+// DECIMAL, which compares exactly instead of through float64. CAST(... AS
+// NUMERIC) is included even though its result metadata stays unchanged: the
+// cast leaves the value's carrier alone, but comparisons still mean decimal.
+func (e *Executor) isNumericExprType(expr parser.Expr) bool {
+	switch x := expr.(type) {
+	case nil:
+		return false
+	case *parser.ParenExpr:
+		return e.isNumericExprType(x.Expr)
+	case *parser.CastExpr:
+		switch strings.ToUpper(strings.TrimSpace(x.Type.Name)) {
+		case "NUMERIC", "DECIMAL":
+			return true
+		}
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(inferExprType(expr, e.resolveColumnType))) {
+	case "NUMERIC", "DECIMAL":
+		return true
+	default:
+		return false
+	}
+}
+
+// comparisonOperatorResult applies a comparison operator to a three-way result.
+func comparisonOperatorResult(op lexer.TokenType, cmp int) (bool, error) {
+	switch op {
+	case lexer.TokenEq:
+		return cmp == 0, nil
+	case lexer.TokenNeq:
+		return cmp != 0, nil
+	case lexer.TokenLt:
+		return cmp < 0, nil
+	case lexer.TokenLte:
+		return cmp <= 0, nil
+	case lexer.TokenGt:
+		return cmp > 0, nil
+	case lexer.TokenGte:
+		return cmp >= 0, nil
+	default:
+		return false, fmt.Errorf("unsupported comparison operator: %v", op)
+	}
+}
+
+// arrayEqualityType reports the array type used for a whole-array equality
+// comparison. The left side wins when both are arrays.
+func (e *Executor) arrayEqualityType(leftExpr, rightExpr parser.Expr) (string, bool) {
+	if typeName, ok := e.arrayTypeOf(leftExpr); ok {
+		return typeName, true
+	}
+	return e.arrayTypeOf(rightExpr)
+}
+
+// compareExprValues applies a comparison operator to two evaluated values. A
+// NUMERIC-typed operand compares exactly (including element-wise numeric array
+// equality); everything else keeps the engine's existing comparison rules.
+func (e *Executor) compareExprValues(op lexer.TokenType, leftExpr, rightExpr parser.Expr, left, right interface{}) (bool, error) {
+	if op == lexer.TokenEq || op == lexer.TokenNeq {
+		if typeName, ok := e.arrayEqualityType(leftExpr, rightExpr); ok {
+			equal, err := numericArrayTextEqual(toString(left), toString(right), typeName)
+			if err != nil {
+				return false, err
+			}
+			if op == lexer.TokenNeq {
+				return !equal, nil
+			}
+			return equal, nil
+		}
+	}
+	if e.isNumericExprType(leftExpr) || e.isNumericExprType(rightExpr) {
+		if cmp, ok := compareNumericValues(left, right); ok {
+			return comparisonOperatorResult(op, cmp)
+		}
+	}
+	return comparisonOperatorResult(op, compare(left, right))
+}
+
 // arrayElementTypeOf reports the element type of an expression whose value is an
 // array, resolved against the declared column types of the query currently
 // executing. An unknown type (a derived table, a bare literal) reports false so
@@ -549,13 +751,14 @@ func (e *Executor) evalAnyAllExpr(expr *parser.AnyAllExpr, row storage.Row) (int
 	if err != nil {
 		return nil, fmt.Errorf("ANY/ALL requires an array operand: %w", err)
 	}
-	return evalQuantifiedComparison(expr.Op, expr.All, left, elements)
+	elementType, _ := e.arrayElementTypeOf(expr.Array)
+	return evalQuantifiedComparison(expr.Op, expr.All, left, elements, elementType)
 }
 
 // evalQuantifiedComparison applies a comparison to each array element. The
 // empty array is decided before the left operand: ANY over no elements is
 // false and ALL over no elements is true, even when the left operand is NULL.
-func evalQuantifiedComparison(op lexer.TokenType, all bool, left interface{}, elements []*string) (interface{}, error) {
+func evalQuantifiedComparison(op lexer.TokenType, all bool, left interface{}, elements []*string, elementType string) (interface{}, error) {
 	if len(elements) == 0 {
 		return all, nil
 	}
@@ -568,7 +771,7 @@ func evalQuantifiedComparison(op lexer.TokenType, all bool, left interface{}, el
 			sawNull = true
 			continue
 		}
-		matched, err := compareArrayElement(op, left, *element)
+		matched, err := compareArrayElement(op, left, *element, elementType)
 		if err != nil {
 			return nil, err
 		}
@@ -589,7 +792,14 @@ func evalQuantifiedComparison(op lexer.TokenType, all bool, left interface{}, el
 // and one array element's text. Booleans are decoded so `true = ANY('{t,f}')`
 // compares as booleans; every other type compares through the engine's numeric
 // or textual comparison rules.
-func compareArrayElement(op lexer.TokenType, left interface{}, element string) (bool, error) {
+func compareArrayElement(op lexer.TokenType, left interface{}, element, elementType string) (bool, error) {
+	if kind, err := arrayElementKindForName(elementType); err == nil && kind == arrayElementNumeric {
+		cmp, ok := compareNumericValues(left, element)
+		if !ok {
+			return false, pgerror.InvalidText("invalid input syntax for type numeric: %q", element)
+		}
+		return comparisonOperatorResult(op, cmp)
+	}
 	var right interface{} = element
 	if _, isBool := left.(bool); isBool {
 		value, ok := parseArrayBoolean(element)
@@ -598,23 +808,7 @@ func compareArrayElement(op lexer.TokenType, left interface{}, element string) (
 		}
 		right = value
 	}
-	cmp := compare(left, right)
-	switch op {
-	case lexer.TokenEq:
-		return cmp == 0, nil
-	case lexer.TokenNeq:
-		return cmp != 0, nil
-	case lexer.TokenLt:
-		return cmp < 0, nil
-	case lexer.TokenLte:
-		return cmp <= 0, nil
-	case lexer.TokenGt:
-		return cmp > 0, nil
-	case lexer.TokenGte:
-		return cmp >= 0, nil
-	default:
-		return false, fmt.Errorf("unsupported ANY/ALL comparison operator: %v", op)
-	}
+	return comparisonOperatorResult(op, compare(left, right))
 }
 
 // evalArrayLength implements array_length(array, dimension). Only dimension 1 is
@@ -657,8 +851,19 @@ func (e *Executor) arrayTypeOf(expr parser.Expr) (string, bool) {
 	return typeName, true
 }
 
+// arrayCanonicalEntry memoizes one canonicalized array comparison operand for
+// the current statement, validated by the source text and target type.
+type arrayCanonicalEntry struct {
+	text      string
+	typeName  string
+	canonical string
+	err       error
+}
+
 // canonicalArrayValue canonicalizes a value against the array type of expr. It
-// is a no-op for non-array expressions, NULL, and non-string values.
+// is a no-op for non-array expressions, NULL, and non-string values. The result
+// is memoized per AST node and source text, so a constant literal on one side of
+// a scan predicate is canonicalized once per statement.
 func (e *Executor) canonicalArrayValue(arrayExpr parser.Expr, value interface{}) (interface{}, error) {
 	typeName, ok := e.arrayTypeOf(arrayExpr)
 	if !ok || value == nil {
@@ -668,7 +873,22 @@ func (e *Executor) canonicalArrayValue(arrayExpr parser.Expr, value interface{})
 	if !isText {
 		return value, nil
 	}
-	return canonicalArrayText(text, typeName)
+	if e.arrayCanonicalCache != nil && arrayExpr != nil {
+		if entry, cached := e.arrayCanonicalCache[arrayExpr]; cached && entry.text == text && entry.typeName == typeName {
+			if entry.err != nil {
+				return nil, entry.err
+			}
+			return entry.canonical, nil
+		}
+	}
+	canonical, err := canonicalArrayText(text, typeName)
+	if e.arrayCanonicalCache != nil && arrayExpr != nil {
+		e.arrayCanonicalCache[arrayExpr] = &arrayCanonicalEntry{text: text, typeName: typeName, canonical: canonical, err: err}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return canonical, nil
 }
 
 // canonicalizeArrayComparison canonicalizes the string operand of a comparison

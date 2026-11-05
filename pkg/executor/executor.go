@@ -81,10 +81,20 @@ type Executor struct {
 	// text for every row of a scan.
 	arrayValueCache map[parser.Expr]interface{}
 
+	// Per-query cache of canonicalized array comparison literals, keyed by AST
+	// pointer and validated by the source text, so `tags = '{a, b}'` parses the
+	// literal once per statement rather than once per row.
+	arrayCanonicalCache map[parser.Expr]*arrayCanonicalEntry
+
 	// typeScopes holds the column-type resolvers of the SELECT statements being
 	// evaluated, innermost last. Value-time consumers (array subscripts) use
 	// them to recover a column's declared type.
 	typeScopes []columnTypeResolver
+
+	// joinTypeScopes holds the per-statement records of right-hand relations
+	// materialized while executing joins, so their column types are available
+	// after the join rows are built.
+	joinTypeScopes []*joinTypeScope
 
 	// In-memory view registry: view name (lowercase) → SELECT AST.
 	views map[string]*parser.SelectStmt
@@ -226,11 +236,13 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	e.correlatedAggCache = make(map[*parser.SelectStmt]*correlatedAggCache)
 	e.arrayCache = make(map[parser.Expr]*arrayParseEntry)
 	e.arrayValueCache = make(map[parser.Expr]interface{})
+	e.arrayCanonicalCache = make(map[parser.Expr]*arrayCanonicalEntry)
 	defer func() {
 		e.subqueryCache = nil
 		e.correlatedAggCache = nil
 		e.arrayCache = nil
 		e.arrayValueCache = nil
+		e.arrayCanonicalCache = nil
 	}()
 
 	// PRAGMA doesn't need analysis. SQLite catalog-introspection pragmas
@@ -421,8 +433,18 @@ func isCountStarSingleTable(stmt *parser.SelectStmt) bool {
 
 // executeSelect executes a SELECT statement (or compound SELECT).
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	// The join scope is pushed below the snapshot so a real table's unqualified
+	// column keeps precedence; it answers for right-side derived tables and
+	// CTEs that the snapshot cannot read without materializing them again.
+	joinScope := newJoinTypeScope()
+	e.joinTypeScopes = append(e.joinTypeScopes, joinScope)
+	e.pushTypeScope(joinScope.resolve)
 	e.pushTypeScope(e.snapshotTypeResolver(stmt.From))
-	defer e.popTypeScope()
+	defer func() {
+		e.popTypeScope()
+		e.popTypeScope()
+		e.joinTypeScopes = e.joinTypeScopes[:len(e.joinTypeScopes)-1]
+	}()
 
 	if len(stmt.With) > 0 {
 		return e.executeWith(stmt)
@@ -480,7 +502,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// A materialized CTE is served from memory, not from storage.
 	if cte, ok := e.cteTableFor(tableName); ok {
-		return e.executeSelectOnMaterialized(stmt, cte.columns, cteRowsToValues(cte))
+		qualifier := stmt.From[0].Alias
+		if qualifier == "" {
+			qualifier = stmt.From[0].Name
+		}
+		return e.executeSelectOnMaterializedTyped(stmt, cte.columns, cte.types, cteRowsToValues(cte), qualifier)
 	}
 
 	// Transparently expand view references as derived-table subqueries.
@@ -1592,6 +1618,8 @@ func (e *Executor) executeSelectFromTableFunction(stmt *parser.SelectStmt) (*Res
 }
 
 // executeSelectFromSubquery executes a SELECT with a subquery in FROM clause.
+// The derived table's column types are carried into the outer statement so
+// array subscripts and comparisons keep decoding elements.
 func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, error) {
 	// Execute the subquery to get the derived table
 	subqueryResult, err := e.executeSelect(stmt.From[0].Subquery)
@@ -1599,20 +1627,26 @@ func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, 
 		return nil, fmt.Errorf("subquery error: %w", err)
 	}
 
-	return e.executeSelectOnMaterialized(stmt, subqueryResult.Columns, subqueryResult.Rows)
+	qualifier := stmt.From[0].Alias
+	if qualifier == "" {
+		qualifier = stmt.From[0].Name
+	}
+	return e.executeSelectOnMaterializedTyped(stmt, subqueryResult.Columns, subqueryResult.ColumnTypes, subqueryResult.Rows, qualifier)
 }
 
 func (e *Executor) executeSelectFromSubqueries(stmt *parser.SelectStmt) (*Result, error) {
 	rows := []storage.Row{{}}
-	var columns, starKeys []string
+	var columns, starKeys, types, qualifiers []string
 	for _, ref := range stmt.From {
 		res, err := e.executeSelect(ref.Subquery)
 		if err != nil {
 			return nil, fmt.Errorf("subquery error: %w", err)
 		}
 		columns = append(columns, res.Columns...)
-		for _, column := range res.Columns {
+		for i, column := range res.Columns {
 			starKeys = append(starKeys, ref.Alias+"."+column)
+			qualifiers = append(qualifiers, ref.Alias)
+			types = append(types, typeAt(res.ColumnTypes, i))
 		}
 
 		right := make([]storage.Row, 0, len(res.Rows))
@@ -1641,13 +1675,38 @@ func (e *Executor) executeSelectFromSubqueries(stmt *parser.SelectStmt) (*Result
 		}
 		rows = joined
 	}
+	e.pushTypeScope(materializedTypeResolver(columns, types, qualifiers))
+	defer e.popTypeScope()
 	return e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
 }
 
+// typeAt returns the type at index i, or the empty string when the position has
+// no recorded type (which the resolver reports as known-but-untyped).
+func typeAt(types []string, i int) string {
+	if i < len(types) {
+		return types[i]
+	}
+	return ""
+}
+
 // executeSelectOnMaterialized runs a SELECT whose FROM[0] is already
-// materialized as (columns, rowValues). It is shared by derived tables and
-// materialized CTEs.
+// materialized as (columns, rowValues) without column-type metadata.
 func (e *Executor) executeSelectOnMaterialized(stmt *parser.SelectStmt, columns []string, rowValues [][]interface{}) (*Result, error) {
+	return e.executeSelectOnMaterializedTyped(stmt, columns, nil, rowValues, "")
+}
+
+// executeSelectOnMaterializedTyped runs the same materialized SELECT with the
+// relation's column types exposed to value-time consumers such as array
+// subscripts. qualifier names the relation (alias or name) for qualified column
+// references; one qualifier applies to every column.
+func (e *Executor) executeSelectOnMaterializedTyped(stmt *parser.SelectStmt, columns, columnTypes []string, rowValues [][]interface{}, qualifier string) (*Result, error) {
+	qualifiers := make([]string, len(columns))
+	for i := range qualifiers {
+		qualifiers[i] = qualifier
+	}
+	e.pushTypeScope(materializedTypeResolver(columns, columnTypes, qualifiers))
+	defer e.popTypeScope()
+
 	derivedRows := make([]storage.Row, 0, len(rowValues))
 	for _, values := range rowValues {
 		row := make(storage.Row, len(columns))
@@ -1666,7 +1725,7 @@ func (e *Executor) executeSelectOnMaterialized(stmt *parser.SelectStmt, columns 
 // every SELECT * column, including duplicate column names.
 func (e *Executor) executeSelectOnMaterializedCTEs(stmt *parser.SelectStmt) (*Result, error) {
 	rows := []storage.Row{{}}
-	var columns, starKeys []string
+	var columns, starKeys, types, qualifiers []string
 	for _, ref := range stmt.From {
 		cte, _ := e.cteTableFor(ref.Name)
 		qualifier := ref.Alias
@@ -1674,8 +1733,10 @@ func (e *Executor) executeSelectOnMaterializedCTEs(stmt *parser.SelectStmt) (*Re
 			qualifier = ref.Name
 		}
 		columns = append(columns, cte.columns...)
-		for _, column := range cte.columns {
+		for i, column := range cte.columns {
 			starKeys = append(starKeys, qualifier+"."+column)
+			qualifiers = append(qualifiers, qualifier)
+			types = append(types, typeAt(cte.types, i))
 		}
 
 		right := cloneRows(cte.rows)
@@ -1697,6 +1758,8 @@ func (e *Executor) executeSelectOnMaterializedCTEs(stmt *parser.SelectStmt) (*Re
 		}
 		rows = joined
 	}
+	e.pushTypeScope(materializedTypeResolver(columns, types, qualifiers))
+	defer e.popTypeScope()
 	return e.executeSelectOnMaterializedRows(stmt, columns, starKeys, rows)
 }
 
@@ -2200,14 +2263,17 @@ func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []sto
 	var err error
 	switch {
 	case rightTableRef.Subquery != nil:
-		rightRows, rightSchema, err = e.materializeJoinSubquery(rightTableRef)
+		var columns, types []string
+		rightRows, rightSchema, columns, types, err = e.materializeJoinSubquery(rightTableRef)
 		if err != nil {
 			return nil, err
 		}
+		e.recordJoinColumns(rightAlias, columns, types)
 	case e.cteTableExists(rightTable):
 		cte, _ := e.cteTableFor(rightTable)
 		rightRows = cloneRows(cte.rows)
 		rightSchema = schemaFromColumns(cte.columns)
+		e.recordJoinColumns(rightAlias, cte.columns, cte.types)
 	default:
 		rightSchema, err = e.session.GetSchema(rightTable)
 		if err != nil {
@@ -2335,14 +2401,21 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 	}
 
 	rightTable := join.Table.Name
+	rightQualifier := join.Table.Alias
+	if rightQualifier == "" {
+		rightQualifier = rightTable
+	}
 	var rightRows []storage.Row
 	var err error
 	switch {
 	case join.Table.Subquery != nil:
-		rightRows, _, err = e.materializeJoinSubquery(join.Table)
+		var columns, types []string
+		rightRows, _, columns, types, err = e.materializeJoinSubquery(join.Table)
+		e.recordJoinColumns(rightQualifier, columns, types)
 	case e.cteTableExists(rightTable):
 		cte, _ := e.cteTableFor(rightTable)
 		rightRows = cloneRows(cte.rows)
+		e.recordJoinColumns(rightQualifier, cte.columns, cte.types)
 	default:
 		rightRows, err = e.session.Select(rightTable, nil)
 	}
@@ -5382,6 +5455,10 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 		if err != nil {
 			return nil, err
 		}
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return e.compareExprValues(expr.Op, expr.Left, expr.Right, left, right)
 	}
 
 	if isBitwiseOp(expr.Op) {
@@ -6186,7 +6263,11 @@ func (e *Executor) evalInExpr(expr *parser.InExpr, row storage.Row) (interface{}
 			if canonErr != nil {
 				return nil, canonErr
 			}
-			if compare(left, v) == 0 {
+			equal, cmpErr := e.compareExprValues(lexer.TokenEq, expr.Left, nil, left, v)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			if equal {
 				if expr.Not {
 					return false, nil
 				}
@@ -6226,7 +6307,11 @@ func (e *Executor) evalInExpr(expr *parser.InExpr, row storage.Row) (interface{}
 		if err != nil {
 			return nil, err
 		}
-		if compare(left, v) == 0 {
+		equal, cmpErr := e.compareExprValues(lexer.TokenEq, expr.Left, nil, left, v)
+		if cmpErr != nil {
+			return nil, cmpErr
+		}
+		if equal {
 			if expr.Not {
 				return false, nil
 			}
@@ -6367,7 +6452,11 @@ func (e *Executor) evalIsDistinctExpr(expr *parser.IsDistinctExpr, row storage.R
 	case left == nil || right == nil:
 		distinct = true
 	default:
-		distinct = compare(left, right) != 0
+		equal, cmpErr := e.compareExprValues(lexer.TokenEq, expr.Left, expr.Right, left, right)
+		if cmpErr != nil {
+			return nil, cmpErr
+		}
+		distinct = !equal
 	}
 	if expr.Not {
 		return !distinct, nil
@@ -6893,6 +6982,10 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			if err != nil {
 				return nil, err
 			}
+			if left == nil || right == nil {
+				return nil, nil
+			}
+			return e.compareExprValues(ex.Op, ex.Left, ex.Right, left, right)
 		}
 		// Use the same logic as evalBinaryExpr to preserve integer semantics.
 		combined := &parser.BinaryExpr{Op: ex.Op}
@@ -7116,7 +7209,8 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if err != nil {
 			return nil, fmt.Errorf("ANY/ALL requires an array operand: %w", err)
 		}
-		return evalQuantifiedComparison(ex.Op, ex.All, left, elements)
+		elementType, _ := e.arrayElementTypeOf(ex.Array)
+		return evalQuantifiedComparison(ex.Op, ex.All, left, elements, elementType)
 	case *parser.InExpr:
 		left, err := e.evalExprWithAggregates(ex.Left, rows)
 		if err != nil {
@@ -7162,7 +7256,11 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 				if canonErr != nil {
 					return nil, canonErr
 				}
-				if compare(left, v) == 0 {
+				equal, cmpErr := e.compareExprValues(lexer.TokenEq, ex.Left, nil, left, v)
+				if cmpErr != nil {
+					return nil, cmpErr
+				}
+				if equal {
 					if ex.Not {
 						return false, nil
 					}
@@ -7199,7 +7297,11 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			if err != nil {
 				return nil, err
 			}
-			if compare(left, v) == 0 {
+			equal, cmpErr := e.compareExprValues(lexer.TokenEq, ex.Left, nil, left, v)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			if equal {
 				if ex.Not {
 					return false, nil
 				}
