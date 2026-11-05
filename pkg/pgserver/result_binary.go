@@ -142,6 +142,12 @@ func appendBinaryResultValue(dst []byte, oid int32, value interface{}) ([]byte, 
 		if err != nil {
 			return dst, err
 		}
+		// A value beyond float4's range would otherwise convert to ±Inf and be
+		// decoded as infinity instead of the stored value. NaN compares false
+		// here and stays NaN, which float4 can represent.
+		if math.Abs(f) > math.MaxFloat32 {
+			return dst, binaryEncodeErrorf("value %v does not fit float4", f)
+		}
 		bits := math.Float32bits(float32(f))
 		return append(dst, byte(bits>>24), byte(bits>>16), byte(bits>>8), byte(bits)), nil
 	case 701: // float8
@@ -235,7 +241,7 @@ func binaryInt64(value interface{}, oid int32) (int64, error) {
 	case int8:
 		n = int64(v)
 	case float64:
-		if math.Trunc(v) != v || v < math.MinInt64 || v > math.MaxInt64 {
+		if math.Trunc(v) != v || v < math.MinInt64 || v >= math.MaxInt64 {
 			return 0, binaryEncodeErrorf("value %v is not an integer", v)
 		}
 		n = int64(v)
@@ -495,7 +501,7 @@ func appendNumericText(dst []byte, text string) ([]byte, error) {
 	if weight < math.MinInt16 || weight > math.MaxInt16 {
 		return dst, binaryEncodeErrorf("numeric weight %d is out of range", weight)
 	}
-	if len(groups) > math.MaxUint16 {
+	if len(groups) > math.MaxInt16 {
 		return dst, binaryEncodeErrorf("numeric has %d base-10000 groups, out of range", len(groups))
 	}
 

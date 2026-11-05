@@ -313,8 +313,9 @@ func TestBinaryResultsAreAdvertised(t *testing.T) {
 	}
 	for _, claim := range []string{
 		"bool (16)", "bytea (17)", "int8 (20)", "int2 (21)", "int4 (23)", "text (25)",
-		"float4 (700)", "float8 (701)", "varchar (1043)", "numeric (1700)", "jsonb (3802,",
+		"float4 (700)", "float8 (701)", "varchar (1043)", "numeric (1700) only as the element type of numeric[] (1231)", "jsonb (3802,",
 		"1000, 1005, 1007, 1009, 1015, 1016, 1021, 1022, 1231", "0A000",
+		"unrepresentable stored value", "22P02",
 		"Describe and simple-query results stay text",
 	} {
 		if !strings.Contains(results.Notes, claim) {

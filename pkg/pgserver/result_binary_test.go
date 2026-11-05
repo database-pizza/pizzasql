@@ -890,3 +890,187 @@ func TestBinaryResultsCatalogQuery(t *testing.T) {
 		t.Fatalf("hasindexes = %v, want false", rows[0][1])
 	}
 }
+
+// A stored value the requested binary type cannot represent fails mid-result:
+// the RowDescription and rows already written stay written, the failing DataRow
+// is never emitted, the transaction is marked failed, and the connection stays
+// usable after ROLLBACK.
+func TestBinaryResultsEncodeFailureMidResult(t *testing.T) {
+	c, conn := extendedResultConnection(t)
+	for _, sql := range []string{
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)`,
+		`INSERT INTO t VALUES (1, 5), (2, 'abc'), (3, 7)`,
+	} {
+		if _, err := c.executor.Execute(parseStmt(t, sql)); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if msg := findError(runSimple(t, c, conn, "BEGIN")); msg != nil {
+		t.Fatalf("BEGIN failed: %s", errorCode(msg))
+	}
+	conn.reset()
+	sendExtended(t, c,
+		parseMessage("s", `SELECT id, x FROM t ORDER BY id`),
+		bindResultMessage("p", "s", nil, []int16{1, 1}),
+		executeMessage("p"),
+		&Message{Type: MsgSync},
+	)
+	messages := readAllMessages(t, conn.bytes())
+	if got := messageTypes(messages); got != "12TDEZ" {
+		t.Fatalf("messages = %q, want Parse/Bind/RowDescription/DataRow/Error/ReadyForQuery", got)
+	}
+	rows := dataRowsRaw(t, messages)
+	if len(rows) != 1 {
+		t.Fatalf("got %d DataRows, want only the rows before the failure", len(rows))
+	}
+	assertBytes(t, "row before the failure", rows[0][0], []byte{0, 0, 0, 1})
+	assertBytes(t, "int4 before the failure", rows[0][1], []byte{0, 0, 0, 5})
+	if code := errorCode(findError(messages)); code != ErrCodeInvalidText {
+		t.Fatalf("SQLSTATE = %s, want %s", code, ErrCodeInvalidText)
+	}
+	ready := messages[len(messages)-1]
+	if ready.Type != MsgReadyForQuery || ready.Data[0] != TxStatusFailed {
+		t.Fatalf("transaction status = %c, want failed", ready.Data[0])
+	}
+
+	// The connection recovers after ROLLBACK and a new cycle.
+	conn.reset()
+	if err := c.handleMessage(&Message{Type: MsgQuery, Data: []byte("ROLLBACK\x00")}); err != nil {
+		t.Fatal(err)
+	}
+	conn.reset()
+	sendExtended(t, c,
+		parseMessage("s2", `SELECT x FROM t WHERE id = 1`),
+		bindResultMessage("p2", "s2", nil, []int16{1}),
+		executeMessage("p2"),
+		&Message{Type: MsgSync},
+	)
+	messages = readAllMessages(t, conn.bytes())
+	if msg := findError(messages); msg != nil {
+		t.Fatalf("query after the encode failure failed: %s", errorCode(msg))
+	}
+	if rows := dataRowsRaw(t, messages); len(rows) != 1 || !bytes.Equal(rows[0][0], []byte{0, 0, 0, 5}) {
+		t.Fatalf("rows after recovery = %v", rows)
+	}
+}
+
+// A value that does not fit int4 (2^40 in an INTEGER column) is an encoding
+// failure even when the value converted cleanly at insert time.
+func TestBinaryResultsEncodeFailureOutOfRange(t *testing.T) {
+	c, conn := extendedResultConnection(t)
+	for _, sql := range []string{
+		`CREATE TABLE big (id INTEGER PRIMARY KEY, x INTEGER)`,
+		`INSERT INTO big VALUES (1, 1099511627776)`,
+	} {
+		if _, err := c.executor.Execute(parseStmt(t, sql)); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	sendExtended(t, c,
+		parseMessage("s", `SELECT x FROM big`),
+		bindResultMessage("p", "s", nil, []int16{1}),
+		executeMessage("p"),
+		&Message{Type: MsgSync},
+	)
+	messages := readAllMessages(t, conn.bytes())
+	if got := messageTypes(messages); got != "12TEZ" {
+		t.Fatalf("messages = %q, want no DataRow for the failing value", got)
+	}
+	if code := errorCode(findError(messages)); code != ErrCodeInvalidText {
+		t.Fatalf("SQLSTATE = %s, want %s", code, ErrCodeInvalidText)
+	}
+}
+
+// Close('P') drops the portal and therefore its result formats; a later Bind
+// under the same name starts from the new list.
+func TestBinaryResultsCloseDropsPortalFormats(t *testing.T) {
+	c, conn := extendedResultConnection(t)
+	prepareBinaryResultTable(t, c)
+	sendExtended(t, c,
+		parseMessage("s", `SELECT id FROM t ORDER BY id`),
+		bindResultMessage("p", "s", nil, []int16{1}),
+		executeMessage("p"),
+		&Message{Type: MsgClose, Data: []byte{'P', 'p', 0}},
+		bindResultMessage("p", "s", nil, nil),
+		executeMessage("p"),
+		&Message{Type: MsgSync},
+	)
+	messages := readAllMessages(t, conn.bytes())
+	if msg := findError(messages); msg != nil {
+		t.Fatalf("close/re-bind failed: %s", errorCode(msg))
+	}
+	var formats [][]int16
+	var rows [][][]byte
+	for _, message := range messages {
+		switch message.Type {
+		case MsgRowDescription:
+			formats = append(formats, rowDescriptionFormats(t, message.Data))
+		case MsgDataRow:
+			rows = append(rows, dataRowRawValues(t, message))
+		}
+	}
+	if len(formats) != 2 || !equalInt16(formats[0], []int16{1}) {
+		t.Fatalf("formats = %v, want the first portal binary", formats)
+	}
+	if !equalInt16(formats[1], []int16{0}) {
+		t.Fatalf("formats after Close = %v, want text", formats[1])
+	}
+	if len(rows) != 4 {
+		t.Fatalf("got %d rows, want 4", len(rows))
+	}
+	assertBytes(t, "binary portal id", rows[0][0], []byte{0, 0, 0, 1})
+	if string(rows[2][0]) != "1" {
+		t.Fatalf("re-bound text portal id = %q", rows[2][0])
+	}
+}
+
+// Float results keep their exact bit patterns, including -0 and NaN; float4
+// rejects values whose conversion would become an infinity.
+func TestBinaryFloatBitPatterns(t *testing.T) {
+	negativeZero := math.Copysign(0, -1)
+	nan := math.NaN()
+	positiveInfinity := math.Inf(1)
+	negativeInfinity := math.Inf(-1)
+	cases := []struct {
+		name  string
+		oid   int32
+		value interface{}
+		want  []byte
+	}{
+		{"float8 -0", 701, negativeZero, binary.BigEndian.AppendUint64(nil, 0x8000000000000000)},
+		{"float8 NaN", 701, nan, binary.BigEndian.AppendUint64(nil, math.Float64bits(nan))},
+		{"float8 +Inf", 701, positiveInfinity, binary.BigEndian.AppendUint64(nil, 0x7ff0000000000000)},
+		{"float8 -Inf", 701, negativeInfinity, binary.BigEndian.AppendUint64(nil, 0xfff0000000000000)},
+		{"float8 Infinity text", 701, "Infinity", binary.BigEndian.AppendUint64(nil, 0x7ff0000000000000)},
+		{"float4 -0", 700, negativeZero, []byte{0x80, 0, 0, 0}},
+		{"float4 NaN", 700, nan, []byte{0x7f, 0xc0, 0, 0}},
+		{"int8 -2^63", 20, float64(math.MinInt64), []byte{0x80, 0, 0, 0, 0, 0, 0, 0}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := appendBinaryResultValue(nil, tc.oid, tc.value)
+			if err != nil {
+				t.Fatalf("encode %s: %v", tc.name, err)
+			}
+			assertBytes(t, tc.name, got, tc.want)
+		})
+	}
+
+	// float4 cannot represent an infinity, and 2^63 does not fit int8.
+	for _, tc := range []struct {
+		name  string
+		oid   int32
+		value interface{}
+	}{
+		{"float4 +Inf", 700, positiveInfinity},
+		{"float4 -Inf", 700, negativeInfinity},
+		{"float4 Infinity text", 700, "-Infinity"},
+		{"int8 2^63", 20, math.Pow(2, 63)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := appendBinaryResultValue(nil, tc.oid, tc.value); err == nil {
+				t.Fatalf("%s: encoding succeeded, want an error", tc.name)
+			}
+		})
+	}
+}
