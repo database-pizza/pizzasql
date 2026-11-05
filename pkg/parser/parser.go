@@ -304,9 +304,11 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.Offset = offset
 	}
 
-	if err := p.rejectLockingClause(); err != nil {
+	locking, err := p.parseLockingClause()
+	if err != nil {
 		return nil, err
 	}
+	stmt.Locking = locking
 
 	return stmt, nil
 }
@@ -443,8 +445,8 @@ func (p *Parser) parseCompoundChain(first *SelectStmt) (*CompoundSelect, error) 
 		}
 		compound.Offset = offset
 	}
-	if err := p.rejectLockingClause(); err != nil {
-		return nil, err
+	if p.isLockingClauseStart() {
+		return nil, pgerror.Unsupported("row locking is not supported on a compound SELECT")
 	}
 
 	return compound, nil
@@ -735,24 +737,48 @@ func (p *Parser) isLockingClauseStart() bool {
 	return p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "FOR")
 }
 
-// rejectLockingClause rejects SELECT ... FOR UPDATE/SHARE and its NOWAIT / SKIP
-// LOCKED variants. The engine has no row locks; claiming support by parsing the
-// clause would silently provide weaker isolation than PostgreSQL.
-func (p *Parser) rejectLockingClause() error {
+// parseLockingClause parses SELECT ... FOR UPDATE/SHARE [NOWAIT | SKIP LOCKED].
+// FOR is not a reserved keyword in this lexer, so the caller already used
+// isLockingClauseStart to avoid treating it as a table alias.
+func (p *Parser) parseLockingClause() (*LockingClause, error) {
 	if !p.isLockingClauseStart() {
-		return nil
+		return nil, nil
 	}
-	locking := p.peekTokenIs(lexer.TokenUPDATE) ||
-		(p.peekTokenIs(lexer.TokenIdent) &&
-			(strings.EqualFold(p.peekToken.Literal, "SHARE") ||
-				strings.EqualFold(p.peekToken.Literal, "NO") ||
-				strings.EqualFold(p.peekToken.Literal, "KEY")))
-	if !locking {
-		return nil
+	p.nextToken() // consume FOR
+
+	clause := &LockingClause{Strength: LockUpdate}
+	switch {
+	case p.curTokenIs(lexer.TokenUPDATE):
+		p.nextToken()
+	case p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "SHARE"):
+		clause.Strength = LockShare
+		p.nextToken()
+	case p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "NO"):
+		return nil, pgerror.Unsupported("FOR NO KEY UPDATE is not supported; use FOR UPDATE")
+	case p.curTokenIs(lexer.TokenKEY):
+		return nil, pgerror.Unsupported("FOR KEY SHARE is not supported; use FOR SHARE")
+	default:
+		return nil, p.curError("expected UPDATE or SHARE after FOR")
 	}
-	return pgerror.Unsupported(
-		"SELECT ... FOR UPDATE/SHARE row locking (including NOWAIT and SKIP LOCKED) is not supported; use the documented optimistic transaction model with SQLSTATE 40001 retries instead",
-	)
+
+	if p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "OF") {
+		return nil, pgerror.Unsupported("SELECT ... FOR UPDATE OF table is not supported")
+	}
+	if p.curTokenIs(lexer.TokenIdent) {
+		switch {
+		case strings.EqualFold(p.curToken.Literal, "NOWAIT"):
+			clause.Wait = LockWaitNoWait
+			p.nextToken()
+		case strings.EqualFold(p.curToken.Literal, "SKIP"):
+			p.nextToken()
+			if !p.curTokenIs(lexer.TokenIdent) || !strings.EqualFold(p.curToken.Literal, "LOCKED") {
+				return nil, p.curError("expected LOCKED after SKIP")
+			}
+			clause.Wait = LockWaitSkipLocked
+			p.nextToken()
+		}
+	}
+	return clause, nil
 }
 
 func (p *Parser) parseJoin() (*JoinClause, error) {

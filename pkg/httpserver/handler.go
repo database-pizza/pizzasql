@@ -529,6 +529,20 @@ func sqlStateHTTPError(err error) *HTTPError {
 			Message: message,
 		}
 	}
+	if errors.Is(err, pgerror.ErrLockNotAvailable) {
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    pgerror.CodeLockNotAvailable,
+			Message: message,
+		}
+	}
+	if errors.Is(err, pgerror.ErrDeadlockDetected) {
+		return &HTTPError{
+			Status:  http.StatusConflict,
+			Code:    pgerror.CodeDeadlockDetected,
+			Message: message,
+		}
+	}
 	if strings.Contains(message, "feature not supported:") {
 		return &HTTPError{
 			Status:  http.StatusBadRequest,

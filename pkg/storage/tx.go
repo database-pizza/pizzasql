@@ -26,6 +26,17 @@ type Session struct {
 	inTx    bool
 	aborted bool
 
+	// autoLocks is true while a locking SELECT without an explicit transaction
+	// holds its statement-scoped row locks.
+	autoLocks bool
+
+	// lockingRead suppresses table/predicate generation tracking while a
+	// locking SELECT scans. A row lock plus the per-row LSN is the conflict
+	// boundary for that read; recording a whole-table generation would abort
+	// every queue worker whenever another worker claimed a different row.
+	lockingRead  bool
+	lockingTable string
+
 	// overlay holds staged writes keyed by lowercased table then data key.
 	overlay map[string]map[string]*overlayEntry
 
@@ -101,6 +112,80 @@ func (s *Session) Begin() error {
 	s.fkCatalog = nil
 	s.fkVersion = 0
 	return nil
+}
+
+// BeginLockStatement starts the statement-scoped lock lifetime used by an
+// autocommit SELECT ... FOR UPDATE. Inside an explicit transaction the locks
+// already live until COMMIT/ROLLBACK, so this is a no-op.
+func (s *Session) BeginLockStatement() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inTx {
+		s.autoLocks = true
+	}
+}
+
+// EndLockStatement releases statement-scoped row locks after an autocommit
+// locking SELECT.
+func (s *Session) EndLockStatement() {
+	s.mu.Lock()
+	release := !s.inTx && s.autoLocks
+	s.autoLocks = false
+	s.mu.Unlock()
+	if release {
+		s.table.rowLocks.ReleaseAll(s)
+	}
+}
+
+// RowLockKey returns the durable row key used by the row-lock manager.
+func (s *Session) RowLockKey(table, pk string) string {
+	return s.table.dataKey(table, pk)
+}
+
+// AcquireRowLock takes a row lock for a locking SELECT. The caller must hold the
+// row lock before returning the row to the client and must re-read the row after
+// acquisition, because another transaction may have committed in between.
+func (s *Session) AcquireRowLock(table, pk string, mode LockMode, wait LockWait) error {
+	return s.table.rowLocks.Acquire(s, s.RowLockKey(table, pk), mode, wait)
+}
+
+// guardKeys holds the row-lock commit gate while fn publishes a durable write,
+// and rejects the write if another transaction holds one of keys.
+func (s *Session) guardKeys(keys []string, fn func() error) error {
+	release, err := s.table.rowLocks.BeginWrite(s, keys, nil)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrSerialization, err)
+	}
+	defer release()
+	return fn()
+}
+
+// guardTable is the coarse guard for autocommit bulk writes whose exact keys
+// are not known before the scan.
+func (s *Session) guardTable(table string, fn func() error) error {
+	release, err := s.table.rowLocks.BeginTableWrite(s, s.table.dataPrefix(table))
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrSerialization, err)
+	}
+	defer release()
+	return fn()
+}
+
+// BeginLockingRead marks scans of table as row-locking reads. Reads of other
+// tables in subqueries keep normal phantom tracking.
+func (s *Session) BeginLockingRead(table string) {
+	s.mu.Lock()
+	s.lockingRead = true
+	s.lockingTable = table
+	s.mu.Unlock()
+}
+
+// EndLockingRead restores normal phantom tracking.
+func (s *Session) EndLockingRead() {
+	s.mu.Lock()
+	s.lockingRead = false
+	s.lockingTable = ""
+	s.mu.Unlock()
 }
 
 // InTx reports whether a transaction is in progress.
@@ -275,6 +360,29 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 	// gates for the affected tables below, because the commit rewrites or
 	// removes their durable rows.
 	hasDDL := s.schemaTx != nil && s.schemaTx.hasDDL()
+
+	// Row locks are optimistic: a write that touches a row locked by another
+	// transaction fails with 40001 instead of waiting. Hold the lock-manager
+	// read gate from this check through publication so a locking SELECT cannot
+	// insert a lock in the window between the check and the durable batch.
+	writeKeys := make([]string, 0)
+	for _, entries := range s.overlay {
+		for key := range entries {
+			writeKeys = append(writeKeys, key)
+		}
+	}
+	var ddlPrefixes []string
+	if hasDDL {
+		for _, table := range s.schemaTx.touchedTables() {
+			ddlPrefixes = append(ddlPrefixes, s.table.dataPrefix(table))
+		}
+	}
+	releaseRowLocks, lockErr := s.table.rowLocks.BeginWrite(s, writeKeys, ddlPrefixes)
+	if lockErr != nil {
+		s.resetLocked()
+		return 0, fmt.Errorf("%w: %v", ErrSerialization, lockErr)
+	}
+	defer releaseRowLocks()
 
 	// Lock order for every path that touches both a table and the catalog is
 	// session lock -> foreign-key write gate -> table gates (sorted by name) ->
@@ -779,6 +887,12 @@ func (s *Session) hasUniqueIndexLocked(table string) (bool, error) {
 	return false, nil
 }
 
+// lockingTableIs reports whether table is the main table of the active
+// locking SELECT, whose rows are covered by explicit row locks.
+func (s *Session) lockingTableIs(table string) bool {
+	return s.lockingRead && strings.EqualFold(table, s.lockingTable)
+}
+
 func (s *Session) resetLocked() {
 	s.inTx = false
 	s.aborted = false
@@ -790,6 +904,10 @@ func (s *Session) resetLocked() {
 	s.schemaTx = nil
 	s.fkCatalog = nil
 	s.fkVersion = 0
+	s.autoLocks = false
+	s.lockingRead = false
+	s.lockingTable = ""
+	s.table.rowLocks.ReleaseAll(s)
 }
 
 func (s *Session) stagePut(table, key string, row Row) {
@@ -821,6 +939,17 @@ func (s *Session) stageDelete(table, key string, row Row) {
 // GetByPK retrieves a row by primary key, observing the staged overlay in a
 // transaction and recording the observed LSN for validation.
 func (s *Session) GetByPK(table, pk string) (Row, error) {
+	return s.getByPK(table, pk, true)
+}
+
+// GetByPKNoRead is GetByPK without recording the durable LSN. A locking SELECT
+// uses it for the pre-lock candidate lookup: the read is only part of the
+// transaction's conflict set once the row lock has actually been acquired.
+func (s *Session) GetByPKNoRead(table, pk string) (Row, error) {
+	return s.getByPK(table, pk, false)
+}
+
+func (s *Session) getByPK(table, pk string, recordRead bool) (Row, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.inTx {
@@ -838,12 +967,16 @@ func (s *Session) GetByPK(table, pk string) (Row, error) {
 	row, lsn, err := s.table.getKeyWithLSN(durableKey)
 	if err != nil {
 		if err == ErrKeyNotFound {
-			s.reads[durableKey] = 0
+			if recordRead {
+				s.reads[durableKey] = 0
+			}
 			return nil, ErrKeyNotFound
 		}
 		return nil, err
 	}
-	s.reads[durableKey] = lsn
+	if recordRead {
+		s.reads[durableKey] = lsn
+	}
 	if err := s.applyStagedRewritesLocked(table, row); err != nil {
 		return nil, err
 	}
@@ -920,13 +1053,15 @@ func (s *Session) selectLocked(table string, filter func(Row) bool) ([]Row, erro
 	tableLock := s.table.tableLock(tl)
 	tableLock.RLock()
 	defer tableLock.RUnlock()
-	if _, ok := s.scanGens[tl]; !ok {
-		s.scanGens[tl] = s.table.generation(tl)
+	if !s.lockingTableIs(table) {
+		if _, ok := s.scanGens[tl]; !ok {
+			s.scanGens[tl] = s.table.generation(tl)
+		}
 	}
 	overlay := s.overlay[tl]
 	source := s.durableSourceLocked(table)
 	sourceLower := strings.ToLower(source)
-	if sourceLower != tl {
+	if sourceLower != tl && !s.lockingTableIs(table) {
 		// A concurrent write to the committed name must invalidate the commit
 		// just like a write to the staged name.
 		if _, ok := s.scanGens[sourceLower]; !ok {
@@ -943,7 +1078,9 @@ func (s *Session) selectLocked(table string, filter func(Row) bool) ([]Row, erro
 		if _, ok := overlay[s.table.dataKey(table, pk)]; ok {
 			return false, nil
 		}
-		s.reads[durableKey] = lsn
+		if !s.lockingTableIs(table) {
+			s.reads[durableKey] = lsn
+		}
 		if err := s.applyStagedRewritesLocked(table, row); err != nil {
 			return true, err
 		}
@@ -1008,11 +1145,13 @@ func (s *Session) SelectByIndex(table, indexName string, colValue interface{}) (
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := s.predicateGens[predicate.valueKey]; !ok {
-		s.predicateGens[predicate.valueKey] = predicateRead{table: tableKey, gen: predicate.valueGen}
-	}
-	if _, ok := s.predicateGens[predicate.wildcardKey]; !ok {
-		s.predicateGens[predicate.wildcardKey] = predicateRead{table: tableKey, gen: predicate.wildcardGen}
+	if !s.lockingTableIs(table) {
+		if _, ok := s.predicateGens[predicate.valueKey]; !ok {
+			s.predicateGens[predicate.valueKey] = predicateRead{table: tableKey, gen: predicate.valueGen}
+		}
+		if _, ok := s.predicateGens[predicate.wildcardKey]; !ok {
+			s.predicateGens[predicate.wildcardKey] = predicateRead{table: tableKey, gen: predicate.wildcardGen}
+		}
 	}
 	overlay := s.overlay[tableKey]
 	rows := make([]Row, 0, len(versions)+len(overlay))
@@ -1020,7 +1159,9 @@ func (s *Session) SelectByIndex(table, indexName string, colValue interface{}) (
 		if _, staged := overlay[version.key]; staged {
 			continue
 		}
-		s.reads[version.key] = version.lsn
+		if !s.lockingTableIs(table) {
+			s.reads[version.key] = version.lsn
+		}
 		if err := s.applyStagedRewritesLocked(table, version.row); err != nil {
 			return nil, err
 		}
@@ -1061,11 +1202,13 @@ func (s *Session) SelectByIndexKey(table string, idx *Index, valueKey string) ([
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := s.predicateGens[predicate.valueKey]; !ok {
-		s.predicateGens[predicate.valueKey] = predicateRead{table: tableKey, gen: predicate.valueGen}
-	}
-	if _, ok := s.predicateGens[predicate.wildcardKey]; !ok {
-		s.predicateGens[predicate.wildcardKey] = predicateRead{table: tableKey, gen: predicate.wildcardGen}
+	if !s.lockingTableIs(table) {
+		if _, ok := s.predicateGens[predicate.valueKey]; !ok {
+			s.predicateGens[predicate.valueKey] = predicateRead{table: tableKey, gen: predicate.valueGen}
+		}
+		if _, ok := s.predicateGens[predicate.wildcardKey]; !ok {
+			s.predicateGens[predicate.wildcardKey] = predicateRead{table: tableKey, gen: predicate.wildcardGen}
+		}
 	}
 	overlay := s.overlay[tableKey]
 	rows := make([]Row, 0, len(versions)+len(overlay))
@@ -1073,7 +1216,9 @@ func (s *Session) SelectByIndexKey(table string, idx *Index, valueKey string) ([
 		if _, staged := overlay[version.key]; staged {
 			continue
 		}
-		s.reads[version.key] = version.lsn
+		if !s.lockingTableIs(table) {
+			s.reads[version.key] = version.lsn
+		}
 		if err := s.applyStagedRewritesLocked(table, version.row); err != nil {
 			return nil, err
 		}
@@ -1242,7 +1387,14 @@ func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) 
 			return nil, false, err
 		}
 		if !cascading {
-			return s.table.UpdateByPK(table, pk, updateFn)
+			var row Row
+			var updated bool
+			err := s.guardKeys([]string{s.RowLockKey(table, pk)}, func() error {
+				var err error
+				row, updated, err = s.table.UpdateByPK(table, pk, updateFn)
+				return err
+			})
+			return row, updated, err
 		}
 		oldRow, updated, err := s.updateByPKStaged(table, pk, updateFn)
 		unlockFK()
@@ -1329,7 +1481,14 @@ func (s *Session) DeleteByPK(table, pk string) (Row, bool, error) {
 			return nil, false, err
 		}
 		if !cascading {
-			return s.table.DeleteByPK(table, pk)
+			var row Row
+			var deleted bool
+			err := s.guardKeys([]string{s.RowLockKey(table, pk)}, func() error {
+				var err error
+				row, deleted, err = s.table.DeleteByPK(table, pk)
+				return err
+			})
+			return row, deleted, err
 		}
 		row, deleted, err := s.deleteByPKStaged(table, pk)
 		unlockFK()
@@ -1405,7 +1564,13 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 	s.mu.Lock()
 	if !s.inTx {
 		s.mu.Unlock()
-		return s.table.UpdateFunc(table, updateFn, filter)
+		var count int
+		err := s.guardTable(table, func() error {
+			var err error
+			count, err = s.table.UpdateFunc(table, updateFn, filter)
+			return err
+		})
+		return count, err
 	}
 	defer s.mu.Unlock()
 
@@ -1453,7 +1618,13 @@ func (s *Session) Delete(table string, filter func(Row) bool) (int, error) {
 	s.mu.Lock()
 	if !s.inTx {
 		s.mu.Unlock()
-		return s.table.Delete(table, filter)
+		var count int
+		err := s.guardTable(table, func() error {
+			var err error
+			count, err = s.table.Delete(table, filter)
+			return err
+		})
+		return count, err
 	}
 	defer s.mu.Unlock()
 

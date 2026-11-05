@@ -31,15 +31,33 @@ func errorField(t *testing.T, msg *Message, want byte) string {
 	return ""
 }
 
-func TestLockingClauseRejectedOverSimpleQuery(t *testing.T) {
+func TestLockingClauseSupportedShapeOverSimpleQuery(t *testing.T) {
 	c, client := newDataConnection(t)
 	runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (id INTEGER PRIMARY KEY)"), 0)})
 
 	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("SELECT * FROM t FOR UPDATE"), 0)})
-	if code := errorCode(msgs[0]); code != ErrCodeFeatureNotSupported {
-		t.Fatalf("error code = %q, want %q", code, ErrCodeFeatureNotSupported)
+	if code := errorCode(msgs[0]); code != "" {
+		t.Fatalf("locking query error = %q", code)
 	}
-	if message := errorField(t, msgs[0], ErrorFieldMessage); !bytes.Contains([]byte(message), []byte("row locking")) {
-		t.Fatalf("error message = %q, want a row-locking explanation", message)
+}
+
+func TestLockingClauseRejectsUnsupportedShapes(t *testing.T) {
+	c, client := newDataConnection(t)
+	for _, sql := range []string{
+		"CREATE TABLE t (id INTEGER PRIMARY KEY)",
+		"CREATE TABLE u (id INTEGER PRIMARY KEY)",
+	} {
+		runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(sql), 0)})
+	}
+	for _, sql := range []string{
+		"SELECT * FROM t a JOIN u b ON a.id = b.id FOR UPDATE",
+		"SELECT COUNT(*) FROM t FOR UPDATE",
+		"SELECT DISTINCT id FROM t FOR UPDATE",
+		"SELECT id FROM t UNION SELECT id FROM u FOR UPDATE",
+	} {
+		msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(sql), 0)})
+		if code := errorCode(msgs[0]); code != ErrCodeFeatureNotSupported {
+			t.Fatalf("%s: error code = %q, want %q", sql, code, ErrCodeFeatureNotSupported)
+		}
 	}
 }

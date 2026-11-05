@@ -520,6 +520,15 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if e.lockedScanDepth > 0 && !e.fromResolvesToCatalogRelations(stmt.From) {
 		return nil, pgerror.Unsupported("a correlated subquery cannot be evaluated inside a locked table scan; its predicate must not read the row being written")
 	}
+	if stmt.Locking != nil {
+		if err := e.validateLockingSelect(stmt); err != nil {
+			return nil, err
+		}
+		e.session.BeginLockStatement()
+		e.session.BeginLockingRead(stmt.From[0].Name)
+		defer e.session.EndLockingRead()
+		defer e.session.EndLockStatement()
+	}
 	// This SELECT may be a view or CTE body that the statement-level prime never
 	// saw, and its WHERE is pushed into the scan below, so resolve the catalog
 	// snapshot before the scan starts.
@@ -748,7 +757,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			colName, colValue, isEquality := e.extractSelectLookupCondition(condition, stmt.From[0])
 			if isEquality {
 				if schema.IsSingleColumnPrimaryKey() && strings.EqualFold(schema.PrimaryKey, colName) && safePrimaryKeyLiteral(colValue) {
-					row, getErr := e.session.GetByPK(tableName, fmt.Sprintf("%v", colValue))
+					lookup := e.session.GetByPK
+					if stmt.Locking != nil {
+						lookup = e.session.GetByPKNoRead
+					}
+					row, getErr := lookup(tableName, fmt.Sprintf("%v", colValue))
 					if getErr == nil {
 						normalizeRowBySchema(row, schema)
 						rows = []storage.Row{row}
@@ -799,7 +812,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				return toBool(val)
 			}
 		}
-		if limit, bounded := scanLimit(stmt); bounded && (effectiveWhere == nil || canFilterInScan) {
+		if limit, bounded := scanLimit(stmt); stmt.Locking == nil && bounded && (effectiveWhere == nil || canFilterInScan) {
 			rows, err = e.session.SelectLimited(tableName, filter, limit)
 		} else {
 			rows, err = e.session.Select(tableName, filter)
@@ -1458,8 +1471,19 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return e.executeAggregateSelect(stmt, rows, schema)
 	}
 
-	// Apply ORDER BY, LIMIT, and OFFSET.
-	rows = e.orderAndLimitRows(rows, stmt.OrderBy, stmt.Limit, stmt.Offset, stmt.Columns)
+	// Apply ORDER BY, LIMIT, and OFFSET. A locking SELECT sorts first, then
+	// locks rows in that order until it has enough candidates, so SKIP LOCKED
+	// can continue past contended rows and LIMIT counts only locked rows.
+	if stmt.Locking != nil {
+		rows = e.orderAndLimitRows(rows, stmt.OrderBy, nil, nil, stmt.Columns)
+		rows, err = e.applyRowLocks(stmt, tableName, schema, effectiveWhere, rows, e.lockingRowLimit(stmt))
+		if err != nil {
+			return nil, err
+		}
+		rows = e.orderAndLimitRows(rows, nil, stmt.Limit, stmt.Offset, stmt.Columns)
+	} else {
+		rows = e.orderAndLimitRows(rows, stmt.OrderBy, stmt.Limit, stmt.Offset, stmt.Columns)
+	}
 
 	// Build result
 	result := NewResult("SELECT")
@@ -5204,6 +5228,17 @@ func (e *Executor) RollbackActive() error {
 
 // extractIndexableCondition extracts column name and value from a simple equality condition.
 // Returns (column, value, true) if the expression is column = literal.
+// parameterLiteral returns the literal inside a bound-parameter marker. The
+// marker is an identity function in the executor, but index and point-update
+// planning must see the value as a constant.
+func parameterLiteral(expr parser.Expr) (*parser.LiteralExpr, bool) {
+	if fn, ok := expr.(*parser.FunctionCall); ok && strings.EqualFold(fn.Name, "PIZZASQL_PARAM") && len(fn.Args) == 1 {
+		return parameterLiteral(fn.Args[0])
+	}
+	lit, ok := expr.(*parser.LiteralExpr)
+	return lit, ok
+}
+
 func (e *Executor) extractIndexableCondition(expr parser.Expr) (string, interface{}, bool) {
 	binExpr, ok := expr.(*parser.BinaryExpr)
 	if !ok {
@@ -5215,25 +5250,128 @@ func (e *Executor) extractIndexableCondition(expr parser.Expr) (string, interfac
 		return "", nil, false
 	}
 
-	// Check for column = literal pattern
+	// Check for column = literal pattern. Bound parameters are inlined as
+	// pizzasql_param(<literal>), so unwrap that marker before deciding whether
+	// this equality can use the primary-key point update.
 	colRef, leftIsCol := binExpr.Left.(*parser.ColumnRef)
-	litExpr, rightIsLit := binExpr.Right.(*parser.LiteralExpr)
-
+	litExpr, rightIsLit := parameterLiteral(binExpr.Right)
 	if leftIsCol && rightIsLit && colRef.Table == "" {
 		val, _ := e.evalLiteral(litExpr)
 		return colRef.Column, val, true
 	}
 
 	// Check for literal = column pattern
-	litExpr, leftIsLit := binExpr.Left.(*parser.LiteralExpr)
+	leftLitExpr, leftIsLit := parameterLiteral(binExpr.Left)
 	colRef, rightIsCol := binExpr.Right.(*parser.ColumnRef)
 
 	if leftIsLit && rightIsCol && colRef.Table == "" {
-		val, _ := e.evalLiteral(litExpr)
+		val, _ := e.evalLiteral(leftLitExpr)
 		return colRef.Column, val, true
 	}
 
 	return "", nil, false
+}
+
+// validateLockingSelect rejects shapes whose row identity is ambiguous. A
+// locking clause is only meaningful for a single base table today; derived
+// tables, joins, set operations, and grouped results would otherwise need a
+// rule for which underlying rows to lock.
+func (e *Executor) validateLockingSelect(stmt *parser.SelectStmt) error {
+	if len(stmt.From) != 1 || stmt.From[0].Subquery != nil || stmt.From[0].Function != nil || stmt.From[0].Join != nil {
+		return pgerror.Unsupported("row locking requires exactly one base table in FROM")
+	}
+	if len(stmt.With) > 0 || stmt.Compound != nil {
+		return pgerror.Unsupported("row locking is not supported on a CTE or compound SELECT")
+	}
+	if stmt.Distinct || len(stmt.GroupBy) > 0 || stmt.Having != nil || e.hasAggregates(stmt.Columns) {
+		return pgerror.Unsupported("row locking is not supported with DISTINCT, GROUP BY, HAVING, or aggregates")
+	}
+	return nil
+}
+
+// lockingRowLimit bounds how many candidates applyRowLocks must acquire before
+// the final OFFSET/LIMIT is applied. A negative result means no limit.
+func (e *Executor) lockingRowLimit(stmt *parser.SelectStmt) int {
+	if stmt.Limit == nil {
+		return -1
+	}
+	limit := e.evalIntExpr(stmt.Limit)
+	if limit < 0 {
+		return -1
+	}
+	offset := 0
+	if stmt.Offset != nil {
+		offset = e.evalIntExpr(stmt.Offset)
+		if offset < 0 {
+			offset = 0
+		}
+	}
+	return offset + limit
+}
+
+// applyRowLocks acquires the requested lock for each candidate, re-reads the row
+// under the lock, and re-checks the predicate. SKIP LOCKED drops contended rows;
+// NOWAIT reports 55P03; blocking modes wait with deadlock detection.
+func (e *Executor) applyRowLocks(stmt *parser.SelectStmt, table string, schema *storage.Schema, where parser.Expr, rows []storage.Row, maxRows int) ([]storage.Row, error) {
+	mode := storage.LockUpdate
+	if stmt.Locking.Strength == parser.LockShare {
+		mode = storage.LockShare
+	}
+	wait := storage.LockWaitBlock
+	switch stmt.Locking.Wait {
+	case parser.LockWaitNoWait:
+		wait = storage.LockWaitNoWait
+	case parser.LockWaitSkipLocked:
+		wait = storage.LockWaitSkip
+	}
+	if maxRows == 0 {
+		return []storage.Row{}, nil
+	}
+	alias := stmt.From[0].Alias
+	locked := make([]storage.Row, 0, len(rows))
+	for _, row := range rows {
+		pk, err := schema.PrimaryKeyForRow(row)
+		if err != nil {
+			return nil, pgerror.Unsupported("row locking requires a table with a primary key")
+		}
+		if err := e.session.AcquireRowLock(table, pk, mode, wait); err != nil {
+			switch {
+			case err == storage.ErrRowLocked && wait == storage.LockWaitSkip:
+				continue
+			case err == storage.ErrLockNotAvailable:
+				return nil, pgerror.LockNotAvailable("could not obtain lock on row")
+			case err == storage.ErrDeadlockDetected:
+				return nil, pgerror.DeadlockDetected("deadlock detected while waiting for a row lock")
+			default:
+				return nil, err
+			}
+		}
+		fresh, err := e.session.GetByPK(table, pk)
+		if err == storage.ErrKeyNotFound {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		checkRow := fresh
+		if alias != "" {
+			checkRow = e.addTableAlias(fresh, alias)
+		}
+		if where != nil {
+			val, err := e.evalExpr(where, checkRow)
+			if err != nil {
+				return nil, err
+			}
+			if !toBool(val) {
+				continue
+			}
+		}
+		locked = append(locked, checkRow)
+		if maxRows >= 0 && len(locked) >= maxRows {
+			break
+		}
+	}
+	return locked, nil
 }
 
 // Bound only simple scans. Final OFFSET/LIMIT is still applied once by the

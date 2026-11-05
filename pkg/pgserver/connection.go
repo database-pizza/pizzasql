@@ -451,6 +451,16 @@ func (c *Connection) handleQuery(msg *Message) error {
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
+			} else if errors.Is(err, pgerror.ErrLockNotAvailable) {
+				code = ErrCodeLockNotAvailable
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
+			} else if errors.Is(err, pgerror.ErrDeadlockDetected) {
+				code = ErrCodeDeadlockDetected
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if errors.Is(err, pgerror.ErrInvalidText) {
 				code = ErrCodeInvalidText
 				if c.txStatus == TxStatusInBlock {
@@ -798,6 +808,16 @@ func (c *Connection) classifyExecuteError(stmt parser.Statement, err error) *exe
 	if errors.Is(err, storage.ErrSerialization) {
 		code = ErrCodeSerializationFailure
 		c.txStatus = TxStatusIdle
+	} else if errors.Is(err, pgerror.ErrLockNotAvailable) {
+		code = ErrCodeLockNotAvailable
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.Is(err, pgerror.ErrDeadlockDetected) {
+		code = ErrCodeDeadlockDetected
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
 	} else if errors.Is(err, pgerror.ErrInvalidText) {
 		code = ErrCodeInvalidText
 		if c.txStatus == TxStatusInBlock {

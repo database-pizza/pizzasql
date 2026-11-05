@@ -67,6 +67,10 @@ type TableManager struct {
 	generations          map[string]uint64
 	predicateGenerations map[string]uint64
 
+	// rowLocks holds optimistic row locks created by SELECT ... FOR UPDATE.
+	// Ordinary writes only consult it at their commit/batch boundary.
+	rowLocks *RowLockManager
+
 	// exprMu guards exprEval, the pluggable evaluator for expression-index
 	// columns. It is set by the SQL executor so storage stays independent of
 	// the SQL front end.
@@ -111,8 +115,12 @@ func NewTableManager(pool *KVPool, schema *SchemaManager, database string) *Tabl
 		countGeneration:      make(map[string]time.Time),
 		generations:          make(map[string]uint64),
 		predicateGenerations: make(map[string]uint64),
+		rowLocks:             NewRowLockManager(),
 	}
 }
+
+// RowLocks returns the manager for locking reads on this table set.
+func (m *TableManager) RowLocks() *RowLockManager { return m.rowLocks }
 
 func (m *TableManager) tableLock(key string) *sync.RWMutex {
 	return m.schema.tableLock(key)
