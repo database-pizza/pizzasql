@@ -181,15 +181,9 @@ func (e *Executor) statementDefaults(schema *storage.Schema) (map[string]interfa
 	return defaults, nil
 }
 
-// evalStorageDefault is the storage-facing evaluator. ADD COLUMN evaluates a
-// default once per rewritten row, so every call samples the executor clock;
-// that keeps a storage-side backfill on the same clock as the session.
-func (e *Executor) evalStorageDefault(expression string) (interface{}, error) {
-	return evalDefaultExpressionAt(expression, e.statementNow())
-}
-
 // statementNow returns the instant one statement's expression defaults use.
-// Tests inject e.clock to make that instant deterministic.
+// The executor samples it once per INSERT/UPDATE; the storage layer samples it
+// once per ALTER TABLE statement. Tests inject e.clock to make it deterministic.
 func (e *Executor) statementNow() time.Time {
 	if e.clock != nil {
 		return e.clock().UTC()

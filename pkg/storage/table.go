@@ -540,7 +540,7 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 		if _, ok := normalizedRow[col.Name]; ok {
 			continue
 		}
-		value, hasDefault, err := m.schema.columnDefaultValue(col)
+		value, hasDefault, err := m.schema.columnDefaultValue(col, m.schema.defaultNow())
 		if err != nil {
 			return nil, "", err
 		}
@@ -728,7 +728,7 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 			if _, ok := nr[col.Name]; ok {
 				continue
 			}
-			value, hasDefault, err := m.schema.columnDefaultValue(col)
+			value, hasDefault, err := m.schema.columnDefaultValue(col, m.schema.defaultNow())
 			if err != nil {
 				return 0, 0, err
 			}

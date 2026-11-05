@@ -132,10 +132,12 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 	table.SetExpressionEvaluator(EvalStoredExpression)
 	// Non-constant DEFAULT expressions are likewise stored as SQL text; storage
 	// evaluates them when it backfills ADD COLUMN rows or completes a row image
-	// that predates the column. The evaluator closes over this executor so the
-	// session clock also drives storage-side evaluation. Ordinary writes
-	// evaluate them once per statement in this package.
-	schema.SetDefaultEvaluator(executor.evalStorageDefault)
+	// that predates the column. Storage samples the clock once per ALTER
+	// statement through this executor, so the session clock also drives
+	// storage-side evaluation; ordinary writes evaluate defaults once per
+	// statement in this package.
+	schema.SetDefaultEvaluator(evalDefaultExpressionAt)
+	schema.SetDefaultClock(executor.statementNow)
 	schema.SetCheckEvaluator(EvalCheckExpression)
 
 	// Register the main database
@@ -4151,8 +4153,8 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 // into every existing row (see SchemaManager.AddColumn), so the column reads
 // the default on rows that predate the statement as well as on later INSERTs
 // that omit it. A constant default is copied from the catalog; a non-constant
-// one is evaluated per rewritten row, so CURRENT_TIMESTAMP stamps the backfill
-// at rewrite time.
+// one is evaluated at a single instant sampled for the ALTER statement, so
+// validation and the backfill write the same CURRENT_TIMESTAMP value.
 func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddColumnAction) (*Result, error) {
 	schema, err := e.schema.GetSchema(table)
 	if err != nil {

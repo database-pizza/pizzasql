@@ -136,14 +136,23 @@ type SchemaManager struct {
 	// defaultEval evaluates a persisted non-constant DEFAULT expression. The
 	// SQL executor registers one so storage can backfill ADD COLUMN rows and
 	// complete row images without importing the parser or executor.
+	// defaultClock supplies the instant a DDL statement samples once for every
+	// expression default it touches.
 	defaultEvalMu sync.RWMutex
 	defaultEval   DefaultEvaluator
+	defaultClock  DefaultClock
 }
 
 // DefaultEvaluator evaluates a persisted non-constant DEFAULT expression, such
-// as CURRENT_TIMESTAMP, to the value a row receives. Expression defaults are
-// never frozen at DDL time: each write reads the clock again.
-type DefaultEvaluator func(expression string) (interface{}, error)
+// as CURRENT_TIMESTAMP, at the supplied instant. Expression defaults are never
+// frozen at DDL time; the caller samples one instant per statement so every row
+// it touches sees the same value.
+type DefaultEvaluator func(expression string, now time.Time) (interface{}, error)
+
+// DefaultClock supplies the instant a statement's expression defaults use. The
+// SQL executor registers a clock backed by the session so a storage-side ADD
+// COLUMN backfill matches statement-time now().
+type DefaultClock func() time.Time
 
 // SetDefaultEvaluator installs the evaluator used for expression defaults.
 func (m *SchemaManager) SetDefaultEvaluator(eval DefaultEvaluator) {
@@ -152,10 +161,31 @@ func (m *SchemaManager) SetDefaultEvaluator(eval DefaultEvaluator) {
 	m.defaultEvalMu.Unlock()
 }
 
+// SetDefaultClock installs the clock sampled once per DDL statement for
+// expression defaults.
+func (m *SchemaManager) SetDefaultClock(clock DefaultClock) {
+	m.defaultEvalMu.Lock()
+	m.defaultClock = clock
+	m.defaultEvalMu.Unlock()
+}
+
 func (m *SchemaManager) defaultEvaluator() DefaultEvaluator {
 	m.defaultEvalMu.RLock()
 	defer m.defaultEvalMu.RUnlock()
 	return m.defaultEval
+}
+
+// defaultNow samples the registered clock, falling back to the wall clock.
+// Callers sample it once per statement and pass the instant down so validation
+// and the rewrite observe the same value.
+func (m *SchemaManager) defaultNow() time.Time {
+	m.defaultEvalMu.RLock()
+	clock := m.defaultClock
+	m.defaultEvalMu.RUnlock()
+	if clock != nil {
+		return clock().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // CheckEvaluator reports whether a persisted CHECK expression holds for a row.
@@ -1054,12 +1084,13 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 // published together in one batch write so a crash cannot leave the column
 // visible without the constraints that validate it. A constant default is
 // deterministic, so its UNIQUE prediction can run as a cheap pre-scan. A
-// clock-reading default cannot be predicted: the UNIQUE duplicate set is
-// collected during the rewrite itself, because a separate scan could observe a
-// different instant and publish an index over duplicate values; the CHECK
-// pre-scan resolves the same clock default for each row it validates. A
-// nullable column without a default needs no rewrite because a missing row
-// field already reads as NULL. Like DROP COLUMN, the statement holds the
+// clock-reading default is evaluated at one instant sampled for this ALTER
+// statement, and that instant is passed to every validation scan and to the
+// rewrite, so a clock crossing between them cannot publish a row that violates
+// the constraint the statement adds; the UNIQUE duplicate set is still
+// collected during the rewrite so it covers exactly the values the index will
+// see. A nullable column without a default needs no rewrite because a missing
+// row field already reads as NULL. Like DROP COLUMN, the statement holds the
 // catalog lock for the whole scan, so the cost is one table scan per validating
 // constraint plus a table-wide stall per ADD COLUMN that has a default, an
 // index, or a check.
@@ -1070,6 +1101,12 @@ func (m *SchemaManager) AddColumn(table string, column Column, checks []CheckCon
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// One instant for the whole ALTER statement: every validation scan and the
+	// row rewrite must observe the same value, or a clock crossing between them
+	// could publish rows that violate the CHECK or UNIQUE constraint this
+	// statement adds.
+	now := m.defaultNow()
 
 	schema, err := m.getSchemaUnsafe(table)
 	if err != nil {
@@ -1085,16 +1122,17 @@ func (m *SchemaManager) AddColumn(table string, column Column, checks []CheckCon
 		if m.indexExistsUnsafe(unique.Name) {
 			return fmt.Errorf("index already exists: %s", unique.Name)
 		}
-		// A clock-reading default is validated during the rewrite below, which
-		// samples the same values it writes. Predicting them in a separate scan
-		// could disagree across a second boundary and publish duplicates.
+		// A clock-reading default is validated during the rewrite below so the
+		// duplicate set covers exactly the values this statement writes. The
+		// pre-scan is kept for constant and absent defaults, which are
+		// deterministic.
 		if column.DefaultExpr == "" {
-			if err := m.validateAddColumnUnique(table, column, unique); err != nil {
+			if err := m.validateAddColumnUnique(table, column, unique, now); err != nil {
 				return err
 			}
 		}
 	}
-	if err := m.validateAddColumnChecks(table, column, checks); err != nil {
+	if err := m.validateAddColumnChecks(table, column, checks, now); err != nil {
 		return err
 	}
 
@@ -1110,9 +1148,10 @@ func (m *SchemaManager) AddColumn(table string, column Column, checks []CheckCon
 		}
 	}
 
-	// An expression default is evaluated per rewritten row. When the column is
-	// also UNIQUE, collect the values this rewrite writes and abort on a
-	// duplicate, so validation cannot disagree with the published rows.
+	// An expression default is evaluated at the ALTER statement's instant. When
+	// the column is also UNIQUE, collect the values this rewrite writes and
+	// abort on a duplicate, so the index is validated against exactly the values
+	// it will see.
 	var seen map[string]struct{}
 	if unique != nil && column.DefaultExpr != "" {
 		seen = make(map[string]struct{})
@@ -1122,7 +1161,7 @@ func (m *SchemaManager) AddColumn(table string, column Column, checks []CheckCon
 			value, present := rowColumnValue(row, column.Name)
 			if !present {
 				var err error
-				value, _, err = m.columnDefaultValue(column)
+				value, _, err = m.columnDefaultValue(column, now)
 				if err != nil {
 					return false, err
 				}
@@ -1683,13 +1722,13 @@ func (m *SchemaManager) applyRows(table string, transform func(Row) (bool, error
 // its values cannot be predicted. The caller holds the table's exclusive gate,
 // so no writer can insert a conflicting row between this check and the
 // publication of the index.
-func (m *SchemaManager) validateAddColumnUnique(table string, column Column, index *Index) error {
+func (m *SchemaManager) validateAddColumnUnique(table string, column Column, index *Index, now time.Time) error {
 	seen := make(map[string]struct{})
 	return m.applyRows(table, func(row Row) (bool, error) {
 		value, ok := rowColumnValue(row, column.Name)
 		if !ok {
 			var err error
-			value, _, err = m.columnDefaultValue(column)
+			value, _, err = m.columnDefaultValue(column, now)
 			if err != nil {
 				return false, err
 			}
@@ -1716,11 +1755,12 @@ func columnHasDefault(column Column) bool {
 // already false for an existing row. Like validateAddColumnUnique it reads rows
 // as they will look after the default backfill, and it runs before that rewrite
 // so a rejected DDL leaves no row carrying the new field. The default is
-// resolved through columnDefaultValue, so a clock-reading default reaches the
-// predicate as the value the backfilled row will receive instead of NULL. The
-// caller holds the table's exclusive gate, so no writer can insert a violating
-// row between this validation and the publication of the check.
-func (m *SchemaManager) validateAddColumnChecks(table string, column Column, checks []CheckConstraint) error {
+// resolved through columnDefaultValue at the instant sampled once for the
+// ALTER statement, so a clock-reading default reaches the predicate as the value
+// the backfilled row will receive instead of NULL. The caller holds the table's
+// exclusive gate, so no writer can insert a violating row between this
+// validation and the publication of the check.
+func (m *SchemaManager) validateAddColumnChecks(table string, column Column, checks []CheckConstraint, now time.Time) error {
 	if len(checks) == 0 {
 		return nil
 	}
@@ -1730,7 +1770,7 @@ func (m *SchemaManager) validateAddColumnChecks(table string, column Column, che
 	}
 	return m.applyRows(table, func(row Row) (bool, error) {
 		if _, ok := rowColumnValue(row, column.Name); !ok {
-			value, hasDefault, err := m.columnDefaultValue(column)
+			value, hasDefault, err := m.columnDefaultValue(column, now)
 			if err != nil {
 				return false, err
 			}

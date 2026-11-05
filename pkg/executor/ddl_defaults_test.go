@@ -202,25 +202,33 @@ func TestMultiRowInsertSharesStatementDefault(t *testing.T) {
 	}
 }
 
-func TestAlterTableAddColumnBackfillsNonConstantDefaultPerRow(t *testing.T) {
+func TestAlterTableAddColumnBackfillsNonConstantDefaultOncePerStatement(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
-	// The storage-side evaluator samples the executor clock for every rewritten
-	// row, so a stepping clock shows per-row evaluation without patching the
-	// schema manager.
-	e.clock = (&steppingClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}).Now
+	// A stepping clock makes a per-row evaluation visible: every backfilled row
+	// must share the one instant sampled for the ALTER statement.
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	calls := 0
+	e.clock = func() time.Time {
+		at := base.Add(time.Duration(calls) * time.Second)
+		calls++
+		return at
+	}
 
 	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
 	execMust(t, e, "ALTER TABLE t ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
+	if calls != 1 {
+		t.Fatalf("clock sampled %d times, want once per ALTER statement", calls)
+	}
 	res := execMust(t, e, "SELECT id, created_at FROM t ORDER BY id")
 	first, second := res.Rows[0][1], res.Rows[1][1]
-	if first == second {
-		t.Fatalf("both rows were stamped %v; the ADD COLUMN rewrite must evaluate each row", first)
+	if first != second {
+		t.Fatalf("timestamps %v and %v differ; the backfill must use one statement instant", first, second)
 	}
-	if compare(first, second) >= 0 {
-		t.Fatalf("timestamps %v then %v are not ordered", first, second)
+	if got, want := first, "2026-01-02 03:04:05"; got != want {
+		t.Fatalf("created_at = %v, want the statement instant %q", got, want)
 	}
 
 	col, ok := e.schemaColumn(t, "t", "created_at")
@@ -305,41 +313,39 @@ func TestAlterTableAddColumnUniqueClockDefaultRejectsDuplicates(t *testing.T) {
 	}
 }
 
-func TestAlterTableAddColumnUniqueClockDefaultValidatesTheRewrite(t *testing.T) {
+func TestAlterTableAddColumnUniqueClockDefaultUsesStatementInstant(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
 
-	// The first two samples (the rewrite of rows 1 and 2) are distinct; later
-	// samples collide. A separate prediction scan would have seen the distinct
-	// values and then published an index over the colliding rewrite values.
 	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	calls := 0
 	e.clock = func() time.Time {
+		at := base.Add(time.Duration(calls) * time.Second)
 		calls++
-		if calls == 2 {
-			return base.Add(time.Second)
-		}
-		if calls > 2 {
-			return base.Add(2 * time.Second)
-		}
-		return base
+		return at
 	}
 
 	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
 	execMust(t, e, "ALTER TABLE t ADD COLUMN tag TEXT DEFAULT CURRENT_TIMESTAMP UNIQUE")
 
-	if calls != 2 {
-		t.Fatalf("clock sampled %d times, want once per rewritten row (2); the UNIQUE check must validate the rewrite itself", calls)
+	if calls != 1 {
+		t.Fatalf("clock sampled %d times, want once per ALTER statement", calls)
 	}
 	res := execMust(t, e, "SELECT id, tag FROM t ORDER BY id")
-	if res.Rows[0][1] == res.Rows[1][1] {
-		t.Fatalf("both rows got tag %v; the published index must cover distinct rewrite values", res.Rows[0][1])
+	if got, want := res.Rows[0][1], "2026-01-02 03:04:05"; got != want {
+		t.Fatalf("tag = %v, want the statement instant %q", got, want)
 	}
 
-	// The published index enforces uniqueness for later writes.
-	execMust(t, e, "INSERT INTO t (id) VALUES (3)")
-	if _, err := execSQL(e, "INSERT INTO t (id, tag) VALUES (4, '"+res.Rows[0][1].(string)+"')"); err == nil {
+	// A later INSERT samples its own statement instant, so it does not collide.
+	execMust(t, e, "INSERT INTO t (id) VALUES (2)")
+	next := execMust(t, e, "SELECT tag FROM t WHERE id = 2")
+	if next.Rows[0][0] == res.Rows[0][1] {
+		t.Fatalf("later INSERT tag = %v, want a new statement instant", next.Rows[0][0])
+	}
+
+	// The published index still rejects an explicit duplicate.
+	if _, err := execSQL(e, "INSERT INTO t (id, tag) VALUES (3, '"+res.Rows[0][1].(string)+"')"); err == nil {
 		t.Fatal("expected the published UNIQUE index to reject a duplicate")
 	}
 }

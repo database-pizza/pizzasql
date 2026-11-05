@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // PrimaryKeyViolationError preserves duplicate-key identity through wrapped
@@ -106,7 +107,7 @@ func (m *SchemaManager) applySchemaDefaults(schema *Schema, row Row) error {
 		if _, ok := rowColumnValue(row, column.Name); ok {
 			continue
 		}
-		value, ok, err := m.columnDefaultValue(column)
+		value, ok, err := m.columnDefaultValue(column, m.defaultNow())
 		if err != nil {
 			return err
 		}
@@ -120,14 +121,15 @@ func (m *SchemaManager) applySchemaDefaults(schema *Schema, row Row) error {
 // columnDefaultValue returns the value a row receives for a column it omits.
 // A column with no default reports ok=false. DefaultExpr takes precedence over
 // Default; the two are never both set by DDL, which keeps constant defaults in
-// the catalog as values and clock-reading defaults as SQL text.
-func (m *SchemaManager) columnDefaultValue(column Column) (interface{}, bool, error) {
+// the catalog as values and clock-reading defaults as SQL text. now is the
+// instant the caller sampled for its statement; a constant default ignores it.
+func (m *SchemaManager) columnDefaultValue(column Column, now time.Time) (interface{}, bool, error) {
 	if column.DefaultExpr != "" {
 		eval := m.defaultEvaluator()
 		if eval == nil {
 			return nil, false, fmt.Errorf("column %q has a DEFAULT expression but no evaluator is installed", column.Name)
 		}
-		value, err := eval(column.DefaultExpr)
+		value, err := eval(column.DefaultExpr, now)
 		if err != nil {
 			return nil, false, fmt.Errorf("evaluate DEFAULT for column %q: %w", column.Name, err)
 		}
