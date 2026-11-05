@@ -329,6 +329,63 @@ func newJSONContainer(seg jsonPathSeg) interface{} {
 	return map[string]interface{}{}
 }
 
+// jsonArrowExtract evaluates the SQLite -> and ->> operators. The key operand is
+// a field label, an array index, or a $ path. A NULL operand or a path that
+// selects nothing yields SQL NULL; malformed JSON in the document is an error,
+// as it is for json_extract(). scalar selects ->> (SQL value of the selected
+// node) instead of -> (JSON text for the selected node).
+func jsonArrowExtract(document, key interface{}, scalar bool) (interface{}, error) {
+	if document == nil || key == nil {
+		return nil, nil
+	}
+	node, err := jsonInput(document)
+	if err != nil {
+		return nil, err
+	}
+	segs, err := jsonArrowPath(key)
+	if err != nil {
+		return nil, err
+	}
+	found, ok := jsonLookup(node, segs)
+	if !ok {
+		return nil, nil
+	}
+	if scalar {
+		return jsonNodeToSQL(found), nil
+	}
+	s, err := jsonEncode(found)
+	if err != nil {
+		return nil, err
+	}
+	return jsonText(s), nil
+}
+
+// jsonArrowPath turns an arrow-operator operand into a path. Text that starts
+// with $ is a JSON path; other text names a single object member, so labels
+// containing dots or brackets are not reinterpreted as paths. Integers select
+// an array position, with negative values counting from the end.
+func jsonArrowPath(key interface{}) ([]jsonPathSeg, error) {
+	switch t := key.(type) {
+	case string:
+		return jsonArrowPathText(t)
+	case jsonText:
+		return jsonArrowPathText(string(t))
+	case int64:
+		return []jsonPathSeg{{isIndex: true, index: int(t), fromEnd: t < 0}}, nil
+	case int:
+		return []jsonPathSeg{{isIndex: true, index: t, fromEnd: t < 0}}, nil
+	default:
+		return nil, fmt.Errorf("JSON path error")
+	}
+}
+
+func jsonArrowPathText(path string) ([]jsonPathSeg, error) {
+	if strings.HasPrefix(path, "$") {
+		return parseJSONPath(path)
+	}
+	return []jsonPathSeg{{key: path}}, nil
+}
+
 // jsonTypeName returns the JSON1 type name for a decoded node.
 func jsonTypeName(v interface{}) string {
 	switch v.(type) {

@@ -45,18 +45,11 @@ func returningProjection(cols []parser.SelectColumn, schema *storage.Schema) ([]
 	return names, types
 }
 
-// projectionType resolves the declared type of a direct column reference.
+// projectionType resolves the declared type of a RETURNING expression. Direct
+// column references use the schema type and expressions use the executor's type
+// inference, so RETURNING metadata matches the equivalent SELECT projection.
 func projectionType(expr parser.Expr, schema *storage.Schema) string {
-	ref, ok := expr.(*parser.ColumnRef)
-	if !ok {
-		return "TEXT"
-	}
-	for _, c := range schema.Columns {
-		if strings.EqualFold(c.Name, ref.Column) {
-			return c.Type
-		}
-	}
-	return "TEXT"
+	return inferExprType(expr, schemaTypeResolver(schema))
 }
 
 // returningResult evaluates a RETURNING projection over the affected rows and

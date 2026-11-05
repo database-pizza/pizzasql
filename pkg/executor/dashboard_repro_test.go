@@ -24,7 +24,7 @@ func TestSelectColumnTypesGroupBy(t *testing.T) {
 	execMust(t, e, `INSERT INTO hit_stats VALUES (1, 1, '2024-05-06', '[]')`)
 
 	res := execMust(t, e, `SELECT hour, sum(total) FROM hit_counts GROUP BY hour ORDER BY hour`)
-	want := []string{"TIMESTAMP", "TEXT"}
+	want := []string{"TIMESTAMP", "BIGINT"}
 	if len(res.ColumnTypes) != len(want) {
 		t.Fatalf("group-by column types = %v, want %v", res.ColumnTypes, want)
 	}

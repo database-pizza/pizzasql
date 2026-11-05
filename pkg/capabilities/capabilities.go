@@ -179,7 +179,7 @@ func Current() *Document {
 			AddColumnBackfill:      Feature{Supported: true, Status: "rewrites_rows", Notes: "a constant DEFAULT is materialized into existing rows at DDL time; ADD COLUMN ... NOT NULL without a DEFAULT fails with 23502 on a non-empty table, ADD COLUMN ... UNIQUE conflicts with 23505 when backfilling a non-NULL default into more than one row, and the column is published together with its UNIQUE index in one atomic schema write"},
 			DropColumn:             Feature{Supported: true, Status: "rewrites_rows"},
 			RenameColumn:           Feature{Supported: true, Status: "rewrites_rows"},
-			RenameColumnIndexes:    Feature{Supported: false, Status: "stale_index_metadata", Notes: "drop and recreate indexes that reference a renamed column"},
+			RenameColumnIndexes:    Feature{Supported: true, Status: "rewrites_index_metadata", Notes: "column references in index definitions are rewritten in place, including composite and unique indexes; index names are unchanged; RENAME COLUMN is rejected when an expression index references the column (drop that index, rename, then recreate it)"},
 			CreateTableIfNotExists: true,
 			AddColumnIfNotExists:   true,
 		},
@@ -217,8 +217,8 @@ func Current() *Document {
 		JSON: JSON{
 			Storage:        "TEXT (JSON and JSONB type names are accepted without native semantics; insert JSON as text)",
 			Functions:      "json, json_extract, json_set, json_insert, json_replace, json_remove, json_valid, json_type, json_array, json_array_length, json_object, json_quote, json_group_array; PostgreSQL text compatibility: concat_ws, string_agg, pg_backend_pid",
-			ArrowOperators: Feature{Supported: false, Status: "rejected", SQLState: "42601", Notes: "-> and ->> are not implemented; use json_extract"},
-			InvalidInput:   "json_extract/json_set throw 'malformed JSON'; json_valid returns 0",
+			ArrowOperators: Feature{Supported: true, Status: "supported", Notes: "-> returns JSON text for a member or element, ->> returns the SQL value (text, number, 1/0 for booleans, NULL for JSON null); right operand is a label, an array index, or a $ path; missing paths and NULL operands return NULL; chaining is left-to-right"},
+			InvalidInput:   "json_extract/json_set and ->/->> throw 'malformed JSON'; json_valid returns 0",
 		},
 
 		ErrorCodes: map[string]string{

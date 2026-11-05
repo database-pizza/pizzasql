@@ -39,6 +39,22 @@ func TestCurrentDocumentIsVersionedAndMarshalable(t *testing.T) {
 	if round.Notifications.PayloadLimit != 8000 || round.Notifications.DurableReplay {
 		t.Fatalf("unexpected notification limits: %+v", round.Notifications)
 	}
+	if !round.DDL.RenameColumnIndexes.Supported {
+		t.Fatal("RENAME COLUMN must advertise index metadata rewriting")
+	}
+}
+
+func TestJSONArrowOperatorsAreAdvertised(t *testing.T) {
+	arrow := Current().JSON.ArrowOperators
+	if !arrow.Supported {
+		t.Fatal("-> and ->> should be advertised as supported")
+	}
+	if arrow.SQLState != "" {
+		t.Fatalf("arrow operator SQLSTATE = %q, want none", arrow.SQLState)
+	}
+	if arrow.Status == "rejected" {
+		t.Fatalf("arrow operator status = %q, want a supported status", arrow.Status)
+	}
 }
 
 func TestAddColumnBackfillIsAdvertised(t *testing.T) {
