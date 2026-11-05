@@ -72,6 +72,10 @@ type preparedStatement struct {
 type portal struct {
 	query    string
 	executed bool
+	// resultFormats is the Bind result format list exactly as the client sent
+	// it: empty (all text), one entry that repeats for every column, or one
+	// entry per column. It is resolved against the produced result at Execute.
+	resultFormats []int16
 }
 
 // NewConnection creates a new connection handler
@@ -385,7 +389,7 @@ func (c *Connection) handleQuery(msg *Message) error {
 			c.sendError("ERROR", ErrCodeInternalError, err.Error())
 			return c.sendReadyForQuery()
 		}
-		if err := c.sendTabularResult(result, "SELECT"); err != nil {
+		if err := c.sendTabularResult(result, "SELECT", nil); err != nil {
 			return err
 		}
 		return c.sendReadyForQuery()
@@ -497,7 +501,7 @@ func (c *Connection) handleQuery(msg *Message) error {
 			c.sendError("ERROR", code, message)
 			return c.sendReadyForQuery()
 		}
-		if err := c.sendResult(result, stmt); err != nil {
+		if err := c.sendResult(result, stmt, wireColumnTypes(result), nil); err != nil {
 			return err
 		}
 		if result.LSN > 0 {
@@ -600,12 +604,6 @@ func (c *Connection) handleBind(msg *Message) error {
 		if format != 0 && format != 1 {
 			return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind result format code"))
 		}
-		if format == 1 {
-			return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("binary result format is not supported; request text results"))
-		}
-	}
-	if len(resultFormats) > 1 {
-		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("per-column result format lists are not supported; request all-text results"))
 	}
 	query, err := bindQuery(statement.query, params)
 	if err != nil {
@@ -621,7 +619,7 @@ func (c *Connection) handleBind(msg *Message) error {
 		}
 		return c.failExtended(code, err)
 	}
-	c.portals[portalName] = &portal{query: query}
+	c.portals[portalName] = &portal{query: query, resultFormats: resultFormats}
 	return c.writeMessage(MsgBindComplete, nil)
 }
 
@@ -694,7 +692,7 @@ func (c *Connection) handleExecute(msg *Message) error {
 		if catalogErr != nil {
 			return c.failExtended(ErrCodeInternalError, catalogErr)
 		}
-		return c.sendTabularResult(result, "SELECT")
+		return c.sendTabularResult(result, "SELECT", portal.resultFormats)
 	}
 	l := lexer.New(portal.query)
 	stmt, err := parser.New(l).Parse()
@@ -785,7 +783,12 @@ func (c *Connection) handleExecute(msg *Message) error {
 		}
 		return c.failExtended(code, fmt.Errorf("execution error: %w", err))
 	}
-	if err := c.sendResult(result, stmt); err != nil {
+	columnTypes := wireColumnTypes(result)
+	formats, formatErr := c.resolveResultFormats(portal.resultFormats, columnTypes, len(result.Columns))
+	if formatErr != nil {
+		return c.failResultFormat(formatErr)
+	}
+	if err := c.sendResult(result, stmt, columnTypes, formats); err != nil {
 		return err
 	}
 	if result.LSN > 0 {
@@ -991,13 +994,18 @@ func yesNo(value bool) string {
 	return "NO"
 }
 
-func (c *Connection) sendTabularResult(result *executor.Result, tag string) error {
-	if err := c.sendRowDescription(result.Columns, result.ColumnTypes); err != nil {
+func (c *Connection) sendTabularResult(result *executor.Result, tag string, bindFormats []int16) error {
+	formats, err := c.resolveResultFormats(bindFormats, result.ColumnTypes, len(result.Columns))
+	if err != nil {
+		return c.failResultFormat(err)
+	}
+	oids := c.resultColumnOIDs(result.ColumnTypes, len(result.Columns))
+	if err := c.sendRowDescriptionFormats(result.Columns, result.ColumnTypes, oids, formats); err != nil {
 		return err
 	}
 	for _, row := range result.Rows {
-		if err := c.sendDataRow(row, result.Columns); err != nil {
-			return err
+		if err := c.sendDataRowFormats(row, oids, formats); err != nil {
+			return c.failBinaryEncode(err)
 		}
 	}
 	return c.sendCommandComplete(fmt.Sprintf("%s %d", tag, len(result.Rows)))
@@ -1233,23 +1241,25 @@ func parameterLiteral(param boundParameter) (string, error) {
 	}
 }
 
-// sendResult sends query results
-func (c *Connection) sendResult(result *executor.Result, stmt parser.Statement) error {
+// sendResult sends a statement's result. columnTypes are the types reported in
+// RowDescription (already corrected for BLOB values) and formats are the
+// portal's resolved per-column format codes, or nil for all-text results.
+func (c *Connection) sendResult(result *executor.Result, stmt parser.Statement, columnTypes []string, formats []int16) error {
 	// Any statement that produced a row set (SELECT, or INSERT/UPDATE/DELETE
 	// with RETURNING) sends a row description and its data rows. Other
 	// statements only send the command completion tag.
 	if len(result.Columns) > 0 {
-		if err := c.sendRowDescription(result.Columns, wireColumnTypes(result)); err != nil {
+		oids := c.resultColumnOIDs(columnTypes, len(result.Columns))
+		if err := c.sendRowDescriptionFormats(result.Columns, columnTypes, oids, formats); err != nil {
 			return err
 		}
 		for _, row := range result.Rows {
-			if err := c.sendDataRow(row, result.Columns); err != nil {
-				return err
+			if err := c.sendDataRowFormats(row, oids, formats); err != nil {
+				return c.failBinaryEncode(err)
 			}
 		}
 		return c.sendCommandComplete(c.getCommandTag(stmt, result))
 	}
-
 	// For other statements, just send command complete
 	tag := c.getCommandTag(stmt, result)
 	return c.sendCommandComplete(tag)
@@ -1429,43 +1439,85 @@ func (c *Connection) sendParameterDescription(oids []int32) error {
 	return c.writeMessage(MsgParameterDescription, mb.Bytes())
 }
 
-// sendRowDescription sends row description (column metadata)
+// sendRowDescription sends row description (column metadata) in text format.
 func (c *Connection) sendRowDescription(columns []string, columnTypes []string) error {
+	return c.sendRowDescriptionFormats(columns, columnTypes, c.resultColumnOIDs(columnTypes, len(columns)), nil)
+}
+
+// sendRowDescriptionFormats sends row description with the per-column formats a
+// portal resolved at Bind. PostgreSQL reports the bound formats in a portal
+// RowDescription; this server emits its RowDescription at Execute instead of
+// Describe, so the portal's formats travel with the row metadata. OIDs are the
+// same for text and binary results.
+func (c *Connection) sendRowDescriptionFormats(columns []string, columnTypes []string, oids []int32, formats []int16) error {
 	mb := NewMessageBuilder()
 	mb.WriteInt16(int16(len(columns)))
 
 	for i, col := range columns {
-		colType := ""
-		if i < len(columnTypes) {
-			colType = columnTypes[i]
+		colType := typeNameAt(columnTypes, i)
+		format := int16(0)
+		if i < len(formats) {
+			format = formats[i]
 		}
 		mb.WriteString(col)
 		mb.WriteInt32(0)                             // table OID
 		mb.WriteInt16(0)                             // column attribute number
-		mb.WriteInt32(c.getOIDForType(colType))      // type OID
+		mb.WriteInt32(oids[i])                       // type OID
 		mb.WriteInt16(c.getTypeSizeForType(colType)) // type size
 		mb.WriteInt32(-1)                            // type modifier
-		mb.WriteInt16(0)                             // format code (text)
+		mb.WriteInt16(format)                        // format code
 	}
 
 	return c.writeMessage(MsgRowDescription, mb.Bytes())
 }
 
-// sendDataRow sends a data row
+// resultColumnOIDs returns the PostgreSQL OID reported for every result column.
+func (c *Connection) resultColumnOIDs(columnTypes []string, columnCount int) []int32 {
+	oids := make([]int32, columnCount)
+	for i := range oids {
+		oids[i] = c.getOIDForType(typeNameAt(columnTypes, i))
+	}
+	return oids
+}
+
+// sendDataRow sends a data row in text format
 func (c *Connection) sendDataRow(row []interface{}, columns []string) error {
+	return c.sendDataRowFormats(row, nil, nil)
+}
+
+// sendDataRowFormats sends one DataRow, choosing text or binary encoding per
+// column from formats. NULL is always length -1. Binary values are appended
+// directly into the DataRow buffer; a value that cannot be encoded fails before
+// the row is written, so the client never receives a partial DataRow.
+func (c *Connection) sendDataRowFormats(row []interface{}, oids []int32, formats []int16) error {
 	mb := NewMessageBuilder()
 	mb.WriteInt16(int16(len(row)))
 
-	for _, value := range row {
+	for i, value := range row {
 		if value == nil {
 			mb.WriteInt32(-1) // NULL indicator
 			continue
 		}
-
-		// Convert value to string
-		strValue := c.valueToString(value)
-		mb.WriteInt32(int32(len(strValue)))
-		mb.WriteBytes([]byte(strValue))
+		format := int16(0)
+		if i < len(formats) {
+			format = formats[i]
+		}
+		if format == 0 {
+			strValue := c.valueToString(value)
+			mb.WriteInt32(int32(len(strValue)))
+			mb.WriteBytes([]byte(strValue))
+			continue
+		}
+		oid := int32(25) // TEXT, the fallback RowDescription OID
+		if i < len(oids) {
+			oid = oids[i]
+		}
+		err := mb.AppendBinary(func(dst []byte) ([]byte, error) {
+			return appendBinaryResultValue(dst, oid, value)
+		})
+		if err != nil {
+			return fmt.Errorf("binary result column %d: %w", i+1, err)
+		}
 	}
 
 	return c.writeMessage(MsgDataRow, mb.Bytes())
@@ -1656,13 +1708,20 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 	}
 }
 
-// valueToString converts a value to string
+// valueToString converts a value to its PostgreSQL text representation
 func (c *Connection) valueToString(value interface{}) string {
+	return textValueString(value)
+}
+
+// textValueString is the text representation the wire layer sends for a value.
+// Binary text and bytea results reuse it so both formats carry the same bytes
+// for values without a native binary form. PostgreSQL's text format for bytea is
+// \x followed by hex, which lets libpq/pgx decode a BLOB column (OID 17)
+// losslessly.
+func textValueString(value interface{}) string {
 	if value == nil {
 		return ""
 	}
-	// PostgreSQL's text format for bytea is \x followed by hex. Emitting that
-	// lets libpq/pgx decode a BLOB column (OID 17) losslessly.
 	if b, ok := value.([]byte); ok {
 		return `\x` + hex.EncodeToString(b)
 	}
