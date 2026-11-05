@@ -93,3 +93,64 @@ func TestSetAndShowSearchPathOverWire(t *testing.T) {
 		t.Fatalf("SHOW client_encoding = %v", rows)
 	}
 }
+
+// An unknown regclass/regtype reaches the client as SQLSTATE 42P01 over the
+// simple-query protocol, both in a projection and inside a WHERE clause, and
+// to_regclass returns NULL instead of failing.
+func TestPgCatalogUndefinedRelationSQLState(t *testing.T) {
+	c, client := newDataConnection(t)
+	for _, sql := range []string{
+		"CREATE TABLE wire_state (id INTEGER PRIMARY KEY)",
+	} {
+		if msgs := runQuery(t, c, client, simpleQuery(sql)); errorCode(msgs[0]) != "" {
+			t.Fatalf("%s: %s", sql, errorMessage(msgs[0]))
+		}
+	}
+
+	for _, sql := range []string{
+		`SELECT 'missing_relation'::regclass`,
+		`SELECT 'missing_type'::regtype`,
+		`SELECT count(*) FROM pg_catalog.pg_class WHERE oid = 'missing_relation'::regclass`,
+		`SELECT count(*) FROM public.pg_class`,
+	} {
+		msgs := runQuery(t, c, client, simpleQuery(sql))
+		msg := findError(msgs)
+		if msg == nil {
+			t.Fatalf("%s: expected an error, got %v", sql, msgs)
+		}
+		if code := errorCode(msg); code != ErrCodeUndefinedTable {
+			t.Fatalf("%s: SQLSTATE = %q, want %q", sql, code, ErrCodeUndefinedTable)
+		}
+	}
+
+	msgs := runQuery(t, c, client, simpleQuery(`SELECT to_regclass('missing_relation'), to_regclass('wire_state')`))
+	if msg := findError(msgs); msg != nil {
+		t.Fatalf("to_regclass failed: %s", errorMessage(msg))
+	}
+	rd := findRowDescription(t, msgs)
+	if got := rowDescriptionOIDs(t, rd.Data); len(got) != 2 || got[0] != 2205 || got[1] != 2205 {
+		t.Fatalf("to_regclass OIDs = %v, want regclass 2205 twice", got)
+	}
+	rows := catalogRows(t, msgs)
+	if len(rows) != 1 || rows[0][0] != "<null>" || rows[0][1] != "wire_state" {
+		t.Fatalf("to_regclass rows = %v, want NULL then wire_state", rows)
+	}
+}
+
+// pg_type's function attributes are regproc (OID 24) with numeric values, not
+// the text "-".
+func TestPgCatalogRegprocWireType(t *testing.T) {
+	c, client := newDataConnection(t)
+	msgs := runQuery(t, c, client, simpleQuery(`SELECT typinput, typoutput FROM pg_type WHERE typname = 'int4'`))
+	if msg := findError(msgs); msg != nil {
+		t.Fatalf("pg_type query failed: %s", errorMessage(msg))
+	}
+	rd := findRowDescription(t, msgs)
+	if got := rowDescriptionOIDs(t, rd.Data); len(got) != 2 || got[0] != 24 || got[1] != 24 {
+		t.Fatalf("regproc OIDs = %v, want [24 24]", got)
+	}
+	rows := catalogRows(t, msgs)
+	if len(rows) != 1 || rows[0][0] != "0" || rows[0][1] != "0" {
+		t.Fatalf("pg_type regproc values = %v, want 0/0", rows)
+	}
+}

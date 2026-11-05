@@ -23,6 +23,44 @@ func normalizeSettingName(name string) string {
 	return strings.ToLower(strings.Join(strings.Fields(name), " "))
 }
 
+// effectiveSearchPath is the search path the session currently observes: SET
+// LOCAL while a transaction is open, otherwise the session value.
+func (e *Executor) effectiveSearchPath() []string {
+	if len(e.localSearchPath) > 0 {
+		return e.localSearchPath
+	}
+	if len(e.searchPath) == 0 {
+		return []string{publicSchemaName}
+	}
+	return e.searchPath
+}
+
+// beginSettingScope records the session search path so ROLLBACK can restore it
+// and clears any SET LOCAL left by a previous transaction.
+func (e *Executor) beginSettingScope() {
+	e.txSearchPath = e.searchPath
+	e.localSearchPath = nil
+}
+
+// commitSettingScope ends a transaction: SET LOCAL expires and a session SET
+// stays in effect.
+func (e *Executor) commitSettingScope() {
+	e.localSearchPath = nil
+	e.txSearchPath = nil
+	e.pgCatalog = nil
+}
+
+// rollbackSettingScope restores the session search path captured at BEGIN, so a
+// session SET inside an aborted transaction has no lasting effect.
+func (e *Executor) rollbackSettingScope() {
+	if e.txSearchPath != nil {
+		e.searchPath = e.txSearchPath
+	}
+	e.localSearchPath = nil
+	e.txSearchPath = nil
+	e.pgCatalog = nil
+}
+
 // executeSet acknowledges a session setting.
 func (e *Executor) executeSet(stmt *parser.SetStmt) (*Result, error) {
 	name := normalizeSettingName(stmt.Name)
@@ -48,7 +86,19 @@ func (e *Executor) executeSet(stmt *parser.SetStmt) (*Result, error) {
 		if len(known) == 0 {
 			known = []string{publicSchemaName}
 		}
-		e.searchPath = known
+		switch {
+		case stmt.Local:
+			// SET LOCAL is transaction-scoped: it has no effect outside a
+			// transaction block and expires at COMMIT or ROLLBACK.
+			if e.inTransaction {
+				e.localSearchPath = known
+			}
+		default:
+			// A session SET inside a transaction is undone by ROLLBACK, so
+			// BEGIN keeps the previous value.
+			e.searchPath = known
+			e.localSearchPath = nil
+		}
 		// A different search path changes which schema is visible; drop the
 		// statement-scoped catalog snapshot so the next read re-evaluates it.
 		e.pgCatalog = nil
@@ -79,11 +129,7 @@ func (e *Executor) settingValue(name string) (string, error) {
 	var value string
 	switch name {
 	case "search_path":
-		if len(e.searchPath) == 0 {
-			value = publicSchemaName
-		} else {
-			value = strings.Join(e.searchPath, ", ")
-		}
+		value = strings.Join(e.effectiveSearchPath(), ", ")
 	case "server_version":
 		value = version.PostgreSQLCompatVersion
 	case "server_version_num":

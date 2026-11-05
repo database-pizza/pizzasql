@@ -88,10 +88,10 @@ var pgCatalogRelationDefs = []catalogRelationDef{
 		{"typowner", "OID"}, {"typlen", "INT2"}, {"typbyval", "BOOL"},
 		{"typtype", "CHAR"}, {"typcategory", "CHAR"}, {"typispreferred", "BOOL"},
 		{"typisdefined", "BOOL"}, {"typdelim", "CHAR"}, {"typrelid", "OID"},
-		{"typsubscript", "TEXT"}, {"typelem", "OID"}, {"typarray", "OID"},
-		{"typinput", "TEXT"}, {"typoutput", "TEXT"}, {"typreceive", "TEXT"},
-		{"typsend", "TEXT"}, {"typmodin", "TEXT"}, {"typmodout", "TEXT"},
-		{"typanalyze", "TEXT"}, {"typalign", "CHAR"}, {"typstorage", "CHAR"},
+		{"typsubscript", "REGPROC"}, {"typelem", "OID"}, {"typarray", "OID"},
+		{"typinput", "REGPROC"}, {"typoutput", "REGPROC"}, {"typreceive", "REGPROC"},
+		{"typsend", "REGPROC"}, {"typmodin", "REGPROC"}, {"typmodout", "REGPROC"},
+		{"typanalyze", "REGPROC"}, {"typalign", "CHAR"}, {"typstorage", "CHAR"},
 		{"typnotnull", "BOOL"}, {"typbasetype", "OID"}, {"typtypmod", "INT4"},
 		{"typndims", "INT4"}, {"typcollation", "OID"}, {"typdefaultbin", "TEXT"},
 		{"typdefault", "TEXT"}, {"typacl", "TEXT"},
@@ -134,7 +134,7 @@ var pgCatalogRelationDefs = []catalogRelationDef{
 	{schema: pgCatalogSchemaName, name: "pg_proc", columns: []catalogColumnDef{
 		{"oid", "OID"}, {"proname", "NAME"}, {"pronamespace", "OID"},
 		{"proowner", "OID"}, {"prolang", "OID"}, {"procost", "FLOAT4"},
-		{"prorows", "FLOAT4"}, {"provariadic", "OID"}, {"prosupport", "TEXT"},
+		{"prorows", "FLOAT4"}, {"provariadic", "OID"}, {"prosupport", "REGPROC"},
 		{"prokind", "CHAR"}, {"prosecdef", "BOOL"}, {"proleakproof", "BOOL"},
 		{"proisstrict", "BOOL"}, {"proretset", "BOOL"}, {"provolatile", "CHAR"},
 		{"proparallel", "CHAR"}, {"pronargs", "INT2"}, {"pronargdefaults", "INT2"},
@@ -261,10 +261,14 @@ func buildCatalogRelationIndex() map[string]catalogRelationEntry {
 }
 
 // catalogRelationFor resolves a possibly schema-qualified table reference to a
-// virtual catalog relation. Unqualified names resolve to pg_catalog only when
-// no durable table shadows them, matching PostgreSQL's implicit search_path.
+// virtual catalog relation. A CTE in scope shadows every relation name, and an
+// unqualified name resolves to pg_catalog only when no durable table shadows it,
+// matching PostgreSQL's implicit search_path.
 func (e *Executor) catalogRelationFor(ref parser.TableRef) (catalogRelationEntry, bool) {
 	if ref.Subquery != nil || ref.Function != nil {
+		return catalogRelationEntry{}, false
+	}
+	if e.cteTableExists(ref.Name) {
 		return catalogRelationEntry{}, false
 	}
 	name := strings.ToLower(ref.Name)
@@ -275,13 +279,16 @@ func (e *Executor) catalogRelationFor(ref parser.TableRef) (catalogRelationEntry
 	case informationSchemaName:
 		entry, ok := pgCatalogRelationIndex[informationSchemaName+"."+name]
 		return entry, ok
-	case "", publicSchemaName:
+	case "":
 		if e.session.TableExists(ref.Name) {
 			return catalogRelationEntry{}, false
 		}
 		entry, ok := pgCatalogRelationIndex[pgCatalogSchemaName+"."+name]
 		return entry, ok
 	default:
+		// The emulated schemas are distinct: public.<name> names a durable
+		// relation, never pg_catalog.<name>, so a qualified miss falls through to
+		// the durable-schema path and is reported as an undefined table.
 		return catalogRelationEntry{}, false
 	}
 }
@@ -319,6 +326,14 @@ func fnv1a32(text string) uint32 {
 		hash *= 16777619
 	}
 	return hash
+}
+
+// catalogRelationKey identifies a relation row. relkind is part of the identity:
+// the engine lets an index share its table's name, and both rows must keep their
+// own OID so pg_class, pg_attribute, and pg_index agree, exactly as relname plus
+// relkind identifies a pg_class row in PostgreSQL.
+func catalogRelationKey(relation *catalogRelation) string {
+	return strings.ToLower(relation.schemaName+"."+relation.name) + "#" + string(relation.kind)
 }
 
 // allocateOID maps a kind and fully qualified name to a stable, positive OID.
@@ -505,6 +520,9 @@ type catalogRelation struct {
 	columns    []storage.Column
 	table      *storage.Schema
 	index      *storage.Index
+	// virtual marks a synthesized pg_catalog/information_schema relation. User
+	// tables, indexes, and session views are the durable/session schema.
+	virtual bool
 	// primaryIndex marks the synthetic index that backs a PRIMARY KEY. The
 	// engine does not persist an index object for the key, but PostgreSQL tools
 	// expect pg_index/pg_constraint to point at one.
@@ -535,8 +553,6 @@ type catalogSnapshot struct {
 	constraintByOID map[int64]*catalogConstraint
 
 	rows map[string][]storage.Row
-
-	views []string
 
 	// Preallocated OIDs keep every catalog relation deterministic regardless of
 	// the order in which row sets are materialized.
@@ -601,7 +617,7 @@ func relationNamespaceOID(schemaName string) int64 {
 }
 
 // uniqueCatalogName returns base, or base with a numeric suffix, so a synthetic
-// relation name never collides with a durable index name.
+// relation name never collides with a durable table or index name.
 func uniqueCatalogName(base string, used map[string]bool) string {
 	name := base
 	for suffix := 2; used[strings.ToLower(name)]; suffix++ {
@@ -620,7 +636,6 @@ func buildCatalogSnapshot(e *Executor) (*catalogSnapshot, error) {
 		tableIndexes:    make(map[string][]*catalogRelation),
 		constraintByOID: make(map[int64]*catalogConstraint),
 		rows:            make(map[string][]storage.Row),
-		views:           sortedViewNames(e.views),
 		attrdefOIDs:     make(map[string]int64),
 		procOIDs:        make(map[string]int64),
 		oidOwners:       make(map[int64]string),
@@ -642,11 +657,18 @@ func buildCatalogSnapshot(e *Executor) (*catalogSnapshot, error) {
 	sort.Strings(indexNames)
 
 	var descriptors []*catalogRelation
+	// usedNames guards every synthetic name against the durable names it could
+	// collide with. A table named <x>_pkey shadows the synthetic index name a
+	// PRIMARY KEY on x would otherwise take.
+	usedNames := make(map[string]bool, len(tables)+len(indexNames)+len(e.views))
+	tableSchemas := make(map[string]*storage.Schema, len(tables))
 	for _, tableName := range tables {
 		schema, err := e.session.GetSchema(tableName)
 		if err != nil {
 			return nil, fmt.Errorf("pg_catalog: resolve table %q: %w", tableName, err)
 		}
+		tableSchemas[tableName] = schema
+		usedNames[strings.ToLower(schema.Name)] = true
 		descriptors = append(descriptors, &catalogRelation{
 			schemaName: publicSchemaName,
 			name:       schema.Name,
@@ -656,7 +678,6 @@ func buildCatalogSnapshot(e *Executor) (*catalogSnapshot, error) {
 		})
 	}
 
-	usedNames := make(map[string]bool, len(indexNames))
 	for _, indexName := range indexNames {
 		index, err := e.session.GetIndex(indexName)
 		if err != nil {
@@ -672,13 +693,25 @@ func buildCatalogSnapshot(e *Executor) (*catalogSnapshot, error) {
 		})
 	}
 
+	// Session views are part of the schema the connection observes, so they are
+	// reported the same way PostgreSQL reports a view: a pg_class row with
+	// relkind 'v' plus matching pg_attribute and information_schema.columns rows.
+	viewNames := sortedViewNames(e.views)
+	for _, viewName := range viewNames {
+		columns := e.viewColumns[viewName]
+		usedNames[viewName] = true
+		descriptors = append(descriptors, &catalogRelation{
+			schemaName: publicSchemaName,
+			name:       viewName,
+			kind:       'v',
+			columns:    columns,
+		})
+	}
+
 	// One synthetic index per primary key so pg_index/pg_constraint have a
 	// stable conindid. Composite keys keep their declared order.
 	for _, tableName := range tables {
-		schema, err := e.session.GetSchema(tableName)
-		if err != nil {
-			return nil, err
-		}
+		schema := tableSchemas[tableName]
 		// A table without a declared PRIMARY KEY is addressed by the engine's
 		// synthetic _rowid_ column, which is not a PostgreSQL attribute and has
 		// no index.
@@ -709,6 +742,7 @@ func buildCatalogSnapshot(e *Executor) (*catalogSnapshot, error) {
 			name:       def.name,
 			kind:       'v',
 			columns:    pgCatalogRelationIndex[def.schema+"."+def.name].schema.Columns,
+			virtual:    true,
 		})
 	}
 	for _, def := range informationSchemaRelationDefs {
@@ -717,6 +751,7 @@ func buildCatalogSnapshot(e *Executor) (*catalogSnapshot, error) {
 			name:       def.name,
 			kind:       'v',
 			columns:    pgCatalogRelationIndex[def.schema+"."+def.name].schema.Columns,
+			virtual:    true,
 		})
 	}
 
@@ -731,9 +766,9 @@ func buildCatalogSnapshot(e *Executor) (*catalogSnapshot, error) {
 	})
 
 	for _, relation := range descriptors {
-		relation.oid = snapshot.allocateOID("relation", relation.schemaName+"."+relation.name)
+		relation.oid = snapshot.allocateOID("relation", catalogRelationKey(relation))
 		snapshot.relations = append(snapshot.relations, relation)
-		snapshot.relationByKey[strings.ToLower(relation.schemaName+"."+relation.name)] = relation
+		snapshot.relationByKey[catalogRelationKey(relation)] = relation
 		snapshot.relationByOID[relation.oid] = relation
 		if relation.kind == 'r' {
 			snapshot.tableByName[strings.ToLower(relation.name)] = relation
@@ -861,19 +896,32 @@ func (s *catalogSnapshot) regclassOID(name string) (int64, bool) {
 	if dot := strings.IndexByte(name, '.'); dot >= 0 {
 		schemaName := strings.Trim(strings.TrimSpace(name[:dot]), `"`)
 		tableName := strings.Trim(strings.TrimSpace(name[dot+1:]), `"`)
-		relation, ok := s.relationByKey[strings.ToLower(schemaName+"."+tableName)]
-		if ok {
+		if relation := s.regclassRelation(schemaName, tableName); relation != nil {
 			return relation.oid, true
 		}
 		return 0, false
 	}
-	if relation, ok := s.relationByKey[strings.ToLower(publicSchemaName+"."+name)]; ok {
+	if relation := s.regclassRelation(publicSchemaName, name); relation != nil {
 		return relation.oid, true
 	}
-	if relation, ok := s.relationByKey[strings.ToLower(pgCatalogSchemaName+"."+name)]; ok {
+	if relation := s.regclassRelation(pgCatalogSchemaName, name); relation != nil {
 		return relation.oid, true
 	}
 	return 0, false
+}
+
+// regclassRelation resolves a schema-qualified relation name to the row a
+// regclass literal names. PostgreSQL keeps relation names unique inside a
+// schema, but the engine lets an index share its table's name, so the lookup
+// prefers a table, then a session view, then an index.
+func (s *catalogSnapshot) regclassRelation(schemaName, name string) *catalogRelation {
+	key := strings.ToLower(schemaName + "." + name)
+	for _, kind := range []byte{'r', 'v', 'i'} {
+		if relation, ok := s.relationByKey[key+"#"+string(kind)]; ok {
+			return relation
+		}
+	}
+	return nil
 }
 
 // regclassName renders a relation OID the way regclass output does.
@@ -1131,13 +1179,13 @@ func (s *catalogSnapshot) pgTypeRows() []storage.Row {
 			"typsubscript":   nil,
 			"typelem":        t.elem,
 			"typarray":       t.array,
-			"typinput":       "-",
-			"typoutput":      "-",
-			"typreceive":     "-",
-			"typsend":        "-",
-			"typmodin":       "-",
-			"typmodout":      "-",
-			"typanalyze":     "-",
+			"typinput":       int64(0),
+			"typoutput":      int64(0),
+			"typreceive":     int64(0),
+			"typsend":        int64(0),
+			"typmodin":       int64(0),
+			"typmodout":      int64(0),
+			"typanalyze":     int64(0),
 			"typalign":       t.align,
 			"typstorage":     t.storage,
 			"typnotnull":     false,
@@ -1376,6 +1424,8 @@ var pgCatalogFunctions = []struct {
 	{"pg_get_serial_sequence", 2, 25},
 	{"pg_get_userbyid", 1, 19},
 	{"pg_table_is_visible", 1, 16},
+	{"to_regclass", 1, 2205},
+	{"to_regtype", 1, 2206},
 }
 
 func (s *catalogSnapshot) pgProcRows() []storage.Row {
@@ -1494,22 +1544,6 @@ func (s *catalogSnapshot) informationSchemaTablesRows() []storage.Row {
 			"commit_action":                nil,
 		})
 	}
-	for _, view := range s.views {
-		rows = append(rows, storage.Row{
-			"table_catalog":                s.database,
-			"table_schema":                 publicSchemaName,
-			"table_name":                   view,
-			"table_type":                   "VIEW",
-			"self_referencing_column_name": nil,
-			"reference_generation":         nil,
-			"user_defined_type_catalog":    nil,
-			"user_defined_type_schema":     nil,
-			"user_defined_type_name":       nil,
-			"is_insertable_into":           "NO",
-			"is_typed":                     "NO",
-			"commit_action":                nil,
-		})
-	}
 	return rows
 }
 
@@ -1576,7 +1610,7 @@ func informationSchemaColumn(relation *catalogRelation, column storage.Column, p
 func (s *catalogSnapshot) informationSchemaColumnsRows() []storage.Row {
 	var rows []storage.Row
 	for _, relation := range s.relations {
-		if relation.kind != 'r' {
+		if relation.kind == 'i' || relation.virtual {
 			continue
 		}
 		for i, column := range relation.columns {
@@ -1778,24 +1812,28 @@ func (s *catalogSnapshot) informationSchemaSchemataRows() []storage.Row {
 }
 
 // catalogSchemaByName resolves an unqualified pg_catalog relation name that is
-// not shadowed by a durable table.
+// not shadowed by a durable table or a CTE.
 func (e *Executor) catalogSchemaByName(name string) (*storage.Schema, bool) {
 	entry, ok := pgCatalogRelationIndex[pgCatalogSchemaName+"."+strings.ToLower(name)]
-	if !ok || e.session.TableExists(name) {
+	if !ok || e.session.TableExists(name) || e.cteTableExists(name) {
 		return nil, false
 	}
 	return entry.schema, true
 }
 
 func (s *catalogSnapshot) informationSchemaViewsRows() []storage.Row {
-	// Views are session-local and the engine does not retain their SQL text, so
-	// information_schema.views lists them with an unknown definition.
+	// A session view is listed here exactly when it is listed in pg_class with
+	// relkind 'v'. The engine does not retain the view's SQL text, so the
+	// definition is NULL rather than invented.
 	var rows []storage.Row
-	for _, view := range s.views {
+	for _, relation := range s.relations {
+		if relation.kind != 'v' || relation.virtual {
+			continue
+		}
 		rows = append(rows, storage.Row{
 			"table_catalog":              s.database,
-			"table_schema":               publicSchemaName,
-			"table_name":                 view,
+			"table_schema":               relation.schemaName,
+			"table_name":                 relation.name,
 			"view_definition":            nil,
 			"check_option":               "NONE",
 			"is_updatable":               "NO",
@@ -2048,7 +2086,7 @@ func (e *Executor) evalCatalogFunction(name string, fn *parser.FunctionCall, arg
 	}
 
 	switch name {
-	case "FORMAT_TYPE", "PG_TABLE_IS_VISIBLE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "HAS_TABLE_PRIVILEGE":
+	case "FORMAT_TYPE", "PG_TABLE_IS_VISIBLE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "HAS_TABLE_PRIVILEGE", "TO_REGCLASS", "TO_REGTYPE":
 	default:
 		return nil, false, nil
 	}
@@ -2059,6 +2097,36 @@ func (e *Executor) evalCatalogFunction(name string, fn *parser.FunctionCall, arg
 	}
 
 	switch name {
+	case "TO_REGCLASS", "TO_REGTYPE":
+		// PostgreSQL's to_regclass/to_regtype return NULL for a name that does
+		// not exist instead of failing the statement.
+		if len(args) == 0 || args[0] == nil {
+			return nil, true, nil
+		}
+		if reg, ok := args[0].(RegOID); ok {
+			return reg, true, nil
+		}
+		text, ok := args[0].(string)
+		if !ok {
+			return nil, true, pgerror.InvalidText("%s requires a text argument", strings.ToLower(name))
+		}
+		var oid int64
+		var found bool
+		if name == "TO_REGTYPE" {
+			oid, found = snapshot.typeOIDForName(text)
+		} else {
+			oid, found = snapshot.regclassOID(text)
+		}
+		if !found {
+			return nil, true, nil
+		}
+		var resolved string
+		if name == "TO_REGTYPE" {
+			resolved, _ = snapshot.typeNameForOID(oid)
+		} else {
+			resolved, _ = snapshot.regclassName(oid)
+		}
+		return RegOID{oid: oid, name: resolved}, true, nil
 	case "FORMAT_TYPE":
 		if len(args) == 0 {
 			return nil, true, pgerror.Unsupported("format_type requires a type OID")
@@ -2133,12 +2201,13 @@ func (e *Executor) evalCatalogFunction(name string, fn *parser.FunctionCall, arg
 	}
 }
 
-// currentSchemaName reports the first schema in the session search path. The
+// currentSchemaName reports the first schema in the effective search path. The
 // engine only materializes public, pg_catalog, and information_schema, so a
 // search path naming anything else falls back to public.
 func (e *Executor) currentSchemaName() string {
-	if len(e.searchPath) > 0 && e.searchPath[0] != "" {
-		return e.searchPath[0]
+	path := e.effectiveSearchPath()
+	if len(path) > 0 && path[0] != "" {
+		return path[0]
 	}
 	return publicSchemaName
 }
@@ -2159,14 +2228,14 @@ func (e *Executor) catalogCast(expr *parser.CastExpr, value interface{}) (interf
 			if typeName == "REGTYPE" {
 				oid, found := snapshot.typeOIDForName(text)
 				if !found {
-					return nil, true, fmt.Errorf("type %q does not exist", text)
+					return nil, true, pgerror.UndefinedTable("type %q does not exist", text)
 				}
 				name, _ := snapshot.typeNameForOID(oid)
 				return RegOID{oid: oid, name: name}, true, nil
 			}
 			oid, found := snapshot.regclassOID(text)
 			if !found {
-				return nil, true, fmt.Errorf("relation %q does not exist", text)
+				return nil, true, pgerror.UndefinedTable("relation %q does not exist", text)
 			}
 			name, _ := snapshot.regclassName(oid)
 			return RegOID{oid: oid, name: name}, true, nil

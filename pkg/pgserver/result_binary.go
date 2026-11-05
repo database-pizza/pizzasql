@@ -40,6 +40,7 @@ func canEncodeBinaryResult(oid int32) bool {
 		701,  // float8
 		1043, // varchar
 		1700, // numeric
+		24,   // regproc
 		2205, // regclass
 		2206, // regtype
 		3802: // jsonb
@@ -144,7 +145,7 @@ func appendBinaryResultValue(dst []byte, oid int32, value interface{}) ([]byte, 
 			return append(dst, reg.String()...), nil
 		}
 		return append(dst, textValueString(value)...), nil
-	case 26, 2205, 2206: // oid, regclass, regtype
+	case 26, 24, 2205, 2206: // oid, regproc, regclass, regtype
 		n, err := catalogOIDBinaryValue(value)
 		if err != nil {
 			return dst, err

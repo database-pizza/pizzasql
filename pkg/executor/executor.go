@@ -47,17 +47,22 @@ type Executor struct {
 
 	// searchPath is the session search path used by current_schema() and SHOW
 	// search_path. Only public, pg_catalog, and information_schema are
-	// materialized; drivers may name other schemas.
-	searchPath []string
+	// materialized; drivers may name other schemas. txSearchPath holds the session
+	// value captured at BEGIN so ROLLBACK restores it, and localSearchPath holds
+	// SET LOCAL, which expires at the end of the transaction.
+	searchPath      []string
+	txSearchPath    []string
+	localSearchPath []string
 
 	// Multi-database support
 	attachedDatabases map[string]*DatabaseConnection // alias -> connection
 	currentDatabase   string                         // current database alias (default is "main")
 
 	// Transaction state
-	inTransaction   bool
-	savepoints      []string                    // stack of savepoint names
-	savepointStates []*storage.SessionSavepoint // full session state (rows and staged DDL) per savepoint
+	inTransaction        bool
+	savepoints           []string                    // stack of savepoint names
+	savepointStates      []*storage.SessionSavepoint // full session state (rows and staged DDL) per savepoint
+	localSearchPathSaves [][]string                  // SET LOCAL value per savepoint
 
 	// LISTEN/NOTIFY state. The hub and subscriber are per database instance;
 	// listenOps and notifyQueue are staged until COMMIT so LISTEN and NOTIFY
@@ -106,8 +111,11 @@ type Executor struct {
 	// after the join rows are built.
 	joinTypeScopes []*joinTypeScope
 
-	// In-memory view registry: view name (lowercase) → SELECT AST.
-	views map[string]*parser.SelectStmt
+	// In-memory view registry: view name (lowercase) → SELECT AST, plus the
+	// column list each view exposes. The catalog reports both so pg_class,
+	// pg_attribute, and information_schema.columns agree on a view's shape.
+	views       map[string]*parser.SelectStmt
+	viewColumns map[string][]storage.Column
 
 	// Materialized common table expressions for the current query, keyed by
 	// lowercased CTE name. Recursive CTEs populate this during fixpoint
@@ -157,6 +165,7 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 		attachedDatabases: make(map[string]*DatabaseConnection),
 		currentDatabase:   "main",
 		views:             make(map[string]*parser.SelectStmt),
+		viewColumns:       make(map[string][]storage.Column),
 		listens:           make(map[string]bool),
 		searchPath:        []string{publicSchemaName},
 	}
@@ -591,6 +600,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	schema, err := e.session.GetSchema(tableName)
 	if err != nil {
+		if !e.session.TableExists(tableName) {
+			// A qualified name the durable schema does not have, such as
+			// public.pg_class, is an undefined table in PostgreSQL; report it as
+			// 42P01 rather than an internal error.
+			qualified := tableName
+			if stmt.From[0].Schema != "" {
+				qualified = stmt.From[0].Schema + "." + tableName
+			}
+			return nil, pgerror.UndefinedTable("relation %q does not exist", qualified)
+		}
 		return nil, err
 	}
 
@@ -1902,7 +1921,10 @@ func (e *Executor) executeSelectOnMaterializedRows(stmt *parser.SelectStmt, colu
 		for _, row := range derivedRows {
 			val, err := e.evalExpr(stmt.Where, row)
 			if err != nil {
-				continue
+				// A failing predicate is a statement error, not a non-matching
+				// row: a typo'd regclass lookup must fail instead of filtering
+				// everything out and returning 0 rows.
+				return nil, err
 			}
 			if toBool(val) {
 				filteredRows = append(filteredRows, row)
@@ -4554,9 +4576,22 @@ func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, erro
 
 	e.views[name] = stmt.Select
 
-	// Derive view columns from SELECT list for catalog registration.
+	// Derive view columns from SELECT list for catalog registration. The same
+	// pass records the typed column list the catalog reports, so a view's
+	// pg_attribute and information_schema.columns rows match SELECT * FROM view.
 	var viewCols []analyzer.ColumnInfo
+	var catalogColumns []storage.Column
 	hasStar := false
+	typeResolver := e.joinedTypeResolver(stmt.Select.From)
+	addColumn := func(name, typeName string) {
+		viewCols = append(viewCols, analyzer.ColumnInfo{
+			Name:      name,
+			TableName: stmt.View.Name,
+			Type:      analyzer.TypeAny,
+			Nullable:  true,
+		})
+		catalogColumns = append(catalogColumns, storage.Column{Name: name, Type: typeName, Nullable: true})
+	}
 	for _, col := range stmt.Select.Columns {
 		if col.Star {
 			hasStar = true
@@ -4570,24 +4605,14 @@ func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, erro
 				colName = fmt.Sprintf("col_%d", len(viewCols))
 			}
 		}
-		viewCols = append(viewCols, analyzer.ColumnInfo{
-			Name:      colName,
-			TableName: stmt.View.Name,
-			Type:      analyzer.TypeAny,
-			Nullable:  true,
-		})
+		addColumn(colName, inferExprType(col.Expr, typeResolver))
 	}
 	// For SELECT *, pull columns from the underlying table(s).
 	if hasStar && len(stmt.Select.From) > 0 {
 		baseName := stmt.Select.From[0].Name
 		if schema, err := e.session.GetSchema(baseName); err == nil {
-			for _, c := range schema.Columns {
-				viewCols = append(viewCols, analyzer.ColumnInfo{
-					Name:      c.Name,
-					TableName: stmt.View.Name,
-					Type:      analyzer.TypeAny,
-					Nullable:  true,
-				})
+			for _, c := range visibleCatalogColumns(schema) {
+				addColumn(c.Name, c.Type)
 			}
 		}
 	}
@@ -4598,6 +4623,7 @@ func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, erro
 		Columns: viewCols,
 		IsView:  true,
 	})
+	e.viewColumns[name] = catalogColumns
 
 	return NewResult("CREATE VIEW"), nil
 }
@@ -4612,6 +4638,7 @@ func (e *Executor) executeDropView(stmt *parser.DropViewStmt) (*Result, error) {
 			return nil, fmt.Errorf("view not found: %s", ref.Name)
 		}
 		delete(e.views, name)
+		delete(e.viewColumns, name)
 		e.catalog.DropTable(ref.Name) //nolint:errcheck
 	}
 	return NewResult("DROP VIEW"), nil
@@ -4870,6 +4897,8 @@ func (e *Executor) executeBegin(stmt *parser.BeginStmt) (*Result, error) {
 	e.inTransaction = true
 	e.savepoints = nil
 	e.savepointStates = nil
+	e.localSearchPathSaves = nil
+	e.beginSettingScope()
 	e.clearNotificationState()
 
 	result := NewResult("BEGIN")
@@ -4894,6 +4923,7 @@ func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 	e.inTransaction = false
 	e.savepoints = nil
 	e.savepointStates = nil
+	e.localSearchPathSaves = nil
 	e.finishCommit(lsn)
 
 	result := NewResult("COMMIT")
@@ -4918,6 +4948,7 @@ func (e *Executor) executeRollback(stmt *parser.RollbackStmt) (*Result, error) {
 	e.inTransaction = false
 	e.savepoints = nil
 	e.savepointStates = nil
+	e.localSearchPathSaves = nil
 	e.finishRollback()
 	// total_changes() is monotonic (SQLite semantics): it is NOT decremented on
 	// rollback. last_insert_rowid() and changes() also intentionally hold.
@@ -4943,6 +4974,7 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 	e.savepoints = append(e.savepoints, stmt.Name)
 	e.savepointStates = append(e.savepointStates, e.session.Savepoint())
 	e.notificationSaves = append(e.notificationSaves, e.notificationSnapshot())
+	e.localSearchPathSaves = append(e.localSearchPathSaves, e.localSearchPath)
 
 	result := NewResult("SAVEPOINT")
 	return result, nil
@@ -4962,6 +4994,9 @@ func (e *Executor) executeRelease(stmt *parser.ReleaseStmt) (*Result, error) {
 			e.savepointStates = e.savepointStates[:i]
 			if i <= len(e.notificationSaves) {
 				e.notificationSaves = e.notificationSaves[:i]
+			}
+			if i <= len(e.localSearchPathSaves) {
+				e.localSearchPathSaves = e.localSearchPathSaves[:i]
 			}
 			found = true
 			break
@@ -5062,6 +5097,12 @@ func (e *Executor) rollbackToSavepoint(name string) (*Result, error) {
 	if savepointIdx < len(e.notificationSaves) {
 		e.rollbackNotificationsTo(e.notificationSaves[savepointIdx])
 		e.notificationSaves = e.notificationSaves[:savepointIdx+1]
+	}
+	// SET LOCAL is undoable down to the savepoint, matching PostgreSQL.
+	if savepointIdx < len(e.localSearchPathSaves) {
+		e.localSearchPath = e.localSearchPathSaves[savepointIdx]
+		e.localSearchPathSaves = e.localSearchPathSaves[:savepointIdx+1]
+		e.pgCatalog = nil
 	}
 
 	// Remove savepoints after the target

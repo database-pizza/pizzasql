@@ -485,6 +485,10 @@ func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) str
 		// These return one of the input values unchanged, so the result type
 		// follows the first argument (and therefore keeps JSONB).
 		return firstArgType(fn, resolve)
+	case "TO_REGCLASS":
+		return "REGCLASS"
+	case "TO_REGTYPE":
+		return "REGTYPE"
 	default:
 		return "TEXT"
 	}

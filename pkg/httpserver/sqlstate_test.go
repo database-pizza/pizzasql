@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
@@ -134,6 +135,7 @@ func TestSQLStateHTTPErrorMapping(t *testing.T) {
 		{"typed primary key", &storage.PrimaryKeyViolationError{Table: "t", Key: "1"}, http.StatusConflict, "23505"},
 		{"serialization", fmt.Errorf("commit: %w", storage.ErrSerialization), http.StatusConflict, "40001"},
 		{"unsupported", fmt.Errorf("feature not supported: DEFAULT is not constant"), http.StatusBadRequest, "0A000"},
+		{"undefined table", pgerror.UndefinedTable("relation %q does not exist", "missing"), http.StatusNotFound, "42P01"},
 		{"other", errors.New("boom"), http.StatusInternalServerError, "EXECUTION_ERROR"},
 	}
 	for _, tt := range tests {

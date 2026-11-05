@@ -466,6 +466,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
+			} else if errors.Is(err, pgerror.ErrUndefinedTable) || analysisUndefinedTable(err) {
+				code = ErrCodeUndefinedTable
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if analysisErr := analysisTypeMismatch(err); analysisErr {
 				code = ErrCodeDatatypeMismatch
 				if c.txStatus == TxStatusInBlock {
@@ -803,6 +808,11 @@ func (c *Connection) classifyExecuteError(stmt parser.Statement, err error) *exe
 		if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
 		}
+	} else if errors.Is(err, pgerror.ErrUndefinedTable) || analysisUndefinedTable(err) {
+		code = ErrCodeUndefinedTable
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
 	} else if analysisTypeMismatch(err) {
 		code = ErrCodeDatatypeMismatch
 		if c.txStatus == TxStatusInBlock {
@@ -994,6 +1004,13 @@ func (c *Connection) handleProxyError(msg *Message) error {
 func analysisTypeMismatch(err error) bool {
 	var analysisErr *analyzer.AnalysisError
 	return errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch
+}
+
+// analysisUndefinedTable reports whether the error is the analyzer's
+// table-not-found, which PostgreSQL reports as 42P01 (undefined_table).
+func analysisUndefinedTable(err error) bool {
+	var analysisErr *analyzer.AnalysisError
+	return errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTableNotFound
 }
 
 type boundParameter struct {
@@ -1602,6 +1619,9 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 		return 2205 // REGCLASSOID
 	case "REGTYPE":
 		return 2206 // REGTYPEOID
+	case "REGPROC":
+		// pg_type.typinput and friends are regproc attributes.
+		return 24 // REGPROCOID
 	case "NAME":
 		return 19 // NAMEOID
 	case "TEXT", "VARCHAR", "CHAR", "UUID":
@@ -1651,7 +1671,7 @@ func (c *Connection) getTypeSizeForType(typeName string) int16 {
 		return 8
 	case "DATE":
 		return 4
-	case "OID", "REGCLASS", "REGTYPE":
+	case "OID", "REGCLASS", "REGTYPE", "REGPROC":
 		return 4
 	case "NAME":
 		return 64

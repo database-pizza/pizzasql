@@ -236,8 +236,8 @@ func Current() *Document {
 		},
 
 		Catalog: Catalog{
-			PgCatalog:         Feature{Supported: true, Status: "virtual_relations", SQLState: "0A000", Notes: "read-only relations synthesized from the durable schema the connection's session observes, including DDL staged by an open transaction: pg_class, pg_namespace, pg_attribute, pg_type, pg_index, pg_constraint, pg_attrdef, pg_database, pg_tablespace, pg_proc (the builtins the engine answers), pg_am, pg_description, pg_tables, and pg_indexes; SELECT supports WHERE, ORDER BY, LIMIT/OFFSET, projection, aggregates, and joins between catalog relations, with the emulated schemas pg_catalog (OID 11), public (OID 2200), and information_schema (OID 13207); INSERT/UPDATE/DELETE against a catalog relation fails with 0A000, comments and sequences are honestly empty/NULL, and a primary key gets a synthetic index so pg_index and pg_constraint agree; a unique index and a UNIQUE constraint are both reported as contype 'u' because the engine does not persist which declaration created the index"},
-			InformationSchema: Feature{Supported: true, Status: "virtual_views", Notes: "tables, columns, table_constraints, key_column_usage, referential_constraints, constraint_column_usage, schemata, sequences, and views; sequences is always empty because the engine has no sequence objects, and views lists session views with a NULL definition because the engine does not retain view SQL text; information_schema.check_constraints and domains are not emulated"},
+			PgCatalog:         Feature{Supported: true, Status: "virtual_relations", SQLState: "0A000", Notes: "read-only relations synthesized from the durable schema the connection's session observes, including DDL staged by an open transaction: pg_class, pg_namespace, pg_attribute, pg_type, pg_index, pg_constraint, pg_attrdef, pg_database, pg_tablespace, pg_proc (the builtins the engine answers), pg_am, pg_description, pg_tables, and pg_indexes; session views appear in pg_class with relkind 'v' plus their pg_attribute and information_schema.columns rows; SELECT supports WHERE, ORDER BY, LIMIT/OFFSET, projection, aggregates, and joins between catalog relations, with the emulated schemas pg_catalog (OID 11), public (OID 2200), and information_schema (OID 13207); a schema-qualified name only resolves in the schema named, so public.pg_class is an undefined table (42P01), and a CTE shadows a catalog relation of the same name; INSERT/UPDATE/DELETE against a catalog relation fails with 0A000, comments and sequences are honestly empty/NULL, pg_type function attributes are regproc 0 rather than invented function names, and a primary key gets a synthetic index so pg_index and pg_constraint agree; a unique index and a UNIQUE constraint are both reported as contype 'u' because the engine does not persist which declaration created the index"},
+			InformationSchema: Feature{Supported: true, Status: "virtual_views", Notes: "tables, columns, table_constraints, key_column_usage, referential_constraints, constraint_column_usage, schemata, sequences, and views; sequences is always empty because the engine has no sequence objects, and views lists exactly the session views pg_class reports as relkind 'v', with a NULL definition because the engine does not retain view SQL text; information_schema.check_constraints and domains are not emulated"},
 			Relations: []string{
 				"pg_catalog.pg_class", "pg_catalog.pg_namespace", "pg_catalog.pg_attribute",
 				"pg_catalog.pg_type", "pg_catalog.pg_index", "pg_catalog.pg_constraint",
@@ -254,11 +254,11 @@ func Current() *Document {
 				"current_schema", "current_database", "format_type", "pg_table_is_visible",
 				"pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr",
 				"pg_get_serial_sequence", "obj_description", "col_description",
-				"has_table_privilege", "pg_get_userbyid",
+				"has_table_privilege", "pg_get_userbyid", "to_regclass", "to_regtype",
 			},
-			OIDStrategy:   "deterministic 32-bit FNV-1a of the schema-qualified name, lifted into [16384, 2^31-1] and collision-probed in sorted order; pg_class, pg_attribute, pg_type, pg_index, and pg_constraint share the same allocator so catalog joins agree",
+			OIDStrategy:   "deterministic 32-bit FNV-1a of the schema-qualified name plus relkind, lifted into [16384, 2^31-1] and collision-probed in sorted order; relkind is part of the key so an index that shares its table's name keeps its own OID, and pg_class, pg_attribute, pg_type, pg_index, and pg_constraint share the same allocator so catalog joins agree",
 			Writable:      false,
-			SetStatements: Feature{Supported: true, Status: "accepted_and_ignored", Notes: "SET [SESSION|LOCAL] name { TO | = } value, SET NAMES, SET TIME ZONE, and SET SESSION CHARACTERISTICS are accepted so driver initialization succeeds; only search_path is retained and reported by SHOW search_path and current_schema(), which resolve the emulated public schema; SHOW reports honest constants for server_version, server_encoding, client_encoding, transaction_isolation, standard_conforming_strings, integer_datetimes, datestyle, timezone, application_name, and is_superuser, and rejects unknown names"},
+			SetStatements: Feature{Supported: true, Status: "search_path_only", Notes: "SET [SESSION|LOCAL] name { TO | = } value, SET NAMES, SET TIME ZONE, and SET SESSION CHARACTERISTICS are accepted so driver initialization succeeds; only search_path is retained and reported by SHOW search_path and current_schema(), which resolve the emulated public schema. SET LOCAL is transaction-scoped (no effect outside a transaction block, expires at COMMIT, undone by ROLLBACK TO SAVEPOINT), and a session SET inside an aborted transaction is undone by ROLLBACK, matching PostgreSQL. Other settings are accepted and ignored. SHOW reports honest constants for server_version, server_encoding, client_encoding, transaction_isolation, standard_conforming_strings, integer_datetimes, datestyle, timezone, application_name, and is_superuser, and rejects unknown names"},
 		},
 
 		Parameters: Parameters{
@@ -294,6 +294,7 @@ func Current() *Document {
 			"22023": "invalid_parameter_value",
 			"42501": "insufficient_privilege (managed proxy)",
 			"42601": "syntax_error",
+			"42P01": "undefined_table",
 			"25P02": "in_failed_sql_transaction",
 			"08P01": "protocol_violation (managed proxy: TLS required)",
 			"53300": "too_many_connections (managed proxy: organization quota)",

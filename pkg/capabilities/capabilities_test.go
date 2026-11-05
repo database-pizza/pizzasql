@@ -388,7 +388,7 @@ func TestCatalogIntrospectionIsAdvertised(t *testing.T) {
 	for _, want := range []string{
 		"current_schema", "current_database", "format_type", "pg_table_is_visible",
 		"pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr", "pg_get_serial_sequence",
-		"obj_description", "col_description", "has_table_privilege",
+		"obj_description", "col_description", "has_table_privilege", "to_regclass", "to_regtype",
 	} {
 		found := false
 		for _, function := range catalog.Functions {
@@ -404,10 +404,10 @@ func TestCatalogIntrospectionIsAdvertised(t *testing.T) {
 	if !strings.Contains(catalog.OIDStrategy, "FNV-1a") || !strings.Contains(catalog.OIDStrategy, "deterministic") {
 		t.Fatalf("oid_strategy = %q", catalog.OIDStrategy)
 	}
-	if !catalog.SetStatements.Supported || catalog.SetStatements.Status != "accepted_and_ignored" {
+	if !catalog.SetStatements.Supported || catalog.SetStatements.Status != "search_path_only" {
 		t.Fatalf("set_statements = %+v", catalog.SetStatements)
 	}
-	for _, want := range []string{"search_path", "SHOW", "current_schema"} {
+	for _, want := range []string{"search_path", "SHOW", "current_schema", "SET LOCAL"} {
 		if !strings.Contains(catalog.SetStatements.Notes, want) {
 			t.Errorf("set_statements notes do not mention %q", want)
 		}

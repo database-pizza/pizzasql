@@ -2,7 +2,10 @@ package pgserver
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // A stock pgx connection introspects the catalog with its normal
@@ -109,5 +112,42 @@ func TestPGXCatalogIntrospection(t *testing.T) {
 	}
 	if regclassRows != 1 {
 		t.Fatalf("foreign key constraint count = %d, want 1", regclassRows)
+	}
+}
+
+// An unknown regclass over the extended protocol is a 42P01 PgError, not an
+// XX000 internal error, and to_regclass returns NULL for the same name.
+func TestPGXCatalogUndefinedRelationSQLState(t *testing.T) {
+	conn := connectPGX(t)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `CREATE TABLE catalog_state (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	for _, sql := range []string{
+		`SELECT 'missing_relation'::regclass`,
+		`SELECT 'missing_type'::regtype`,
+		`SELECT count(*) FROM pg_catalog.pg_class WHERE oid = 'missing_relation'::regclass`,
+		`SELECT count(*) FROM public.pg_class`,
+	} {
+		var n int64
+		err := conn.QueryRow(ctx, sql).Scan(&n)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Fatalf("%s: err = %v, want a PgError", sql, err)
+		}
+		if pgErr.Code != "42P01" {
+			t.Fatalf("%s: SQLSTATE = %q, want 42P01 (%s)", sql, pgErr.Code, pgErr.Message)
+		}
+	}
+
+	var missing, present *string
+	err := conn.QueryRow(ctx, `SELECT to_regclass('missing_relation'), to_regclass('catalog_state')`).
+		Scan(&missing, &present)
+	if err != nil {
+		t.Fatalf("to_regclass: %v", err)
+	}
+	if missing != nil || present == nil || *present != "catalog_state" {
+		t.Fatalf("to_regclass = %v / %v, want NULL / catalog_state", missing, present)
 	}
 }

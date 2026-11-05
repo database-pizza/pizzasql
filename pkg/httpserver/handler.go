@@ -558,6 +558,13 @@ func sqlStateHTTPError(err error) *HTTPError {
 			Message: message,
 		}
 	}
+	if errors.Is(err, pgerror.ErrUndefinedTable) || (errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTableNotFound) {
+		return &HTTPError{
+			Status:  http.StatusNotFound,
+			Code:    pgerror.CodeUndefinedTable,
+			Message: message,
+		}
+	}
 	return &HTTPError{
 		Status:  http.StatusInternalServerError,
 		Code:    "EXECUTION_ERROR",

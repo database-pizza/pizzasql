@@ -292,6 +292,8 @@ var builtinFunctions = map[string]FunctionSignature{
 	"COL_DESCRIPTION":        {Name: "COL_DESCRIPTION", MinArgs: 2, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeInteger}, ReturnType: TypeText, IsAggregate: false},
 	"HAS_TABLE_PRIVILEGE":    {Name: "HAS_TABLE_PRIVILEGE", MinArgs: 2, MaxArgs: 3, ArgTypes: []Type{TypeAny, TypeText, TypeText}, ReturnType: TypeBoolean, IsAggregate: false},
 	"PG_GET_USERBYID":        {Name: "PG_GET_USERBYID", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"TO_REGCLASS":            {Name: "TO_REGCLASS", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeText}, ReturnType: TypeAny, IsAggregate: false},
+	"TO_REGTYPE":             {Name: "TO_REGTYPE", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeText}, ReturnType: TypeAny, IsAggregate: false},
 	"LAST_INSERT_ROWID":      {Name: "LAST_INSERT_ROWID", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
 	"CHANGES":                {Name: "CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
 	"TOTAL_CHANGES":          {Name: "TOTAL_CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},

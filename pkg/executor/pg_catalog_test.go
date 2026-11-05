@@ -1,9 +1,12 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 )
 
 // setupPGCatalogFixture creates a schema that exercises every catalog-backed
@@ -395,13 +398,14 @@ func TestPGCatalogRejectsWrites(t *testing.T) {
 		`INSERT INTO information_schema.tables VALUES ('x')`,
 		`UPDATE pg_catalog.pg_type SET typname = 'x'`,
 		`DELETE FROM pg_catalog.pg_attribute`,
-		`CREATE INDEX idx_pg_class_name ON pg_catalog.pg_class (relname)`,
-		`ALTER TABLE pg_catalog.pg_class ADD COLUMN nope TEXT`,
+		`CREATE INDEX idx_pg_class_name ON pg_class (relname)`,
+		`ALTER TABLE pg_class ADD COLUMN nope TEXT`,
 		`DROP TABLE pg_catalog.pg_class`,
-		`CREATE VIEW pg_catalog.pg_class AS SELECT 1`,
+		`CREATE VIEW pg_class AS SELECT 1`,
 	} {
-		if _, err := execSQL(e, sql); err == nil {
-			t.Fatalf("%s: catalog write must be rejected", sql)
+		_, err := execSQL(e, sql)
+		if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			t.Fatalf("%s: err = %v, want 0A000 feature_not_supported", sql, err)
 		}
 	}
 }
@@ -454,4 +458,303 @@ func TestPGCatalogDoesNotChangeSQLiteIntrospection(t *testing.T) {
 	if len(res.Rows) != 5 {
 		t.Fatalf("PRAGMA table_info rows = %v", res.Rows)
 	}
+}
+
+// An index may share its table's name. pg_class then holds two rows with the
+// same relname, so relkind is part of the relation identity: the rows keep
+// distinct OIDs and pg_index/pg_attribute stay consistent with each of them.
+func TestPGCatalogIndexSharingTableName(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE shared (id INTEGER PRIMARY KEY, label TEXT)")
+	execMust(t, e, "CREATE INDEX shared ON shared (label)")
+
+	rows := catalogRows(t, e, `SELECT relkind, oid FROM pg_class WHERE relname = 'shared' ORDER BY relkind`)
+	if len(rows) != 2 {
+		t.Fatalf("pg_class rows for shared = %v, want a table and an index", rows)
+	}
+	if rows[0][0] != "i" || rows[1][0] != "r" {
+		t.Fatalf("pg_class row kinds = %v, want i then r", rows)
+	}
+	if rows[0][1] == rows[1][1] {
+		t.Fatalf("table and index share OID %v", rows[0][1])
+	}
+
+	// pg_index must point the index row at the table row, not at itself.
+	rows = catalogRows(t, e, `
+		SELECT c.relname, i.indexrelid, i.indrelid, i.indrelid = t.oid
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_class t ON t.oid = i.indrelid
+		WHERE c.relname = 'shared'`)
+	if len(rows) != 1 || rows[0][0] != "shared" || rows[0][1] == rows[0][2] || rows[0][3] != "true" {
+		t.Fatalf("pg_index row = %v, want indexrelid != indrelid = t.oid", rows)
+	}
+
+	// The table's attributes belong to exactly one relation, so the index row
+	// must not double them.
+	res := execMust(t, e, `
+		SELECT count(*) FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		WHERE c.relname = 'shared' AND c.relkind = 'r' AND a.attnum > 0`)
+	if res.Rows[0][0] != int64(2) {
+		t.Fatalf("pg_attribute rows for the shared table = %v, want 2", res.Rows[0][0])
+	}
+
+	// regclass resolution prefers the table when the names collide.
+	res = execMust(t, e, `SELECT 'shared'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'shared' AND relkind = 'r')`)
+	if res.Rows[0][0] != true {
+		t.Fatalf("regclass did not resolve to the table: %v", res.Rows)
+	}
+}
+
+// A durable table named <x>_pkey occupies the synthetic primary-key index name,
+// so the synthesized index must pick a free name instead of colliding with it.
+func TestPGCatalogSyntheticPrimaryKeyNameCollision(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE owner (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "CREATE TABLE owner_pkey (id INTEGER PRIMARY KEY)")
+
+	rows := catalogRows(t, e, `SELECT relname, relkind FROM pg_class WHERE relname LIKE 'owner%' ORDER BY relname, relkind`)
+	want := [][]string{
+		{"owner", "r"},
+		{"owner_pkey", "r"},
+		{"owner_pkey2", "i"},
+		{"owner_pkey_pkey", "i"},
+	}
+	if fmt.Sprint(rows) != fmt.Sprint(want) {
+		t.Fatalf("pg_class rows = %v, want %v", rows, want)
+	}
+
+	// The primary key constraint still points at the renamed synthetic index.
+	rows = catalogRows(t, e, `
+		SELECT con.conname, c.relname
+		FROM pg_constraint con
+		JOIN pg_class c ON c.oid = con.conindid
+		WHERE con.conrelid = 'owner'::regclass AND con.contype = 'p'`)
+	if len(rows) != 1 || rows[0][1] != "owner_pkey2" {
+		t.Fatalf("primary key index = %v, want owner_pkey2", rows)
+	}
+
+	// No name is reported twice with the same relkind.
+	res := execMust(t, e, `
+		SELECT count(*) FROM (
+			SELECT relname, relkind, count(*) AS n FROM pg_class GROUP BY relname, relkind
+		) d WHERE d.n > 1`)
+	if res.Rows[0][0] != int64(0) {
+		t.Fatalf("pg_class contains duplicate relname/relkind rows: %v", res.Rows)
+	}
+}
+
+// An unknown regclass or regtype reports undefined_table (42P01) instead of an
+// internal error, and it fails the statement even inside a WHERE clause.
+// to_regclass/to_regtype are the NULL-returning variants.
+func TestPGCatalogUndefinedRelationError(t *testing.T) {
+	e := setupPGCatalogFixture(t)
+	for _, sql := range []string{
+		`SELECT 'missing_relation'::regclass`,
+		`SELECT 'missing_type'::regtype`,
+		`SELECT count(*) FROM pg_class WHERE oid = 'missing_relation'::regclass`,
+		`SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE a.attrelid = 'missing_relation'::regclass`,
+	} {
+		_, err := execSQL(e, sql)
+		if !errors.Is(err, pgerror.ErrUndefinedTable) {
+			t.Fatalf("%s: err = %v, want an undefined_table error", sql, err)
+		}
+	}
+
+	rows := catalogRows(t, e, `SELECT to_regclass('orders'), to_regclass('missing_relation'), to_regtype('missing_type')`)
+	if len(rows) != 1 || rows[0][0] != "orders" || rows[0][1] != "<nil>" || rows[0][2] != "<nil>" {
+		t.Fatalf("to_regclass/to_regtype = %v", rows)
+	}
+	res := execMust(t, e, `
+		SELECT to_regclass('orders')::oid = (SELECT oid FROM pg_class WHERE relname = 'orders' AND relkind = 'r')`)
+	if res.Rows[0][0] != true {
+		t.Fatalf("to_regclass OID = %v, want the pg_class OID", res.Rows)
+	}
+	res = execMust(t, e, `SELECT to_regclass('orders')`)
+	if fmt.Sprint(res.ColumnTypes) != "[REGCLASS]" {
+		t.Fatalf("to_regclass result type = %v, want REGCLASS", res.ColumnTypes)
+	}
+}
+
+// A CTE shadows a virtual catalog relation of the same name, exactly as a CTE
+// shadows a table.
+func TestPGCatalogCTEShadowsVirtualRelation(t *testing.T) {
+	e := setupPGCatalogFixture(t)
+	rows := catalogRows(t, e, `WITH pg_attribute AS (SELECT 7 AS attnum) SELECT * FROM pg_attribute`)
+	if len(rows) != 1 || rows[0][0] != "7" {
+		t.Fatalf("non-recursive CTE did not shadow pg_attribute: %v", rows)
+	}
+
+	rows = catalogRows(t, e, `
+		WITH RECURSIVE pg_class(oid) AS (SELECT 42 UNION ALL SELECT oid + 1 FROM pg_class WHERE oid < 44)
+		SELECT * FROM pg_class`)
+	if len(rows) != 3 || rows[0][0] != "42" || rows[2][0] != "44" {
+		t.Fatalf("recursive CTE did not shadow pg_class: %v", rows)
+	}
+
+	res := execMust(t, e, `
+		WITH pg_attribute(attname) AS (SELECT 'shadowed')
+		SELECT count(*) FROM pg_catalog.pg_attribute`)
+	if res.Rows[0][0] == int64(1) {
+		t.Fatalf("CTE shadowed an explicitly qualified catalog relation")
+	}
+}
+
+// A schema qualifier only resolves inside the schema it names: public.pg_class
+// is not pg_catalog.pg_class, so it is an undefined table.
+func TestPGCatalogQualifiedNameStaysInItsSchema(t *testing.T) {
+	e := setupPGCatalogFixture(t)
+	for _, sql := range []string{
+		`SELECT count(*) FROM public.pg_class`,
+		`SELECT count(*) FROM public.pg_attribute`,
+	} {
+		_, err := execSQL(e, sql)
+		if !errors.Is(err, pgerror.ErrUndefinedTable) {
+			t.Fatalf("%s: err = %v, want an undefined_table error", sql, err)
+		}
+	}
+
+	// A real public table still resolves through the qualifier.
+	res := execMust(t, e, `SELECT count(*) FROM public.orders`)
+	if res.Rows[0][0] != int64(0) {
+		t.Fatalf("public.orders rows = %v", res.Rows)
+	}
+	if res := execMust(t, e, `SELECT count(*) FROM pg_catalog.pg_class`); res.Rows[0][0] == int64(0) {
+		t.Fatal("pg_catalog.pg_class is empty")
+	}
+}
+
+// A view listed by information_schema is listed everywhere else with the same
+// shape: pg_class relkind 'v', its pg_attribute rows, and its columns.
+func TestPGCatalogViewShape(t *testing.T) {
+	e := setupPGCatalogFixture(t)
+
+	rows := catalogRows(t, e, `SELECT relname, relkind, relnatts FROM pg_class WHERE relname = 'active_orders'`)
+	if len(rows) != 1 || rows[0][1] != "v" || rows[0][2] != "2" {
+		t.Fatalf("pg_class view row = %v", rows)
+	}
+
+	rows = catalogRows(t, e, `
+		SELECT a.attnum, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
+		FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		WHERE c.relname = 'active_orders' AND c.relkind = 'v' AND a.attnum > 0
+		ORDER BY a.attnum`)
+	want := [][]string{{"1", "id", "integer"}, {"2", "note", "text"}}
+	if fmt.Sprint(rows) != fmt.Sprint(want) {
+		t.Fatalf("view attributes = %v, want %v", rows, want)
+	}
+
+	rows = catalogRows(t, e, `
+		SELECT table_type, is_insertable_into FROM information_schema.tables WHERE table_name = 'active_orders'`)
+	if len(rows) != 1 || rows[0][0] != "VIEW" || rows[0][1] != "NO" {
+		t.Fatalf("information_schema.tables view row = %v", rows)
+	}
+
+	rows = catalogRows(t, e, `
+		SELECT column_name, data_type, ordinal_position
+		FROM information_schema.columns WHERE table_name = 'active_orders'
+		ORDER BY ordinal_position`)
+	want = [][]string{{"id", "integer", "1"}, {"note", "text", "2"}}
+	if fmt.Sprint(rows) != fmt.Sprint(want) {
+		t.Fatalf("information_schema.columns view rows = %v, want %v", rows, want)
+	}
+
+	res := execMust(t, e, `SELECT count(*) FROM information_schema.views WHERE table_name = 'active_orders'`)
+	if res.Rows[0][0] != int64(1) {
+		t.Fatalf("information_schema.views rows = %v, want 1", res.Rows[0][0])
+	}
+
+	// Every view information_schema lists has the same number of columns in
+	// pg_attribute and information_schema.columns.
+	res = execMust(t, e, `
+		SELECT count(*) FROM information_schema.tables t
+		WHERE t.table_type = 'VIEW' AND t.table_schema = 'public'
+		  AND (SELECT count(*) FROM information_schema.columns c
+		       WHERE c.table_name = t.table_name)
+		      <> (SELECT relnatts FROM pg_class c
+		          WHERE c.relname = t.table_name AND c.relkind = 'v')`)
+	if res.Rows[0][0] != int64(0) {
+		t.Fatalf("a public view has an inconsistent catalog shape: %v", res.Rows[0][0])
+	}
+}
+
+// pg_type's function attributes are regproc columns holding 0, not the text "-".
+func TestPGCatalogTypeRegprocAttributes(t *testing.T) {
+	e := setupPGCatalogFixture(t)
+	rows := catalogRows(t, e, `
+		SELECT typname, typinput, typoutput, typreceive, typsend, typmodin, typanalyze
+		FROM pg_type WHERE typname = 'int4'`)
+	want := [][]string{{"int4", "0", "0", "0", "0", "0", "0"}}
+	if fmt.Sprint(rows) != fmt.Sprint(want) {
+		t.Fatalf("pg_type regproc attributes = %v, want %v", rows, want)
+	}
+
+	res := execMust(t, e, `SELECT typinput, typoutput FROM pg_type WHERE typname = 'text'`)
+	if fmt.Sprint(res.ColumnTypes) != "[REGPROC REGPROC]" {
+		t.Fatalf("pg_type regproc column types = %v", res.ColumnTypes)
+	}
+}
+
+// search_path follows PostgreSQL's transaction rules: SET LOCAL expires at
+// COMMIT (and on ROLLBACK TO SAVEPOINT), and a session SET inside an aborted
+// transaction is undone by ROLLBACK.
+func TestPGSearchPathTransactionScope(t *testing.T) {
+	e := setupPGCatalogFixture(t)
+	showPath := func() string {
+		t.Helper()
+		res := execMust(t, e, "SHOW search_path")
+		if len(res.Rows) != 1 {
+			t.Fatalf("SHOW search_path = %v", res.Rows)
+		}
+		return fmt.Sprintf("%v", res.Rows[0][0])
+	}
+
+	// SET LOCAL outside a transaction block has no effect.
+	execMust(t, e, "SET LOCAL search_path TO pg_catalog")
+	if got := showPath(); got != "public" {
+		t.Fatalf("search_path after SET LOCAL outside a transaction = %q", got)
+	}
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "SET LOCAL search_path TO pg_catalog")
+	if got := showPath(); got != "pg_catalog" {
+		t.Fatalf("search_path inside the transaction = %q", got)
+	}
+	if res := execMust(t, e, "SELECT current_schema()"); res.Rows[0][0] != "pg_catalog" {
+		t.Fatalf("current_schema() inside the transaction = %v", res.Rows[0][0])
+	}
+	execMust(t, e, "COMMIT")
+	if got := showPath(); got != "public" {
+		t.Fatalf("search_path after COMMIT = %q, want SET LOCAL to expire", got)
+	}
+
+	// A session SET is transactional: ROLLBACK restores the previous value,
+	// COMMIT keeps it.
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "SET search_path TO pg_catalog")
+	execMust(t, e, "ROLLBACK")
+	if got := showPath(); got != "public" {
+		t.Fatalf("search_path after ROLLBACK = %q, want the pre-transaction value", got)
+	}
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "SET search_path TO pg_catalog")
+	execMust(t, e, "COMMIT")
+	if got := showPath(); got != "pg_catalog" {
+		t.Fatalf("search_path after COMMIT = %q, want the session SET to persist", got)
+	}
+	execMust(t, e, "SET search_path TO public")
+
+	// ROLLBACK TO SAVEPOINT undoes a SET LOCAL issued after the savepoint.
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "SAVEPOINT sp")
+	execMust(t, e, "SET LOCAL search_path TO pg_catalog")
+	execMust(t, e, "ROLLBACK TO SAVEPOINT sp")
+	if got := showPath(); got != "public" {
+		t.Fatalf("search_path after ROLLBACK TO SAVEPOINT = %q", got)
+	}
+	execMust(t, e, "COMMIT")
 }

@@ -18,8 +18,20 @@ const (
 	CodeCheckViolation       = "23514"
 	CodeSerializationFailure = "40001"
 	CodeSyntaxError          = "42601"
+	CodeUndefinedTable       = "42P01"
 	CodeInternalError        = "XX000"
 )
+
+// ErrUndefinedTable marks a reference to a relation or type name that does not
+// exist. Protocol layers map it to SQLSTATE 42P01 (undefined_table) instead of a
+// generic internal error, which is what a regclass lookup typo must report.
+var ErrUndefinedTable = errors.New("undefined table")
+
+// UndefinedTable returns an error that wraps ErrUndefinedTable with a
+// client-facing explanation of the name that did not resolve.
+func UndefinedTable(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrUndefinedTable, fmt.Sprintf(format, args...))
+}
 
 // ErrFeatureNotSupported marks SQL that PizzaSQL intentionally rejects instead
 // of accepting with different semantics. Protocol layers map it to SQLSTATE
