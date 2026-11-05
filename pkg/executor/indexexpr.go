@@ -213,6 +213,10 @@ var deterministicFunctions = map[string]bool{
 	"JSON_REPLACE": true, "JSONB_REPLACE": true, "JSON_REMOVE": true, "JSONB_REMOVE": true,
 	"JSON_ARRAY": true, "JSONB_ARRAY": true, "JSON_OBJECT": true, "JSONB_OBJECT": true,
 	"JSON_QUOTE": true, "JSONB_QUOTE": true,
+	// Native JSONB scalar functions.
+	"TO_JSONB": true, "JSONB_TYPEOF": true, "JSONB_ARRAY_LENGTH": true,
+	"JSONB_STRIP_NULLS": true, "JSONB_PRETTY": true, "JSONB_BUILD_OBJECT": true,
+	"JSONB_BUILD_ARRAY": true,
 }
 
 func isDeterministicFunction(name string) bool {

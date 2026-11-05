@@ -126,6 +126,19 @@ type JSON struct {
 	Functions      string  `json:"functions"`
 	ArrowOperators Feature `json:"arrow_operators"`
 	InvalidInput   string  `json:"invalid_input"`
+	JSONB          JSONB   `json:"jsonb"`
+}
+
+// JSONB describes the native jsonb type: canonical text storage, operators,
+// functions, ordering, parameters, and the shapes the engine rejects.
+type JSONB struct {
+	Canonicalization string  `json:"canonicalization"`
+	Ordering         string  `json:"ordering"`
+	Operators        Feature `json:"operators"`
+	Functions        Feature `json:"functions"`
+	SetReturning     Feature `json:"set_returning"`
+	Parameters       Feature `json:"parameters"`
+	Rejected         Feature `json:"rejected"`
 }
 
 type Documentation struct {
@@ -204,23 +217,32 @@ func Current() *Document {
 			Boolean:  true,
 			DateTime: true,
 			JSONText: true,
-			JSONB:    Feature{Supported: false, Status: "type_name_alias", Notes: "JSONB is accepted as a column type name with no native semantics; values are stored as text and reported as TEXT over the wire"},
+			JSONB:    Feature{Supported: true, Status: "native", SQLState: "0A000", Notes: "JSONB is a native column type stored as canonical JSON text: object keys sorted, duplicate keys last-wins, no insignificant whitespace, and numbers normalized to exact decimals (1.50 becomes 1.5, 1e2 becomes 100); the canonical form is idempotent and stable across reloads; malformed jsonb input reports 22P02, equality is canonical-text equality (key order and number spelling do not matter), and JSON/TEXT columns keep their existing text-backed JSON1 behavior; literals, ::jsonb and CAST(x AS JSONB), to_jsonb(any), and text-format jsonb parameters (OID 3802, canonicalized at Bind) produce jsonb; direct projections report OID 3802 while JSON stays TEXT; jsonpath, GIN and expression indexes over jsonb, binary jsonb parameters, and wildcard/slice/unbounded jsonb paths are rejected with 0A000; a jsonb value cannot be an array element type (0A000)"},
 			Arrays:   Feature{Supported: true, Status: "one_dimensional", SQLState: "0A000", Notes: "column types TEXT[], VARCHAR(n)[], INTEGER[], BIGINT[], SMALLINT[], BOOLEAN[], REAL[], DOUBLE PRECISION[], and NUMERIC[] in CREATE TABLE and ALTER TABLE ADD COLUMN; values are PostgreSQL array text ({a,b},NULL) stored canonically, with NULL and the empty array distinct; literals, ARRAY[...], ::type[] and CAST(x AS type[]), 1-based arr[n], array_length(arr, 1), and unnest(array) as the single FROM table function are supported; multidimensional arrays, arrays of other element types, and ANY/ALL over subqueries are rejected with 0A000; malformed array input reports 22P02 and a non-integer subscript or array_length dimension reports 42804; NUMERIC[] and DECIMAL[] elements are validated but stored as their exact text, so digits above 2^53 and trailing zeros survive, and NUMERIC comparisons are exact (1.10 = 1.1, and digits above 2^53 are not rounded); column types survive derived tables, CTEs, and a derived table or CTE joined on the right for subscripts and comparisons (CHECK constraints and generated columns evaluate through the stateless evaluator without a table schema, so array subscripts there keep the element text); UNIQUE indexes and primary keys still use the canonical raw text, so 1.10 and 1.1 are distinct index keys even though they compare equal"},
 			RowID:    Feature{Supported: true, Status: "auto_assigned", Notes: "rowid/oid/_rowid_ are BIGINT over the wire; monotonic when the engine assigns the rowid, stable across UPDATE, not monotonic for client-assigned descending INTEGER PRIMARY KEY values"},
 		},
 
 		Parameters: Parameters{
 			Positional:    true,
-			MaxOID:        "int8/text/bool/bytea/float plus the array OIDs text[]/varchar[]/int4[]/int8[]/int2[]/bool[]/float4[]/float8[]/numeric[]",
+			MaxOID:        "int8/text/bool/bytea/float plus OID 3802 jsonb and the array OIDs text[]/varchar[]/int4[]/int8[]/int2[]/bool[]/float4[]/float8[]/numeric[]",
 			Arrays:        Feature{Supported: true, Status: "text_format", SQLState: "0A000", Notes: "a text-format array parameter is bound as a typed array literal, so id = ANY($1) works with OIDs 1009 text[], 1015 varchar[], 1007 int4[], 1016 int8[], 1005 int2[], 1000 bool[], 1021 float4[], 1022 float8[], and 1231 numeric[]; elements are validated and canonicalized; binary-format array parameters are rejected with 0A000 instead of being misread"},
 			BinaryNumeric: true,
 		},
 
 		JSON: JSON{
-			Storage:        "TEXT (JSON and JSONB type names are accepted without native semantics; insert JSON as text)",
+			Storage:        "JSON is TEXT with the JSON1 surface; JSONB is a native type stored as canonical JSON text (see types.jsonb)",
 			Functions:      "json, json_extract, json_set, json_insert, json_replace, json_remove, json_valid, json_type, json_array, json_array_length, json_object, json_quote, json_group_array; PostgreSQL text compatibility: concat_ws, string_agg, pg_backend_pid",
-			ArrowOperators: Feature{Supported: true, Status: "supported", Notes: "-> returns JSON text for a member or element, ->> returns the SQL value (text, number, 1/0 for booleans, NULL for JSON null); right operand is a label, an array index, or a $ path; missing paths and NULL operands return NULL; chaining is left-to-right"},
-			InvalidInput:   "json_extract/json_set and ->/->> throw 'malformed JSON'; json_valid returns 0",
+			ArrowOperators: Feature{Supported: true, Status: "supported", Notes: "on TEXT/JSON, -> returns JSON text for a member or element and ->> returns the SQL value (text, number, 1/0 for booleans, NULL for JSON null); right operand is a label, an array index, or a $ path; missing paths and NULL operands return NULL; chaining is left-to-right; on jsonb, ->> returns PostgreSQL text rendering (true/false, exact decimal numbers) and a JSON null member is SQL NULL"},
+			InvalidInput:   "json_extract/json_set and ->/->> on text throw 'malformed JSON'; json_valid returns 0; jsonb input and casts report 22P02",
+			JSONB: JSONB{
+				Canonicalization: "canonical JSON text: object keys sorted byte-wise, duplicate object keys last-wins, no insignificant whitespace, numbers exact normalized decimals (1.50 becomes 1.5, 1e2 becomes 100; no exponent, no trailing fractional zeros, negative zero becomes 0); canonicalization is idempotent and every write path stores the canonical bytes, so a reload reads back the same text",
+				Ordering:         "jsonb equality is canonical-text equality, so key order and number spelling are irrelevant; DISTINCT and GROUP BY use the canonical stored value; ORDER BY follows the engine's existing value comparison on canonical text: when both values parse as numbers they compare numerically, and every other pair compares byte-wise",
+				Operators:        Feature{Supported: true, Status: "supported", SQLState: "42804", Notes: "-> and ->> extract a member/element ($ path also accepted); #> and #>> extract by a text[] path (or a $ path); @> and <@ test containment with PostgreSQL's object/array/scalar rules; ? tests an object key or top-level string array element; ?| and ?& test a text[] of keys; || merges objects, concatenates arrays, and wraps non-arrays as single-element arrays; - deletes an object key, array index, or text[] of keys/elements; #- deletes a path; NULL operands return NULL, missing keys return SQL NULL (a JSON null member is a jsonb 'null' for -> and SQL NULL for ->>), and @> sees a JSON null member as a value; a text-only @> or <@ is rejected with 42804; the HTTP /query API substitutes ? textually, so a statement using the ? operator cannot also use ? positional parameters there"},
+				Functions:        Feature{Supported: true, Status: "supported", SQLState: "22023", Notes: "jsonb_typeof, jsonb_array_length, jsonb_strip_nulls, jsonb_pretty, jsonb_build_object, jsonb_build_array, to_jsonb, jsonb_set, jsonb_insert; the JSON1 jsonb_* aliases (jsonb_set, jsonb_insert, jsonb_replace, jsonb_remove with $ paths) keep their previous behavior and return canonical jsonb; wrong document kinds report 22023 and malformed input 22P02; the JSON (text) and JSON1 function surface is unchanged"},
+				SetReturning:     Feature{Supported: true, Status: "single_from_item", SQLState: "0A000", Notes: "jsonb_each, jsonb_each_text, jsonb_array_elements, jsonb_array_elements_text, and jsonb_object_keys are supported only as the single FROM item (no joins); calling one in a projection is rejected with 0A000; a NULL document produces no rows"},
+				Parameters:       Feature{Supported: true, Status: "text_format", SQLState: "0A000", Notes: "text-format OID 3802 parameters are canonicalized at Bind, so an invalid document fails with 22P02 before execution and operators see a real jsonb value; binary-format jsonb parameters are rejected with 0A000; OID 114 (JSON) behavior is unchanged"},
+				Rejected:         Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "jsonpath (jsonb_path_*), the @? and @@ jsonpath operators, GIN indexes, expression indexes whose result is jsonb, binary jsonb parameters, wildcard/slice/unbounded jsonb paths, and jsonb array element types"},
+			},
 		},
 
 		ErrorCodes: map[string]string{
@@ -230,6 +252,7 @@ func Current() *Document {
 			"23514": "check_violation",
 			"40001": "serialization_failure",
 			"0A000": "feature_not_supported",
+			"22023": "invalid_parameter_value",
 			"42501": "insufficient_privilege (managed proxy)",
 			"42601": "syntax_error",
 			"25P02": "in_failed_sql_transaction",

@@ -543,6 +543,13 @@ func sqlStateHTTPError(err error) *HTTPError {
 			Message: message,
 		}
 	}
+	if errors.Is(err, pgerror.ErrInvalidParameter) {
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    pgerror.CodeInvalidParameter,
+			Message: message,
+		}
+	}
 	var analysisErr *analyzer.AnalysisError
 	if errors.Is(err, pgerror.ErrDatatypeMismatch) || (errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch) {
 		return &HTTPError{

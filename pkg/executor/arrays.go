@@ -634,6 +634,19 @@ func (e *Executor) arrayEqualityType(leftExpr, rightExpr parser.Expr) (string, b
 // NUMERIC-typed operand compares exactly (including element-wise numeric array
 // equality); everything else keeps the engine's existing comparison rules.
 func (e *Executor) compareExprValues(op lexer.TokenType, leftExpr, rightExpr parser.Expr, left, right interface{}) (bool, error) {
+	if e.isJSONBExpr(leftExpr) || e.isJSONBExpr(rightExpr) {
+		// jsonb equality and ordering are defined on the canonical form, so a
+		// document with a different key order or number spelling compares equal.
+		leftText, err := CanonicalizeJSONB(toString(left))
+		if err != nil {
+			return false, err
+		}
+		rightText, err := CanonicalizeJSONB(toString(right))
+		if err != nil {
+			return false, err
+		}
+		return comparisonOperatorResult(op, compare(leftText, rightText))
+	}
 	if op == lexer.TokenEq || op == lexer.TokenNeq {
 		if typeName, ok := e.arrayEqualityType(leftExpr, rightExpr); ok {
 			equal, err := numericArrayTextEqual(toString(left), toString(right), typeName)

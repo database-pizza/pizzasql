@@ -320,9 +320,9 @@ pgcli postgresql://localhost:5432/pizzasql
 1. **SQL Dialect**: PizzaSQL uses **SQLite syntax**, not PostgreSQL syntax
    - Use `INTEGER PRIMARY KEY AUTOINCREMENT`, not `SERIAL`
    - Use `TEXT`, not `VARCHAR` with enforced length
-2. **Parameter placeholders**: use `$1, $2...` (PostgreSQL style) or `?` (SQLite style). PG Bind rewrites `$n` only outside quoted regions and line/block comments. Initialization probes such as `SELECT version()` and `SHOW server_version` match complete token sequences, never substrings inside SQL literals or unrelated projections.
+2. **Parameter placeholders**: use `$1, $2...` (PostgreSQL style) or `?` (SQLite style). PG Bind rewrites `$n` only outside quoted regions and line/block comments. The HTTP `/query` API substitutes `?` textually, so a statement that uses the jsonb `?` key-existence operator cannot also use `?` positional parameters; use the PostgreSQL protocol or `$n`-free SQL there. Initialization probes such as `SELECT version()` and `SHOW server_version` match complete token sequences, never substrings inside SQL literals or unrelated projections.
 3. **Extended protocol scope**: Parse accepts one command; Bind requests must use text parameters/all-text results. `Describe` returns `ParameterDescription` then `NoData` without executing anything; `Execute` still sends the real `RowDescription`. Binary results and nonzero Execute row limits fail with SQLSTATE `0A000` before side effects. Portals are one-shot, not resumable. Unsupported binary parameter OIDs also report `0A000`.
-4. **No PostgreSQL-specific features**: no schemas, roles, `ARRAY`, `JSONB`, etc.
+4. **PostgreSQL compatibility limits**: no schemas or roles. Arrays are one-dimensional and JSONB is a native canonical-text type; see `GET /capabilities` for the exact surface.
 
 ---
 

@@ -11,6 +11,7 @@ import (
 const (
 	CodeFeatureNotSupported  = "0A000"
 	CodeInvalidText          = "22P02"
+	CodeInvalidParameter     = "22023"
 	CodeDatatypeMismatch     = "42804"
 	CodeUniqueViolation      = "23505"
 	CodeForeignKeyViolation  = "23503"
@@ -40,6 +41,18 @@ var ErrInvalidText = errors.New("invalid text representation")
 // explanation of the rejected input.
 func InvalidText(format string, args ...interface{}) error {
 	return fmt.Errorf("%w: %s", ErrInvalidText, fmt.Sprintf(format, args...))
+}
+
+// ErrInvalidParameter marks a well-formed value that is not valid for the
+// operation it is used in, such as jsonb_array_length() on a non-array or a
+// jsonb path element that is NULL. Protocol layers map it to SQLSTATE 22023
+// (invalid_parameter_value).
+var ErrInvalidParameter = errors.New("invalid parameter value")
+
+// InvalidParameter returns an error that wraps ErrInvalidParameter with a
+// client-facing explanation of the rejected value.
+func InvalidParameter(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrInvalidParameter, fmt.Sprintf(format, args...))
 }
 
 // ErrDatatypeMismatch marks a value whose type is wrong for the operation it is

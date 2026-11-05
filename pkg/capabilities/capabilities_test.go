@@ -221,3 +221,80 @@ func TestArraysAreAdvertised(t *testing.T) {
 		t.Fatalf("parameters.max_oid = %q, want the array OIDs listed", doc.Parameters.MaxOID)
 	}
 }
+
+// JSONB is advertised as a native type with precise canonicalization, operator,
+// function, ordering, parameter, and rejection claims.
+func TestJSONBIsAdvertised(t *testing.T) {
+	doc := Current()
+	types := doc.Types.JSONB
+	if !types.Supported {
+		t.Fatalf("types.jsonb = %+v, want supported", types)
+	}
+	if types.Status != "native" {
+		t.Fatalf("types.jsonb status = %q, want native", types.Status)
+	}
+	for _, want := range []string{"canonical", "sorted", "last-wins", "idempotent", "OID 3802", "22P02", "0A000", "jsonpath", "GIN"} {
+		if !strings.Contains(types.Notes, want) {
+			t.Errorf("types.jsonb notes do not mention %q", want)
+		}
+	}
+	if !doc.Types.JSONText {
+		t.Fatal("JSON (text) remains supported and must stay advertised")
+	}
+
+	jsonb := doc.JSON.JSONB
+	for _, want := range []string{"sorted", "last-wins", "1.50", "idempotent"} {
+		if !strings.Contains(jsonb.Canonicalization, want) {
+			t.Errorf("json.jsonb.canonicalization does not mention %q", want)
+		}
+	}
+	for _, want := range []string{"canonical-text equality", "DISTINCT", "ORDER BY", "numeric"} {
+		if !strings.Contains(jsonb.Ordering, want) {
+			t.Errorf("json.jsonb.ordering does not mention %q", want)
+		}
+	}
+	if !jsonb.Operators.Supported || jsonb.Operators.SQLState != pgerror.CodeDatatypeMismatch {
+		t.Fatalf("json.jsonb.operators = %+v", jsonb.Operators)
+	}
+	for _, want := range []string{"@>", "<@", "?|", "?&", "#>", "#>>", "#-", "||", "SQL NULL"} {
+		if !strings.Contains(jsonb.Operators.Notes, want) {
+			t.Errorf("json.jsonb.operators notes do not mention %q", want)
+		}
+	}
+	if !jsonb.Functions.Supported || jsonb.Functions.SQLState != pgerror.CodeInvalidParameter {
+		t.Fatalf("json.jsonb.functions = %+v", jsonb.Functions)
+	}
+	for _, want := range []string{"jsonb_typeof", "jsonb_array_length", "jsonb_strip_nulls", "jsonb_pretty", "jsonb_set", "jsonb_insert", "jsonb_build_object", "jsonb_build_array", "to_jsonb"} {
+		if !strings.Contains(jsonb.Functions.Notes, want) {
+			t.Errorf("json.jsonb.functions notes do not mention %q", want)
+		}
+	}
+	if !jsonb.SetReturning.Supported || jsonb.SetReturning.Status != "single_from_item" {
+		t.Fatalf("json.jsonb.set_returning = %+v", jsonb.SetReturning)
+	}
+	for _, want := range []string{"jsonb_each", "jsonb_array_elements", "jsonb_object_keys", "0A000"} {
+		if !strings.Contains(jsonb.SetReturning.Notes, want) {
+			t.Errorf("json.jsonb.set_returning notes do not mention %q", want)
+		}
+	}
+	if !jsonb.Parameters.Supported || jsonb.Parameters.Status != "text_format" {
+		t.Fatalf("json.jsonb.parameters = %+v", jsonb.Parameters)
+	}
+	if !strings.Contains(jsonb.Parameters.Notes, "3802") || !strings.Contains(jsonb.Parameters.Notes, "0A000") {
+		t.Fatalf("json.jsonb.parameters notes = %q", jsonb.Parameters.Notes)
+	}
+	if jsonb.Rejected.Supported || jsonb.Rejected.SQLState != pgerror.CodeFeatureNotSupported {
+		t.Fatalf("json.jsonb.rejected = %+v", jsonb.Rejected)
+	}
+	for _, want := range []string{"jsonpath", "GIN", "expression indexes", "binary", "wildcard"} {
+		if !strings.Contains(jsonb.Rejected.Notes, want) {
+			t.Errorf("json.jsonb.rejected notes do not mention %q", want)
+		}
+	}
+	if !strings.Contains(doc.Parameters.MaxOID, "3802") {
+		t.Fatalf("parameters.max_oid = %q, want OID 3802 listed", doc.Parameters.MaxOID)
+	}
+	if got := doc.ErrorCodes[pgerror.CodeInvalidParameter]; got != "invalid_parameter_value" {
+		t.Fatalf("22023 mapping = %q, want invalid_parameter_value", got)
+	}
+}

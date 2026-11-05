@@ -544,7 +544,7 @@ func (p *Parser) parseTableRefs() ([]TableRef, error) {
 			continue
 		}
 		if len(tables) > 1 || table.Join != nil {
-			return nil, pgerror.Unsupported("unnest(array) in FROM must be the only table reference; joins around a table function are not supported")
+			return nil, pgerror.Unsupported("a table function in FROM must be the only table reference; joins around a table function are not supported")
 		}
 	}
 
@@ -617,11 +617,12 @@ func (p *Parser) parseTableRef(allowFunction bool) (*TableRef, error) {
 	ref.Name = p.curToken.Literal
 	p.nextToken()
 
-	// Table function: FROM unnest(array). Only unnest is recognized; other
-	// function names in FROM are reported as an unknown table.
+	// Table function in FROM. unnest(array) and the jsonb set-returning
+	// functions are the only recognized forms; other function names in FROM are
+	// reported as an unsupported table function.
 	if allowFunction && p.curTokenIs(lexer.TokenLParen) {
-		if !strings.EqualFold(ref.Name, "unnest") {
-			return nil, pgerror.Unsupported("table function %s() is not supported; only unnest(array) is available in FROM", ref.Name)
+		if !isTableFunctionName(ref.Name) {
+			return nil, pgerror.Unsupported("table function %s() is not supported; FROM accepts unnest(array), jsonb_each(jsonb), jsonb_each_text(jsonb), jsonb_array_elements(jsonb), jsonb_array_elements_text(jsonb), and jsonb_object_keys(jsonb)", ref.Name)
 		}
 		call, err := p.parseFunctionCall(ref.Name)
 		if err != nil {
@@ -1422,6 +1423,18 @@ func (p *Parser) parseDataType() (*DataType, error) {
 	return dt, nil
 }
 
+// isTableFunctionName reports whether name is a set-returning function the
+// executor can materialize as the single FROM item.
+func isTableFunctionName(name string) bool {
+	switch strings.ToLower(name) {
+	case "unnest", "jsonb_each", "jsonb_each_text", "jsonb_array_elements",
+		"jsonb_array_elements_text", "jsonb_object_keys":
+		return true
+	default:
+		return false
+	}
+}
+
 // isSupportedArrayElementType reports whether an element type name can be
 // encoded as an array element. The list mirrors the element types the executor
 // canonicalizes and the pgserver advertises array OIDs for.
@@ -1848,6 +1861,22 @@ func (p *Parser) parseCreateIndex(unique bool) (*CreateIndexStmt, error) {
 	}
 	stmt.Table = p.curToken.Literal
 	p.nextToken()
+
+	// PostgreSQL index methods. The engine only implements an ordered btree
+	// index, so a request for GIN (the jsonb index method) or any other method is
+	// rejected instead of silently creating a btree index with different
+	// performance and constraint behavior.
+	if p.curTokenIs(lexer.TokenUSING) {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenIdent) {
+			return nil, p.curError("expected index method after USING")
+		}
+		method := strings.ToUpper(p.curToken.Literal)
+		p.nextToken()
+		if method != "BTREE" {
+			return nil, pgerror.Unsupported("index method %s is not supported; only BTREE indexes are implemented", method)
+		}
+	}
 
 	// Expect (
 	if !p.curTokenIs(lexer.TokenLParen) {
@@ -2587,6 +2616,21 @@ func (p *Parser) parseComparisonExpr() (Expr, error) {
 		return nil, p.curError("expected IN, BETWEEN, or LIKE after NOT")
 	}
 
+	// JSONB containment and existence operators share the comparison layer:
+	// they bind looser than + and || and tighter than NOT/AND/OR.
+	if isJSONBPredicateOp(p.curToken.Type) {
+		op := p.curToken.Type
+		p.nextToken()
+		right, err := p.parseBitwiseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &BinaryExpr{Left: left, Op: op, Right: right}, nil
+	}
+	if p.curTokenIs(lexer.TokenAtQuestion) || p.curTokenIs(lexer.TokenAtAt) {
+		return nil, pgerror.Unsupported("jsonpath operators @? and @@ are not supported")
+	}
+
 	// Handle comparison operators, including the quantified forms
 	// `expr op ANY(array)` and `expr op ALL(array)`.
 	if isComparisonOp(p.curToken.Type) {
@@ -2685,6 +2729,17 @@ func isComparisonOp(t lexer.TokenType) bool {
 	switch t {
 	case lexer.TokenEq, lexer.TokenNeq, lexer.TokenLt,
 		lexer.TokenLte, lexer.TokenGt, lexer.TokenGte:
+		return true
+	}
+	return false
+}
+
+// isJSONBPredicateOp reports whether t is a jsonb containment or key-existence
+// operator. They parse at comparison precedence as a single binary predicate.
+func isJSONBPredicateOp(t lexer.TokenType) bool {
+	switch t {
+	case lexer.TokenAtArrow, lexer.TokenLtAt,
+		lexer.TokenQuestion, lexer.TokenQuestionPipe, lexer.TokenQuestionAmp:
 		return true
 	}
 	return false
@@ -2823,7 +2878,8 @@ func (p *Parser) parseMulExpr() (Expr, error) {
 	return left, nil
 }
 
-// parseJSONExpr parses the JSON extraction operators -> and ->>.
+// parseJSONExpr parses the JSON extraction and path operators ->, ->>, #>,
+// #>>, and #-.
 //
 // Precedence: they bind tighter than multiplicative, additive/concatenation,
 // bitwise, and comparison operators, and looser than unary -, +, and ~. So
@@ -2836,17 +2892,21 @@ func (p *Parser) parseJSONExpr() (Expr, error) {
 		return nil, err
 	}
 
-	for p.curTokenIs(lexer.TokenArrow) || p.curTokenIs(lexer.TokenArrowText) {
-		op := p.curToken.Type
-		p.nextToken()
-		right, err := p.parseUnaryExpr()
-		if err != nil {
-			return nil, err
+	for {
+		switch p.curToken.Type {
+		case lexer.TokenArrow, lexer.TokenArrowText,
+			lexer.TokenHashArrow, lexer.TokenHashArrowText, lexer.TokenHashMinus:
+			op := p.curToken.Type
+			p.nextToken()
+			right, err := p.parseUnaryExpr()
+			if err != nil {
+				return nil, err
+			}
+			left = &BinaryExpr{Left: left, Op: op, Right: right}
+		default:
+			return left, nil
 		}
-		left = &BinaryExpr{Left: left, Op: op, Right: right}
 	}
-
-	return left, nil
 }
 
 func (p *Parser) parseUnaryExpr() (Expr, error) {
@@ -3017,10 +3077,11 @@ func (p *Parser) parseIdentOrFunction() (Expr, error) {
 		return p.parseFunctionCall(name)
 	}
 
-	// Check for table.column
+	// Check for table.column. KEY is a lexer keyword but SQLite also permits it
+	// as a column name, and jsonb_each's first output column is named key.
 	if p.curTokenIs(lexer.TokenDot) {
 		p.nextToken()
-		if !p.curTokenIs(lexer.TokenIdent) && !p.curTokenIs(lexer.TokenStar) {
+		if !p.curTokenIs(lexer.TokenIdent) && !p.curTokenIs(lexer.TokenStar) && !p.curTokenIs(lexer.TokenKEY) {
 			return nil, p.curError("expected column name after dot")
 		}
 		col := p.curToken.Literal
