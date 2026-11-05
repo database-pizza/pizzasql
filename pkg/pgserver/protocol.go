@@ -90,6 +90,7 @@ const (
 	ErrCodeUndefinedColumn      = "42703"
 	ErrCodeDuplicateTable       = "42P07"
 	ErrCodeDuplicateColumn      = "42701"
+	ErrCodeDuplicateCursor      = "42P03"
 	ErrCodeInvalidParameter     = "22023"
 	ErrCodeInvalidText          = "22P02"
 	ErrCodeDatatypeMismatch     = "42804"

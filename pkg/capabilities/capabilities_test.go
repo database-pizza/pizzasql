@@ -340,7 +340,7 @@ func TestBoundedExecuteIsAdvertised(t *testing.T) {
 	for _, claim := range []string{
 		"PortalSuspended", "maxRows = 0", "materialized once", "no scroll",
 		"WITH HOLD", "RowDescription is sent by the first Execute only",
-		"Close('P')", "34000", "25P02", "08P01", "RETURNING",
+		"Close('P')", "ROLLBACK TO SAVEPOINT", "42P03", "34000", "25P02", "08P01", "RETURNING",
 	} {
 		if !strings.Contains(bounded.Notes, claim) {
 			t.Errorf("bounded_execute notes do not mention %q", claim)

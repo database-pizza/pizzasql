@@ -17,9 +17,11 @@ func guardConnection(t *testing.T) (*Connection, *countingConn) {
 	return c, conn
 }
 
+// guardBind targets a portal the cases do not pre-create, so a malformed Bind
+// fails on its own validation rather than with 42P03.
 func guardBind(parameterFormats, resultFormats []int16) []byte {
 	b := NewMessageBuilder()
-	b.WriteString("p")
+	b.WriteString("new_portal")
 	b.WriteString("q")
 	b.WriteInt16(int16(len(parameterFormats)))
 	for _, format := range parameterFormats {

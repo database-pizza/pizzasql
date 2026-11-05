@@ -96,10 +96,10 @@ type portalExecution struct {
 	formats     []int16
 	// commandTag is the completion tag sent when the rows are exhausted.
 	commandTag string
-	// endsTransaction reports that this statement ended the explicit
-	// transaction, so every portal is destroyed with it.
-	endsTransaction bool
-	rowOffset       int
+	// clearsPortals reports that this statement invalidated every open portal
+	// (COMMIT, ROLLBACK, or ROLLBACK TO SAVEPOINT); see resetsPortals.
+	clearsPortals bool
+	rowOffset     int
 	// described is true once the RowDescription was sent, so a resumed Execute
 	// sends only DataRows.
 	described bool
@@ -539,6 +539,13 @@ func (c *Connection) handleQuery(msg *Message) error {
 				return err
 			}
 		}
+		if resetsPortals(stmt) {
+			// Same rule as the extended path: a transaction end or a savepoint
+			// rollback invalidates every open portal. sendReadyForQuery covers
+			// the idle case; ROLLBACK TO SAVEPOINT keeps the block open and
+			// needs this explicit clear.
+			c.clearPortals()
+		}
 	}
 
 	return c.sendReadyForQuery()
@@ -592,6 +599,14 @@ func (c *Connection) handleBind(msg *Message) error {
 	statement, ok := c.statements[statementName]
 	if !ok {
 		return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("prepared statement %q does not exist", statementName))
+	}
+	// Named portals cannot be replaced: PostgreSQL reports 42P03 and leaves the
+	// existing portal in place. Only the unnamed portal is re-bound freely,
+	// because the new Bind replaces it.
+	if portalName != "" {
+		if _, exists := c.portals[portalName]; exists {
+			return c.failExtended(ErrCodeDuplicateCursor, fmt.Errorf("portal %q already exists", portalName))
+		}
 	}
 	formats, pos, err := readInt16List(msg.Data, pos)
 	if err != nil || pos+2 > len(msg.Data) {
@@ -719,8 +734,7 @@ func (c *Connection) handleExecute(msg *Message) error {
 	if err := c.sendPortalRows(portal, maxRows); err != nil {
 		return err
 	}
-	if portal.execution.endsTransaction {
-		// PostgreSQL destroys the portals of the transaction that just ended.
+	if portal.execution.clearsPortals {
 		c.clearPortals()
 	}
 	return nil
@@ -769,12 +783,7 @@ func (c *Connection) materializePortal(portal *portal) *executeError {
 		// getCommandTag applies the statement's transaction transition, so it
 		// belongs here: a repeated Execute must not replay BEGIN/COMMIT/ROLLBACK.
 		execution.commandTag = c.getCommandTag(stmt, result)
-		switch s := stmt.(type) {
-		case *parser.CommitStmt:
-			execution.endsTransaction = true
-		case *parser.RollbackStmt:
-			execution.endsTransaction = s.Savepoint == ""
-		}
+		execution.clearsPortals = resetsPortals(stmt)
 	}
 	columnTypes := wireColumnTypes(execution.result)
 	formats, formatErr := c.resolveResultFormats(portal.resultFormats, columnTypes, len(execution.result.Columns))
@@ -1151,6 +1160,21 @@ func (c *Connection) handleClose(msg *Message) error {
 // affected, so a client re-binds after the transaction ends.
 func (c *Connection) clearPortals() {
 	clear(c.portals)
+}
+
+// resetsPortals reports whether stmt invalidates every open portal. COMMIT and
+// ROLLBACK end the transaction, and ROLLBACK TO SAVEPOINT undoes writes a
+// suspended portal may already have materialized: resuming it would stream rows
+// and a completion tag from a removed state. Clearing every portal on ROLLBACK
+// TO SAVEPOINT is stricter than PostgreSQL, which keeps portals created before
+// the savepoint; the coarse rule is what keeps a failed or rewound statement
+// from leaking into a resumed stream.
+func resetsPortals(stmt parser.Statement) bool {
+	switch stmt.(type) {
+	case *parser.CommitStmt, *parser.RollbackStmt:
+		return true
+	}
+	return false
 }
 
 func (c *Connection) failExtended(code string, err error) error {

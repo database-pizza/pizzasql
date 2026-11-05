@@ -327,8 +327,8 @@ func TestBinaryResultsMixedPerColumnFormats(t *testing.T) {
 }
 
 // Formats belong to the portal, not the statement: two portals over one
-// prepared statement can use different formats, and re-binding a portal
-// replaces its list.
+// prepared statement can use different formats, and re-binding a closed portal
+// starts from the new list.
 func TestBinaryResultsArePerPortal(t *testing.T) {
 	c, conn := extendedResultConnection(t)
 	prepareBinaryResultTable(t, c)
@@ -339,6 +339,7 @@ func TestBinaryResultsArePerPortal(t *testing.T) {
 		bindResultMessage("binary_portal", "s", nil, []int16{1}),
 		executeMessage("text_portal"),
 		executeMessage("binary_portal"),
+		&Message{Type: MsgClose, Data: append([]byte("Ptext_portal"), 0)},
 		bindResultMessage("text_portal", "s", nil, []int16{0}),
 		executeMessage("text_portal"),
 		&Message{Type: MsgSync},

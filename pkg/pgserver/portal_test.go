@@ -241,20 +241,49 @@ func TestCloseEndsSuspendedPortal(t *testing.T) {
 	}
 }
 
-// Re-binding a portal name replaces the materialized result, the row cursor,
-// and the row metadata: the stream starts over.
-func TestRebindRestartsPortal(t *testing.T) {
+// The unnamed portal is replaced by every Bind, which restarts its materialized
+// result, row cursor, and row metadata.
+func TestUnnamedRebindRestartsPortal(t *testing.T) {
 	s := newPortalSession(t)
 	createNumberedTable(t, s, 5)
-	s.send(parseMessage("stmt", portalSelectSQL), bindResultMessage("p", "stmt", nil, nil))
-	assertFrameTypes(t, s.send(executeRowsMessage("p", 2)), "TDDs")
+	s.send(parseMessage("stmt", portalSelectSQL), bindResultMessage("", "stmt", nil, nil))
+	assertFrameTypes(t, s.send(executeRowsMessage("", 2)), "TDDs")
 
-	frames := s.send(
-		bindResultMessage("p", "stmt", nil, nil),
-		executeRowsMessage("p", 0),
-	)
+	frames := s.send(bindResultMessage("", "stmt", nil, nil), executeRowsMessage("", 0))
 	assertFrameTypes(t, frames, "2TDDDDDC")
 	assertRowIDs(t, frames, "1", "2", "3", "4", "5")
+}
+
+// A named portal cannot be replaced by another Bind: PostgreSQL reports 42P03,
+// and the rejected Bind fails the cycle, so an explicit transaction is aborted
+// and the portal goes with the ROLLBACK.
+func TestNamedRebindIsRejected(t *testing.T) {
+	s := newPortalSession(t)
+	createNumberedTable(t, s, 3)
+	if status := readyStatus(t, s.send(queryMessageData("BEGIN"))); status != TxStatusInBlock {
+		t.Fatalf("BEGIN status = %c, want %c", status, TxStatusInBlock)
+	}
+	s.send(parseMessage("stmt", portalSelectSQL), bindResultMessage("p", "stmt", nil, nil))
+	assertFrameTypes(t, s.send(executeRowsMessage("p", 1)), "TDs")
+
+	frames := s.send(bindResultMessage("p", "stmt", nil, nil))
+	assertFrameTypes(t, frames, "E")
+	if code := errorCode(findError(frames)); code != ErrCodeDuplicateCursor {
+		t.Fatalf("SQLSTATE = %q, want %q", code, ErrCodeDuplicateCursor)
+	}
+	if status := readyStatus(t, s.send(syncMessage())); status != TxStatusFailed {
+		t.Fatalf("status after rejected re-Bind = %c, want %c", status, TxStatusFailed)
+	}
+
+	if status := readyStatus(t, s.send(queryMessageData("ROLLBACK"))); status != TxStatusIdle {
+		t.Fatalf("ROLLBACK status = %c, want %c", status, TxStatusIdle)
+	}
+	frames = s.send(executeRowsMessage("p", 1))
+	assertFrameTypes(t, frames, "E")
+	if code := errorCode(findError(frames)); code != ErrCodeUndefinedCursor {
+		t.Fatalf("SQLSTATE after ROLLBACK = %q, want %q", code, ErrCodeUndefinedCursor)
+	}
+	s.send(syncMessage())
 }
 
 // Inside an explicit transaction a portal survives Sync and keeps resuming;
@@ -449,4 +478,129 @@ func TestFailedExecuteLeavesTransactionConsistent(t *testing.T) {
 		t.Fatalf("SQLSTATE after ROLLBACK = %q, want %q", code, ErrCodeUndefinedCursor)
 	}
 	s.send(syncMessage())
+}
+
+// A ROLLBACK TO SAVEPOINT can undo writes a suspended portal already
+// materialized, so it drops every portal. Resuming one would stream rows and a
+// completion tag from a removed state; the client gets 34000 instead. Clearing
+// on ROLLBACK TO SAVEPOINT is stricter than PostgreSQL, which keeps portals
+// created before the savepoint.
+func TestRollbackToSavepointClearsSuspendedPortals(t *testing.T) {
+	s := newPortalSession(t)
+	s.setup("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	if status := readyStatus(t, s.send(queryMessageData("BEGIN"))); status != TxStatusInBlock {
+		t.Fatalf("BEGIN status = %c, want %c", status, TxStatusInBlock)
+	}
+	if status := readyStatus(t, s.send(queryMessageData("SAVEPOINT s"))); status != TxStatusInBlock {
+		t.Fatalf("SAVEPOINT status = %c, want %c", status, TxStatusInBlock)
+	}
+	s.send(
+		parseMessage("stmt", "INSERT INTO t (id) VALUES (1), (2) RETURNING id"),
+		bindResultMessage("p", "stmt", nil, nil),
+	)
+	frames := s.send(executeRowsMessage("p", 1))
+	assertFrameTypes(t, frames, "TDs")
+	assertRowIDs(t, frames, "1")
+
+	if status := readyStatus(t, s.send(queryMessageData("ROLLBACK TO SAVEPOINT s"))); status != TxStatusInBlock {
+		t.Fatalf("ROLLBACK TO SAVEPOINT status = %c, want %c", status, TxStatusInBlock)
+	}
+
+	frames = s.send(executeRowsMessage("p", 1))
+	assertFrameTypes(t, frames, "E")
+	if code := errorCode(findError(frames)); code != ErrCodeUndefinedCursor {
+		t.Fatalf("SQLSTATE = %q, want %q", code, ErrCodeUndefinedCursor)
+	}
+	s.send(syncMessage())
+
+	if rows := s.countRows("t"); rows != 0 {
+		t.Fatalf("table has %d rows after ROLLBACK TO SAVEPOINT, want 0", rows)
+	}
+	if status := readyStatus(t, s.send(queryMessageData("ROLLBACK"))); status != TxStatusIdle {
+		t.Fatalf("ROLLBACK status = %c, want %c", status, TxStatusIdle)
+	}
+}
+
+// Transaction commands executed through a portal emit their tag once and drop
+// every open portal, so a suspended sibling can never replay rows or a
+// completion tag from a transaction that ended or was rewound.
+func TestTransactionCommandPortalClearsSiblings(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		command    string
+		wantTag    string
+		wantStatus byte
+	}{
+		{name: "commit", command: "COMMIT", wantTag: "COMMIT", wantStatus: TxStatusIdle},
+		{name: "rollback", command: "ROLLBACK", wantTag: "ROLLBACK", wantStatus: TxStatusIdle},
+		{name: "rollback_to_savepoint", command: "ROLLBACK TO SAVEPOINT s", wantTag: "ROLLBACK", wantStatus: TxStatusInBlock},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newPortalSession(t)
+			createNumberedTable(t, s, 3)
+			if status := readyStatus(t, s.send(queryMessageData("BEGIN"))); status != TxStatusInBlock {
+				t.Fatalf("BEGIN status = %c, want %c", status, TxStatusInBlock)
+			}
+			if status := readyStatus(t, s.send(queryMessageData("SAVEPOINT s"))); status != TxStatusInBlock {
+				t.Fatalf("SAVEPOINT status = %c, want %c", status, TxStatusInBlock)
+			}
+			s.send(parseMessage("stmt", portalSelectSQL), bindResultMessage("first", "stmt", nil, nil))
+			assertFrameTypes(t, s.send(executeRowsMessage("first", 1)), "TDs")
+			s.send(bindResultMessage("second", "stmt", nil, nil))
+			assertFrameTypes(t, s.send(executeRowsMessage("second", 1)), "TDs")
+
+			s.send(parseMessage("txn", tc.command), bindResultMessage("txn_portal", "txn", nil, nil))
+			frames := s.send(executeRowsMessage("txn_portal", 0))
+			assertFrameTypes(t, frames, "C")
+			if tag := commandTagOf(frames[0]); tag != tc.wantTag {
+				t.Fatalf("tag = %q, want %q", tag, tc.wantTag)
+			}
+			if status := readyStatus(t, s.send(syncMessage())); status != tc.wantStatus {
+				t.Fatalf("status after %s = %c, want %c", tc.command, status, tc.wantStatus)
+			}
+
+			for _, name := range []string{"first", "second", "txn_portal"} {
+				frames = s.send(executeRowsMessage(name, 1))
+				assertFrameTypes(t, frames, "E")
+				if code := errorCode(findError(frames)); code != ErrCodeUndefinedCursor {
+					t.Fatalf("Execute %q after %s: SQLSTATE = %q, want %q", name, tc.command, code, ErrCodeUndefinedCursor)
+				}
+				s.send(syncMessage())
+			}
+		})
+	}
+}
+
+// BEGIN through a portal starts the block and emits its tag. It does not end a
+// transaction, so sibling portals are kept, and a repeated Execute repeats the
+// stored tag without replaying BEGIN (the engine rejects a second BEGIN, so a
+// replay would surface as an error).
+func TestBeginPortalStartsTransaction(t *testing.T) {
+	s := newPortalSession(t)
+	createNumberedTable(t, s, 3)
+	s.send(parseMessage("begin_stmt", "BEGIN"), bindResultMessage("begin_portal", "begin_stmt", nil, nil))
+	frames := s.send(executeRowsMessage("begin_portal", 0))
+	assertFrameTypes(t, frames, "C")
+	if tag := commandTagOf(frames[0]); tag != "BEGIN" {
+		t.Fatalf("tag = %q, want %q", tag, "BEGIN")
+	}
+	if status := readyStatus(t, s.send(syncMessage())); status != TxStatusInBlock {
+		t.Fatalf("status after BEGIN = %c, want %c", status, TxStatusInBlock)
+	}
+
+	s.send(parseMessage("stmt", portalSelectSQL), bindResultMessage("p", "stmt", nil, nil))
+	assertFrameTypes(t, s.send(executeRowsMessage("p", 1)), "TDs")
+
+	frames = s.send(executeRowsMessage("begin_portal", 0))
+	assertFrameTypes(t, frames, "C")
+	if tag := commandTagOf(frames[0]); tag != "BEGIN" {
+		t.Fatalf("repeated tag = %q, want %q", tag, "BEGIN")
+	}
+
+	frames = s.send(executeRowsMessage("p", 0))
+	assertFrameTypes(t, frames, "DDC")
+	assertRowIDs(t, frames, "2", "3")
+	if status := readyStatus(t, s.send(queryMessageData("ROLLBACK"))); status != TxStatusIdle {
+		t.Fatalf("ROLLBACK status = %c, want %c", status, TxStatusIdle)
+	}
 }
