@@ -80,6 +80,55 @@ func (m *SchemaManager) HasCascadingReference(table string, forDelete bool) (boo
 	return false, nil
 }
 
+// beginCascadingPointWrite decides whether an autocommit point write must be
+// staged so its cascades publish with the parent change, and starts that
+// implicit transaction when it is needed.
+//
+// A table outside the foreign-key graph keeps the point-write fast path and
+// never touches the gate. For a participating table the database-wide
+// foreign-key write gate is taken before the cascade classification and held
+// across Begin and the caller's staging. CREATE TABLE ... REFERENCES takes the
+// same unconditional gate, so a constraint cannot be published between deciding
+// that the write is not cascading and opening the transaction that would have
+// applied its actions. The returned release function must be called before
+// Commit, which acquires the same non-reentrant gate.
+//
+// A table gains its first constraint only together with a new child table,
+// which is created empty under the gate and whose rows take the gate on insert.
+// If the participant probe above goes stale, the non-cascading point path
+// re-reads the catalog under the gate and rejects the write with 23503 instead
+// of ignoring the new constraint.
+//
+// The gate is held while Begin and the caller's staging take the session lock.
+// That order cannot invert with Commit: a Session serves one connection and one
+// statement at a time, so Commit on this Session runs after the staging path
+// releases the gate, while other sessions hold their own lock and contend only
+// on the shared gate.
+func (s *Session) beginCascadingPointWrite(table string, forDelete bool) (bool, func(), error) {
+	participates, err := s.schema.ForeignKeyParticipants(table)
+	if err != nil {
+		return false, nil, err
+	}
+	if !participates {
+		return false, func() {}, nil
+	}
+	unlockFK := s.table.LockForeignKeyWriteGate()
+	cascades, err := s.schema.HasCascadingReference(table, forDelete)
+	if err != nil {
+		unlockFK()
+		return false, nil, err
+	}
+	if !cascades {
+		unlockFK()
+		return false, func() {}, nil
+	}
+	if err := s.Begin(); err != nil {
+		unlockFK()
+		return false, nil, err
+	}
+	return true, unlockFK, nil
+}
+
 // foreignKeyRawValues returns the unformatted values a row holds for the given
 // columns, and reports false when a column is missing. A NULL component is
 // returned as nil: on a parent-side update the cascading action copies the new

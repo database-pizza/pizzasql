@@ -3494,36 +3494,24 @@ func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Sc
 			if newPKErr != nil {
 				return newPKErr
 			}
-			if newPK != plan.oldPK {
-				if _, gerr := e.session.GetByPK(tableName, newPK); gerr == nil {
-					return &storage.PrimaryKeyViolationError{Table: tableName, Key: newPK}
-				} else if gerr != storage.ErrKeyNotFound {
-					return gerr
+			// Apply the whole post-update image through one update so a primary-key
+			// move is a real UPDATE: the session stages the key move (with the
+			// duplicate check) and fires ON UPDATE actions. Implementing the move as
+			// DELETE + INSERT would fire ON DELETE actions instead and drop children.
+			updates := make(storage.Row, len(schema.Columns))
+			for _, col := range schema.Columns {
+				if v, ok := lookupRowValue(plan.row, col.Name); ok {
+					updates[col.Name] = v
 				}
-				if _, deleted, derr := e.session.DeleteByPK(tableName, plan.oldPK); derr != nil {
-					return derr
-				} else if !deleted {
-					continue
-				}
-				if _, ierr := e.session.InsertWithRowID(tableName, plan.row); ierr != nil {
-					return ierr
-				}
-			} else {
-				updates := make(storage.Row, len(schema.Columns))
-				for _, col := range schema.Columns {
-					if v, ok := lookupRowValue(plan.row, col.Name); ok {
-						updates[col.Name] = v
-					}
-				}
-				_, updated, uerr := e.session.UpdateByPK(tableName, newPK, func(storage.Row) (storage.Row, error) {
-					return updates, nil
-				})
-				if uerr != nil {
-					return uerr
-				}
-				if !updated {
-					continue
-				}
+			}
+			_, updated, uerr := e.session.UpdateByPK(tableName, plan.oldPK, func(storage.Row) (storage.Row, error) {
+				return updates, nil
+			})
+			if uerr != nil {
+				return uerr
+			}
+			if !updated {
+				continue
 			}
 			count++
 			if len(stmt.Returning) > 0 {

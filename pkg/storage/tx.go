@@ -786,34 +786,26 @@ func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) 
 	s.mu.Lock()
 	if !s.inTx {
 		s.mu.Unlock()
-		cascades, err := s.schema.HasCascadingReference(table, false)
+		cascading, unlockFK, err := s.beginCascadingPointWrite(table, false)
 		if err != nil {
 			return nil, false, err
 		}
-		if !cascades {
+		if !cascading {
 			return s.table.UpdateByPK(table, pk, updateFn)
 		}
-		return s.updateByPKImplicit(table, pk, updateFn)
+		oldRow, updated, err := s.updateByPKStaged(table, pk, updateFn)
+		unlockFK()
+		if err != nil {
+			_ = s.Rollback()
+			return nil, false, err
+		}
+		if err := s.Commit(); err != nil {
+			return nil, false, err
+		}
+		return oldRow, updated, nil
 	}
 	defer s.mu.Unlock()
 	return s.updateByPKLocked(table, pk, updateFn)
-}
-
-// updateByPKImplicit runs a cascading point update inside an implicit
-// transaction, so a failed cascade leaves no durable parent change behind.
-func (s *Session) updateByPKImplicit(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
-	if err := s.Begin(); err != nil {
-		return nil, false, err
-	}
-	oldRow, updated, err := s.updateByPKStaged(table, pk, updateFn)
-	if err != nil {
-		_ = s.Rollback()
-		return nil, false, err
-	}
-	if err := s.Commit(); err != nil {
-		return nil, false, err
-	}
-	return oldRow, updated, nil
 }
 
 func (s *Session) updateByPKStaged(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
@@ -881,32 +873,26 @@ func (s *Session) DeleteByPK(table, pk string) (Row, bool, error) {
 	s.mu.Lock()
 	if !s.inTx {
 		s.mu.Unlock()
-		cascades, err := s.schema.HasCascadingReference(table, true)
+		cascading, unlockFK, err := s.beginCascadingPointWrite(table, true)
 		if err != nil {
 			return nil, false, err
 		}
-		if !cascades {
+		if !cascading {
 			return s.table.DeleteByPK(table, pk)
 		}
-		return s.deleteByPKImplicit(table, pk)
+		row, deleted, err := s.deleteByPKStaged(table, pk)
+		unlockFK()
+		if err != nil {
+			_ = s.Rollback()
+			return nil, false, err
+		}
+		if err := s.Commit(); err != nil {
+			return nil, false, err
+		}
+		return row, deleted, nil
 	}
 	defer s.mu.Unlock()
 	return s.deleteByPKLocked(table, pk)
-}
-
-func (s *Session) deleteByPKImplicit(table, pk string) (Row, bool, error) {
-	if err := s.Begin(); err != nil {
-		return nil, false, err
-	}
-	row, deleted, err := s.deleteByPKStaged(table, pk)
-	if err != nil {
-		_ = s.Rollback()
-		return nil, false, err
-	}
-	if err := s.Commit(); err != nil {
-		return nil, false, err
-	}
-	return row, deleted, nil
 }
 
 func (s *Session) deleteByPKStaged(table, pk string) (Row, bool, error) {

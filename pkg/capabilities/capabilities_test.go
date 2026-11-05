@@ -165,8 +165,9 @@ func TestForeignKeyIsAdvertised(t *testing.T) {
 	}
 	for _, want := range []string{
 		"UNIQUE", "COMMIT", "MATCH SIMPLE", "MATCH keyword", "self",
-		"CASCADE", "SET NULL", "SET DEFAULT", "NOT NULL", "immediately", "transitively",
-		"DEFERRABLE", "0A000",
+		"CASCADE", "SET NULL", "SET DEFAULT", "NOT NULL", "transitively",
+		"autocommit", "no later than COMMIT", "statement savepoint", "hand-authored catalog",
+		"O(FK component)", "DEFERRABLE", "0A000",
 		"PRAGMA foreign_keys", "rejects OFF", "foreign_key_list", "database-wide foreign-key write gate",
 		"DROP/RENAME COLUMN", "DROP TABLE", "pg_constraint",
 	} {

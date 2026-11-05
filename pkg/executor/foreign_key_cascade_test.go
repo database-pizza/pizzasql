@@ -442,7 +442,7 @@ func TestForeignKeyCascadeInSQLiteCatalog(t *testing.T) {
 // The capability document advertises the supported referential actions.
 func TestForeignKeyCascadeCapability(t *testing.T) {
 	notes := capabilities.Current().Constraints.ForeignKey.Notes
-	for _, want := range []string{"CASCADE", "SET NULL", "SET DEFAULT", "immediately"} {
+	for _, want := range []string{"CASCADE", "SET NULL", "SET DEFAULT", "autocommit", "no later than COMMIT", "O(FK component)"} {
 		if !strings.Contains(notes, want) {
 			t.Fatalf("foreign_key capability notes = %q, want %q", notes, want)
 		}
@@ -615,5 +615,83 @@ func TestForeignKeyUpdateCascadeToNull(t *testing.T) {
 	execMust(t, e, "UPDATE parent SET code = NULL WHERE id = 1")
 	if res := execMust(t, e, "SELECT code FROM child WHERE id = 10"); res.Rows[0][0] != nil {
 		t.Fatalf("child.code after cascade to NULL = %v, want NULL", res.Rows[0][0])
+	}
+}
+
+// UPDATE ... FROM that moves a parent key must apply ON UPDATE actions like a
+// plain UPDATE. The executor used to implement the move as DELETE + INSERT,
+// which fired ON DELETE CASCADE and silently dropped the children.
+func TestForeignKeyUpdateFromPrimaryKeyMoveCascades(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		constraint string
+	}{
+		{name: "on delete and update cascade", constraint: "ON DELETE CASCADE ON UPDATE CASCADE"},
+		{name: "on update cascade only", constraint: "ON UPDATE CASCADE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, schema, table := newTestDB(t)
+			e := newExec(schema, table)
+			execMust(t, e, "CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+			execMust(t, e, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) "+tc.constraint+")")
+			execMust(t, e, "CREATE TABLE src (id INTEGER PRIMARY KEY, new_id INTEGER)")
+			execMust(t, e, "INSERT INTO parent (id) VALUES (1)")
+			execMust(t, e, "INSERT INTO child (id, parent_id) VALUES (10, 1)")
+			execMust(t, e, "INSERT INTO src (id, new_id) VALUES (1, 2)")
+
+			res := execMust(t, e, "UPDATE parent SET id = src.new_id FROM src WHERE src.id = parent.id")
+			if res.RowsAffected != 1 {
+				t.Fatalf("rows affected = %d, want 1", res.RowsAffected)
+			}
+			if got := countRows(t, e, "child"); got != 1 {
+				t.Fatalf("child rows after UPDATE ... FROM key move = %d, want 1 (children were deleted)", got)
+			}
+			res = execMust(t, e, "SELECT id, parent_id FROM child")
+			if res.Rows[0][0] != int64(10) || res.Rows[0][1] != int64(2) {
+				t.Fatalf("child after UPDATE ... FROM key move = %v, want (10, 2)", res.Rows)
+			}
+			if res := execMust(t, e, "SELECT id FROM parent"); res.RowCount != 1 || res.Rows[0][0] != int64(2) {
+				t.Fatalf("parent after UPDATE ... FROM key move = %v, want id 2", res.Rows)
+			}
+		})
+	}
+}
+
+// A cascade failure inside an explicit transaction is detected at the statement
+// and rolls back to the statement savepoint, so the transaction can continue.
+// A plain NO ACTION/RESTRICT violation is instead deferred to COMMIT, and the
+// statement itself succeeds.
+func TestForeignKeyCascadeTransactionErrorTiming(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "CREATE TABLE required (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id) ON DELETE SET NULL)")
+	execMust(t, e, "CREATE TABLE restricted (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))")
+	execMust(t, e, "INSERT INTO parent (id) VALUES (1), (2)")
+	execMust(t, e, "INSERT INTO required (id, parent_id) VALUES (10, 1)")
+
+	// SET NULL on a NOT NULL child fails at the statement with 23502.
+	execMust(t, e, "BEGIN")
+	_, err := execSQL(e, "DELETE FROM parent WHERE id = 1")
+	requireNotNullViolation(t, err)
+	// The failed cascade rolled back to the statement savepoint: the parent and
+	// child are still visible to the transaction and the transaction is usable.
+	if res := execMust(t, e, "SELECT count(*) FROM parent"); res.Rows[0][0] != int64(2) {
+		t.Fatalf("parent rows after statement rollback = %v, want 2", res.Rows)
+	}
+	if res := execMust(t, e, "SELECT parent_id FROM required WHERE id = 10"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("required.parent_id after statement rollback = %v, want 1", res.Rows[0][0])
+	}
+	execMust(t, e, "ROLLBACK")
+
+	// A NO ACTION/RESTRICT violation is deferred to COMMIT: the DELETE succeeds
+	// as a statement and the transaction fails on commit.
+	execMust(t, e, "INSERT INTO restricted (id, parent_id) VALUES (20, 2)")
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "DELETE FROM parent WHERE id = 2")
+	_, err = execSQL(e, "COMMIT")
+	requireForeignKeyViolation(t, err)
+	if res := execMust(t, e, "SELECT count(*) FROM parent"); res.Rows[0][0] != int64(2) {
+		t.Fatalf("parent rows after rejected commit = %v, want 2", res.Rows)
 	}
 }
