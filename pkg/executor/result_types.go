@@ -519,9 +519,9 @@ func binaryResultType(e *parser.BinaryExpr, resolve columnTypeResolver) string {
 			return "JSONB"
 		}
 		return "TEXT"
-	case lexer.TokenArrow, lexer.TokenHashArrow:
-		// -> and #> keep the jsonb type when the document is jsonb; JSON1 text
-		// extraction reports text.
+	case lexer.TokenArrow, lexer.TokenHashArrow, lexer.TokenHashMinus:
+		// ->, #>, and #- keep the jsonb type when the document is jsonb; JSON1
+		// text extraction reports text.
 		if strings.EqualFold(inferExprType(e.Left, resolve), "JSONB") {
 			return "JSONB"
 		}

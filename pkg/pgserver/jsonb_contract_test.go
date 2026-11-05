@@ -93,12 +93,38 @@ func TestJSONBTextParameterOverExtendedQuery(t *testing.T) {
 		t.Fatalf("jsonb INSERT round trip = %v", row)
 	}
 
-	// Binary jsonb is rejected instead of being misread as UTF-8 JSON.
+	// PostgreSQL binary jsonb is a version byte plus the document text. pgx sends
+	// this form by default, so it is accepted and canonicalized.
 	conn.reset()
-	messages = runExtendedJSONBBind(t, c, conn, `SELECT $1`, 3802, 1, []byte{0x01, 0x02})
-	errMsg = findError(messages)
-	if errMsg == nil || errorCode(errMsg) != ErrCodeFeatureNotSupported {
-		t.Fatalf("binary jsonb parameter error = %v, want 0A000", messages)
+	messages = runExtendedJSONBBind(t, c, conn, `SELECT $1 -> 'a'`, 3802, 1, append([]byte{0x01}, []byte(`{ "a" : 1.50 }`)...))
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("binary jsonb parameter failed: %s", errorCode(errMsg))
+	}
+	if row := firstDataRow(t, messages); len(row) != 1 || row[0] != "1.5" {
+		t.Fatalf("binary jsonb parameter = %v, want [1.5]", row)
+	}
+	conn.reset()
+	messages = runExtendedJSONBBind(t, c, conn, `SELECT $1`, 3802, 1, append([]byte{0x01}, []byte(`[1, 2]`)...))
+	if row := firstDataRow(t, messages); len(row) != 1 || row[0] != `[1,2]` {
+		t.Fatalf("binary jsonb canonicalization = %v, want [1,2]", row)
+	}
+
+	// A wrong version and a malformed body are invalid text (22P02), not 0A000.
+	for _, tc := range []struct {
+		value []byte
+		code  string
+	}{
+		{[]byte{0x02, '{', '}'}, ErrCodeInvalidText},
+		{[]byte{0x01}, ErrCodeInvalidText},
+		{[]byte{0x01, 'n', 'o', 't'}, ErrCodeInvalidText},
+		{[]byte{}, ErrCodeInvalidText},
+	} {
+		conn.reset()
+		messages = runExtendedJSONBBind(t, c, conn, `SELECT $1`, 3802, 1, tc.value)
+		errMsg := findError(messages)
+		if errMsg == nil || errorCode(errMsg) != tc.code {
+			t.Fatalf("binary jsonb %x error = %v, want %s", tc.value, messages, tc.code)
+		}
 	}
 }
 

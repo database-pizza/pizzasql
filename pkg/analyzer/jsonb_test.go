@@ -67,6 +67,8 @@ func TestAnalyzeJSONBExpressions(t *testing.T) {
 		`SELECT doc & 1 FROM docs`,
 		`SELECT doc || 1 FROM docs`,
 		`SELECT doc - doc FROM docs`,
+		`SELECT doc -> 'a' = 1 FROM docs`,
+		`SELECT doc -> 'a' @> 1 FROM docs`,
 	} {
 		err := analyze(t, a, sql)
 		if err == nil {

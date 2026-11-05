@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
@@ -33,9 +34,12 @@ func jsonbErrorCode(t *testing.T, err error) string {
 		return pgerror.CodeFeatureNotSupported
 	case errors.Is(err, pgerror.ErrDatatypeMismatch):
 		return pgerror.CodeDatatypeMismatch
-	default:
-		return "other:" + err.Error()
 	}
+	var analysisErr *analyzer.AnalysisError
+	if errors.As(err, &analysisErr) && analysisErr.Type == analyzer.ErrTypeMismatch {
+		return pgerror.CodeDatatypeMismatch
+	}
+	return "other:" + err.Error()
 }
 
 func TestJSONBCanonicalization(t *testing.T) {
@@ -245,7 +249,7 @@ func TestJSONBContainmentAndExistence(t *testing.T) {
 		{`SELECT '{"a":1}'::jsonb ? 'b'`, false},
 		{`SELECT '[1,"x"]'::jsonb ? 'x'`, true},
 		{`SELECT '[1,"x"]'::jsonb ? '1'`, false},
-		{`SELECT '"x"'::jsonb ? 'x'`, false},
+		{`SELECT '"x"'::jsonb ? 'x'`, true},
 		{`SELECT 'null'::jsonb ? 'x'`, false},
 		{`SELECT '{"a":1,"b":2}'::jsonb ?| '{b,c}'`, true},
 		{`SELECT '{"a":1,"b":2}'::jsonb ?| '{c,d}'`, false},
@@ -301,8 +305,8 @@ func TestJSONBConcatAndDelete(t *testing.T) {
 	if got := jsonbValue(t, e, `SELECT 'a' || 'b'`); got != "ab" {
 		t.Fatalf("text concatenation = %v", got)
 	}
-	if _, err := execSQL(e, `SELECT '{"a":1}'::jsonb - 1`); jsonbErrorCode(t, err) != pgerror.CodeDatatypeMismatch {
-		t.Errorf("jsonb - integer on object error = %v, want 42804", err)
+	if _, err := execSQL(e, `SELECT '{"a":1}'::jsonb - 1`); jsonbErrorCode(t, err) != pgerror.CodeInvalidParameter {
+		t.Errorf("jsonb - integer on object error = %v, want 22023", err)
 	}
 }
 
@@ -338,19 +342,33 @@ func TestJSONBScalarFunctions(t *testing.T) {
 		{`SELECT jsonb_set('{"a":{"b":1}}', '{a,b}', '2')`, `{"a":{"b":2}}`},
 		{`SELECT jsonb_set('{"a":{"b":1}}', '{x,b}', '2')`, `{"a":{"b":1}}`},
 		{`SELECT jsonb_set('[1,2]', '{2}', '3')`, `[1,2,3]`},
+		{`SELECT jsonb_set('[1,2]', '{5}', '3')`, `[1,2,3]`},
+		{`SELECT jsonb_set('[1,2]', '{5}', '3', false)`, `[1,2]`},
+		{`SELECT jsonb_set('[1,2]', '{-3}', '9')`, `[9,1,2]`},
+		{`SELECT jsonb_set('[1,2]', '{-3}', '9', false)`, `[1,2]`},
+		{`SELECT jsonb_set('{"a":1}', '{}', '2')`, `{"a":1}`},
+		{`SELECT jsonb_insert('{"a":1}', '{}', '2')`, `{"a":1}`},
+		{`SELECT jsonb_set('{"a":1}', '{a,b}', '2')`, `{"a":1}`},
+		{`SELECT jsonb_insert('{"a":1}', '{a,b}', '2')`, `{"a":1}`},
 		{`SELECT jsonb_set('{"a":1}', NULL, '2')`, nil},
 		{`SELECT jsonb_insert('{"a":1}', NULL, '2')`, nil},
 		{`SELECT jsonb_insert('{"a":[0,1,2]}', '{a,1}', '"n"')`, `{"a":[0,"n",1,2]}`},
 		{`SELECT jsonb_insert('{"a":[0,1,2]}', '{a,1}', '"n"', true)`, `{"a":[0,1,"n",2]}`},
 		{`SELECT jsonb_insert('{"a":1}', '{b}', '2')`, `{"a":1,"b":2}`},
-		{`SELECT jsonb_insert('{"a":1}', '{a}', '2')`, `{"a":1}`},
+		{`SELECT jsonb_insert('[0,1,2]', '{5}', '9')`, `[0,1,2,9]`},
+		{`SELECT jsonb_insert('[0,1,2]', '{-3}', '9')`, `[9,0,1,2]`},
+		{`SELECT jsonb_insert('[0,1,2]', '{-1}', '9', true)`, `[0,1,2,9]`},
+		{`SELECT jsonb_insert('[0,1,2]', '{-2}', '9')`, `[0,9,1,2]`},
+		{`SELECT jsonb_insert('[0,1,2]', '{-2}', '9', true)`, `[0,1,9,2]`},
 		{`SELECT jsonb_set('{"a":1}', '{a}', NULL)`, nil},
 		{`SELECT jsonb_insert('[0,1]', '{-1}', '9')`, `[0,9,1]`},
-		// The JSON1 $ path form keeps its previous set/insert behavior and now
-		// returns canonical jsonb.
-		{`SELECT jsonb_set('{"a":1}', '$.b', '2')`, `{"a":1,"b":2}`},
-		{`SELECT jsonb_set('{"a":1}', '$.a', '2')`, `{"a":2}`},
-		{`SELECT jsonb_insert('{"a":1}', '$.b', '2')`, `{"a":1,"b":2}`},
+		// The JSON1 $ path form keeps its previous value semantics: a plain SQL
+		// string becomes a JSON string, while a jsonb-typed value is embedded.
+		{`SELECT jsonb_set('{"a":1}', '$.b', '2')`, `{"a":1,"b":"2"}`},
+		{`SELECT jsonb_set('{"a":1}', '$.a', '2')`, `{"a":"2"}`},
+		{`SELECT jsonb_set('{"a":1}', '$.b', '{"x":1}'::jsonb)`, `{"a":1,"b":{"x":1}}`},
+		{`SELECT jsonb_insert('{"a":1}', '$.b', '2')`, `{"a":1,"b":"2"}`},
+		{`SELECT jsonb_replace('{"a":1}', '$.a', '2')`, `{"a":"2"}`},
 		{`SELECT jsonb_remove('{"a":1,"b":2}', '$.a')`, `{"b":2}`},
 	}
 	for _, tc := range cases {
@@ -375,8 +393,11 @@ func TestJSONBScalarFunctions(t *testing.T) {
 		{`SELECT jsonb_typeof('not json')`, pgerror.CodeInvalidText},
 		{`SELECT jsonb_build_object('a')`, pgerror.CodeInvalidParameter},
 		{`SELECT jsonb_build_object(NULL, 1)`, pgerror.CodeInvalidParameter},
-		{`SELECT jsonb_set('{"a":1}', '{a,0}', '2')`, pgerror.CodeInvalidParameter},
-		{`SELECT jsonb_insert('{"a":1}', '{a,0}', '2')`, pgerror.CodeInvalidParameter},
+		{`SELECT jsonb_set('[1,2]', '{a}', '2')`, pgerror.CodeInvalidText},
+		{`SELECT jsonb_insert('[1,2]', '{a}', '2')`, pgerror.CodeInvalidText},
+		{`SELECT jsonb_insert('{"a":1}', '{a}', '2')`, pgerror.CodeInvalidParameter},
+		{`SELECT jsonb_set('1', '{a}', '2')`, pgerror.CodeInvalidParameter},
+		{`SELECT jsonb_insert('1', '{a}', '2')`, pgerror.CodeInvalidParameter},
 	} {
 		if _, err := execSQL(e, tc.sql); jsonbErrorCode(t, err) != tc.code {
 			t.Errorf("%s error = %v, want %s", tc.sql, err, tc.code)
@@ -620,5 +641,267 @@ func TestJSONBRejectsUnboundedCanonicalExpansion(t *testing.T) {
 	e := newExec(schema, table)
 	if _, err := execSQL(e, `SELECT '{"a":1e999999}'::jsonb`); !strings.Contains(err.Error(), "invalid input syntax") {
 		t.Fatalf("unbounded number error = %v", err)
+	}
+}
+
+// A PostgreSQL path element is resolved against the container it reaches:
+// numeric-looking text is an object key in an object and an integer index in an
+// array. This must hold for #>, #>>, #-, jsonb_set, and jsonb_insert.
+func TestJSONBNumericLookingObjectKeys(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	cases := []struct {
+		sql  string
+		want interface{}
+	}{
+		{`SELECT '{"1":{"2":3}}'::jsonb #> '{1,2}'`, `3`},
+		{`SELECT '{"1":{"2":3}}'::jsonb #>> '{1,2}'`, `3`},
+		{`SELECT '{"1":{"2":3}}'::jsonb #- '{1,2}'`, `{"1":{}}`},
+		{`SELECT jsonb_set('{"1":{"2":3}}', '{1,2}', '4')`, `{"1":{"2":4}}`},
+		{`SELECT jsonb_insert('{"1":{"2":3}}', '{1,3}', '4')`, `{"1":{"2":3,"3":4}}`},
+		{`SELECT '{"01":"x"}'::jsonb #> '{01}'`, `"x"`},
+		{`SELECT '{"-1":"x"}'::jsonb #> '{-1}'`, `"x"`},
+		{`SELECT '{"1.5":"x"}'::jsonb #> '{1.5}'`, `"x"`},
+		{`SELECT jsonb_set('{"01":"x"}', '{01}', '"y"')`, `{"01":"y"}`},
+		{`SELECT jsonb_insert('{"01":"x"}', '{02}', '"y"')`, `{"01":"x","02":"y"}`},
+		{`SELECT jsonb_set('{"-1":"x"}', '{-1}', '"y"')`, `{"-1":"y"}`},
+		{`SELECT jsonb_insert('{"-1":"x"}', '{-2}', '"y"')`, `{"-1":"x","-2":"y"}`},
+		{`SELECT '{"1.5":"x"}'::jsonb #- '{1.5}'`, `{}`},
+		{`SELECT jsonb_set('{"1.5":"x"}', '{1.5}', '"y"')`, `{"1.5":"y"}`},
+		{`SELECT '[10,20]'::jsonb #> '{01}'`, `20`},
+		{`SELECT '[10,20]'::jsonb #> '{-1}'`, `20`},
+		{`SELECT '[10,20]'::jsonb #> '{a}'`, nil},
+	}
+	for _, tc := range cases {
+		if got := jsonbValue(t, e, tc.sql); got != tc.want {
+			t.Errorf("%s = %v (%T), want %v", tc.sql, got, got, tc.want)
+		}
+	}
+
+	// A non-integer path element on an array is an error for #-, matching
+	// PostgreSQL's path mutation and delete behavior.
+	if _, err := execSQL(e, `SELECT '[10,20]'::jsonb #- '{a}'`); jsonbErrorCode(t, err) != pgerror.CodeInvalidText {
+		t.Errorf("#- array non-integer element error = %v, want 22P02", err)
+	}
+}
+
+// #- must produce jsonb metadata and keep jsonb semantics for chained
+// operators, not fall back to text.
+func TestJSONBPathDeleteKeepsJSONBType(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	res := execMust(t, e, `SELECT '{"t":true}'::jsonb #- '{x}'`)
+	if len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != "JSONB" {
+		t.Fatalf("#- column type = %v, want JSONB", res.ColumnTypes)
+	}
+	if got := jsonbValue(t, e, `SELECT ('{"t":true}'::jsonb #- '{x}') ->> 't'`); got != "true" {
+		t.Fatalf("#- ->> = %v (%T), want true text", got, got)
+	}
+	if got := jsonbValue(t, e, `SELECT ('{"t":true}'::jsonb #- '{x}') = '{"t":true}'::jsonb`); got != true {
+		t.Fatalf("#- jsonb equality = %v", got)
+	}
+	if got := jsonbValue(t, e, `SELECT ('{"t":true}'::jsonb #- '{x}') ? 't'`); got != true {
+		t.Fatalf("#- ? = %v", got)
+	}
+}
+
+// jsonb equality and ordering use exact canonical bytes, not float64. DISTINCT,
+// GROUP BY, and containment must agree with =.
+func TestJSONBExactEqualityAndAggregateAgreement(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	for _, sql := range []string{
+		`SELECT '1'::jsonb = '1.0000000000000000001'::jsonb`,
+		`SELECT '9007199254740993'::jsonb = '9007199254740992'::jsonb`,
+	} {
+		if got := jsonbValue(t, e, sql); got != false {
+			t.Errorf("%s = %v, want false", sql, got)
+		}
+	}
+	if got := jsonbValue(t, e, `SELECT '1'::jsonb = '1.0'::jsonb`); got != true {
+		t.Fatalf("1 = 1.0 = %v, want true", got)
+	}
+	if got := jsonbValue(t, e, `SELECT '1'::jsonb < '1.0000000000000000001'::jsonb`); got != true {
+		t.Fatalf("1 < 1.0000000000000000001 = %v, want true", got)
+	}
+	if got := jsonbValue(t, e, `SELECT '1'::jsonb IS DISTINCT FROM '1.0000000000000000001'::jsonb`); got != true {
+		t.Fatalf("1 IS DISTINCT FROM 1.0000000000000000001 = %v, want true", got)
+	}
+	if got := jsonbValue(t, e, `SELECT CASE '1'::jsonb WHEN '1.0000000000000000001'::jsonb THEN 'same' ELSE 'different' END`); got != "different" {
+		t.Fatalf("simple CASE exact jsonb equality = %v, want different", got)
+	}
+	if got := jsonbValue(t, e, `SELECT '1'::jsonb IN ('1.0'::jsonb, '1.0000000000000000001'::jsonb)`); got != true {
+		t.Fatalf("jsonb IN = %v, want true", got)
+	}
+	if got := jsonbValue(t, e, `SELECT '{"n":1}'::jsonb @> '{"n":1.0000000000000000001}'::jsonb`); got != false {
+		t.Fatalf("containment rounded a number: %v, want false", got)
+	}
+	if got := jsonbValue(t, e, `SELECT '{"n":1}'::jsonb @> '{"n":1.0}'::jsonb`); got != true {
+		t.Fatalf("containment of equal canonical numbers = %v, want true", got)
+	}
+
+	execMust(t, e, "CREATE TABLE exact (id INTEGER PRIMARY KEY, doc JSONB)")
+	execMust(t, e, `INSERT INTO exact VALUES (1, '1'), (2, '1.0'), (3, '1.0000000000000000001'), (4, '9007199254740993'), (5, '9007199254740992')`)
+	if res := execMust(t, e, `SELECT DISTINCT doc FROM exact`); res.RowCount != 4 {
+		t.Fatalf("DISTINCT exact jsonb rows = %v, want 4", res.Rows)
+	}
+	res := execMust(t, e, `SELECT doc, COUNT(*) FROM exact GROUP BY doc ORDER BY doc`)
+	if res.RowCount != 4 {
+		t.Fatalf("GROUP BY exact jsonb rows = %v, want 4", res.Rows)
+	}
+	if res.Rows[0][1] != int64(2) {
+		t.Fatalf("GROUP BY merged canonical numbers = %v, want two spellings of 1", res.Rows[0])
+	}
+	res = execMust(t, e, `SELECT COUNT(*) FROM exact WHERE doc = '1'::jsonb`)
+	if res.Rows[0][0] != int64(2) {
+		t.Fatalf("equality count = %v, want 2", res.Rows[0][0])
+	}
+	res = execMust(t, e, `SELECT COUNT(*) FROM exact WHERE doc @> '1'::jsonb`)
+	if res.Rows[0][0] != int64(2) {
+		t.Fatalf("containment count = %v, want 2", res.Rows[0][0])
+	}
+}
+
+// Containment tracks consumed array matches, as required by the review gate:
+// a candidate with duplicates needs a distinct container element per copy.
+// A jsonb extraction result must not be silently compared with a SQL number.
+func TestJSONBExtractionComparisonTypeError(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	for _, sql := range []string{
+		`SELECT '{"a":1}'::jsonb -> 'a' = 1`,
+		`SELECT '{"a":1}'::jsonb -> 'a' = TRUE`,
+	} {
+		if _, err := execSQL(e, sql); jsonbErrorCode(t, err) != pgerror.CodeDatatypeMismatch {
+			t.Errorf("%s error = %v, want 42804", sql, err)
+		}
+	}
+	if got := jsonbValue(t, e, `SELECT '{"a":1}'::jsonb -> 'a' = '1'::jsonb`); got != true {
+		t.Fatalf("jsonb -> = jsonb = %v, want true", got)
+	}
+}
+
+func TestJSONBArrayContainmentMultiplicity(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	cases := []struct {
+		sql  string
+		want interface{}
+	}{
+		{`SELECT '[1]'::jsonb @> '[1,1]'::jsonb`, false},
+		{`SELECT '[1,1]'::jsonb @> '[1]'::jsonb`, true},
+		{`SELECT '[1,2,2]'::jsonb @> '[2,2]'::jsonb`, true},
+		{`SELECT '[1,2]'::jsonb @> '[2,2]'::jsonb`, false},
+		{`SELECT '[1]'::jsonb @> '1'::jsonb`, true},
+	}
+	for _, tc := range cases {
+		if got := jsonbValue(t, e, tc.sql); got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.sql, got, tc.want)
+		}
+	}
+}
+
+// A JSONB column written before native JSONB may hold non-canonical text. Reads
+// canonicalize it so projection, DISTINCT, GROUP BY, and ORDER BY all observe
+// the canonical value.
+func TestJSONBLegacyValuesCanonicalizeOnRead(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE legacy (id INTEGER PRIMARY KEY, doc JSONB)")
+
+	legacy := []string{
+		`{ "a" : 1 }`,
+		`{"a":1}`,
+		` { "a" :1 } `,
+		`{"b": 2,"a": 1}`,
+		`{"a":1,"b":2}`,
+		` { "b" : 2, "a" : 1 } `,
+	}
+	for i, raw := range legacy {
+		if err := table.Insert("legacy", storage.Row{"id": int64(i + 1), "doc": raw}); err != nil {
+			t.Fatalf("legacy insert %d: %v", i, err)
+		}
+	}
+	e = newExec(schema, table)
+
+	res := execMust(t, e, `SELECT doc FROM legacy ORDER BY id`)
+	if res.RowCount != len(legacy) {
+		t.Fatalf("legacy rows = %d", res.RowCount)
+	}
+	for _, row := range res.Rows {
+		if row[0] != `{"a":1}` && row[0] != `{"a":1,"b":2}` {
+			t.Fatalf("legacy read = %v, want canonical text", row[0])
+		}
+	}
+	res = execMust(t, e, `SELECT DISTINCT doc FROM legacy`)
+	if res.RowCount != 2 {
+		t.Fatalf("legacy DISTINCT rows = %v, want 2", res.Rows)
+	}
+	res = execMust(t, e, `SELECT DISTINCT * FROM legacy`)
+	if res.RowCount != len(legacy) {
+		t.Fatalf("legacy DISTINCT * rows = %d", res.RowCount)
+	}
+	res = execMust(t, e, `SELECT * FROM legacy ORDER BY id`)
+	for _, row := range res.Rows {
+		if row[1] != `{"a":1}` && row[1] != `{"a":1,"b":2}` {
+			t.Fatalf("legacy SELECT * read = %v, want canonical text", row[1])
+		}
+	}
+	if got := jsonbValue(t, e, `SELECT COUNT(DISTINCT doc) FROM legacy`); got != int64(2) {
+		t.Fatalf("legacy COUNT(DISTINCT doc) = %v, want 2", got)
+	}
+	res = execMust(t, e, `SELECT doc, COUNT(*) FROM legacy GROUP BY doc`)
+	if res.RowCount != 2 {
+		t.Fatalf("legacy GROUP BY rows = %v, want 2", res.Rows)
+	}
+	res = execMust(t, e, `SELECT id FROM legacy ORDER BY doc, id`)
+	if res.RowCount != len(legacy) {
+		t.Fatalf("legacy ORDER BY rows = %d", res.RowCount)
+	}
+	if got := jsonbValue(t, e, `SELECT doc FROM legacy WHERE id = 1`); got != `{"a":1}` {
+		t.Fatalf("legacy selected value = %v, want canonical", got)
+	}
+}
+
+// Escapes that encoding/json would silently rewrite are invalid jsonb input.
+func TestJSONBRejectsNULAndLoneSurrogates(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	for _, sql := range []string{
+		`SELECT '{"a":"\u0000"}'::jsonb`,
+		`SELECT '"\ud800"'::jsonb`,
+		`SELECT '"\ud800x"'::jsonb`,
+		`SELECT '"\udc00"'::jsonb`,
+		`SELECT '{"\u0000":1}'::jsonb`,
+	} {
+		if _, err := execSQL(e, sql); jsonbErrorCode(t, err) != pgerror.CodeInvalidText {
+			t.Errorf("%s error = %v, want 22P02", sql, err)
+		}
+	}
+	if got := jsonbValue(t, e, `SELECT '"\u0041"'::jsonb`); got != `"A"` {
+		t.Fatalf("escaped ASCII = %v", got)
+	}
+	if got := jsonbValue(t, e, `SELECT '"\ud83d\ude00"'::jsonb`); got != "\"\U0001F600\"" {
+		t.Fatalf("surrogate pair = %v", got)
+	}
+}
+
+// Zero-row text set-returning functions must still report TEXT for the value
+// column.
+func TestJSONBTextSetReturningTypesOnNull(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	res := execMust(t, e, `SELECT * FROM jsonb_each_text(NULL)`)
+	if res.RowCount != 0 || len(res.ColumnTypes) != 2 || res.ColumnTypes[0] != "TEXT" || res.ColumnTypes[1] != "TEXT" {
+		t.Fatalf("jsonb_each_text(NULL) = rows %d types %v, want 0 [TEXT TEXT]", res.RowCount, res.ColumnTypes)
+	}
+	res = execMust(t, e, `SELECT * FROM jsonb_array_elements_text(NULL)`)
+	if res.RowCount != 0 || len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != "TEXT" {
+		t.Fatalf("jsonb_array_elements_text(NULL) = rows %d types %v, want 0 [TEXT]", res.RowCount, res.ColumnTypes)
 	}
 }

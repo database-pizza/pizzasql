@@ -1186,7 +1186,19 @@ func parameterLiteral(param boundParameter) (string, error) {
 			return "", fmt.Errorf("%w: binary array parameter format for OID %d; send arrays in text format", pgerror.ErrFeatureNotSupported, param.oid)
 		}
 		if param.oid == 3802 {
-			return "", fmt.Errorf("%w: binary jsonb parameter format for OID 3802; send jsonb in text format", pgerror.ErrFeatureNotSupported)
+			// PostgreSQL's binary jsonb format is a version byte followed by the
+			// document text. pgx sends this form by default.
+			if len(param.value) == 0 {
+				return "", pgerror.InvalidText("jsonb binary parameter is empty")
+			}
+			if param.value[0] != 1 {
+				return "", pgerror.InvalidText("unsupported jsonb binary format version %d", param.value[0])
+			}
+			canonical, err := executor.CanonicalizeJSONB(string(param.value[1:]))
+			if err != nil {
+				return "", err
+			}
+			return "'" + strings.ReplaceAll(canonical, "'", "''") + "'::jsonb", nil
 		}
 		switch param.oid {
 		case 16:

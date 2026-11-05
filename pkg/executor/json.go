@@ -118,8 +118,10 @@ type jsonPathSeg struct {
 	key      string
 	isIndex  bool
 	index    int
-	appendOp bool // [#] — append for insert/set
-	fromEnd  bool // negative index
+	appendOp bool   // [#] — append for insert/set
+	fromEnd  bool   // negative index
+	dynamic  bool   // PostgreSQL text[] path element resolved by container kind
+	element  string // raw dynamic element text
 }
 
 // parseJSONPath parses a JSON1 path expression such as $.a.b[0] or $[#].
@@ -179,34 +181,50 @@ func parseJSONPath(path string) ([]jsonPathSeg, error) {
 
 // jsonLookup walks a decoded tree to the node addressed by segs.
 func jsonLookup(root interface{}, segs []jsonPathSeg) (interface{}, bool) {
+	node, ok, _ := jsonLookupE(root, segs)
+	return node, ok
+}
+
+// jsonLookupE walks a decoded tree to the node addressed by segs. It differs
+// from jsonLookup only in reporting a malformed PostgreSQL path element (a
+// non-integer step on an array). A step that does not resolve is reported as
+// not found, which is the jsonb #> NULL result for a mismatched path.
+func jsonLookupE(root interface{}, segs []jsonPathSeg) (interface{}, bool, error) {
 	cur := root
-	for _, seg := range segs {
+	for _, rawSeg := range segs {
+		seg, resolved, err := resolveJSONBPathSegment(rawSeg, cur, false)
+		if err != nil {
+			return nil, false, err
+		}
+		if !resolved {
+			return nil, false, nil
+		}
 		if seg.isIndex {
 			arr, ok := cur.([]interface{})
 			if !ok {
-				return nil, false
+				return nil, false, nil
 			}
 			idx := seg.index
 			if seg.fromEnd {
 				idx = len(arr) + idx
 			}
 			if idx < 0 || idx >= len(arr) {
-				return nil, false
+				return nil, false, nil
 			}
 			cur = arr[idx]
 			continue
 		}
 		obj, ok := cur.(map[string]interface{})
 		if !ok {
-			return nil, false
+			return nil, false, nil
 		}
 		val, ok := obj[seg.key]
 		if !ok {
-			return nil, false
+			return nil, false, nil
 		}
 		cur = val
 	}
-	return cur, true
+	return cur, true, nil
 }
 
 // jsonApplyPatch applies json_set/insert/replace mutations to a decoded tree.
@@ -670,7 +688,13 @@ func jsonRemove(root interface{}, segs []jsonPathSeg) (interface{}, error) {
 	if len(segs) == 0 {
 		return root, nil
 	}
-	seg := segs[0]
+	seg, resolved, err := resolveJSONBPathSegment(segs[0], root, true)
+	if err != nil {
+		return nil, err
+	}
+	if !resolved {
+		return root, nil
+	}
 	last := len(segs) == 1
 	if seg.isIndex {
 		arr, ok := root.([]interface{})

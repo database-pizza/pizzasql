@@ -165,7 +165,11 @@ func (e *Executor) executeSelectOnRows(stmt *parser.SelectStmt, rows []storage.R
 		for _, col := range stmt.Columns {
 			if col.Star {
 				for _, c := range schema.Columns {
-					values = append(values, row[c.Name])
+					canonical, err := canonicalizeJSONBReadValue(c.Type, row[c.Name])
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, canonical)
 				}
 			} else {
 				val, err := e.evalExpr(col.Expr, row)

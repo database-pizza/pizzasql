@@ -1135,9 +1135,15 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 			return info, nil
 		}
 		info.Type = TypeText
-	case lexer.TokenArrow, lexer.TokenArrowText:
-		// JSON extraction. Like json_extract, the result follows the JSON value
-		// and is not a fixed SQL type (a JSON number extracts as a number).
+	case lexer.TokenArrow:
+		// JSON extraction. A jsonb document extracts as jsonb, so a later
+		// comparison cannot silently reinterpret the result as SQL text.
+		info.Type = TypeAny
+		if left.Type == TypeJSONB {
+			info.Type = TypeJSONB
+		}
+	case lexer.TokenArrowText:
+		// ->> returns the SQL value or text; it is not jsonb.
 		info.Type = TypeAny
 	case lexer.TokenHashArrow:
 		// JSONB path extraction returns a JSONB value.
@@ -1147,8 +1153,22 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 		}
 	case lexer.TokenHashArrowText:
 		info.Type = TypeText
-	case lexer.TokenAtArrow, lexer.TokenLtAt,
-		lexer.TokenQuestion, lexer.TokenQuestionPipe, lexer.TokenQuestionAmp:
+	case lexer.TokenHashMinus:
+		info.Type = TypeAny
+		if left.Type == TypeJSONB {
+			info.Type = TypeJSONB
+		}
+	case lexer.TokenAtArrow, lexer.TokenLtAt:
+		// Containment needs a jsonb operand (or text read as a jsonb document)
+		// on both sides; a number is not silently reinterpreted as JSON.
+		if !jsonbTextOperand(left.Type) || !jsonbTextOperand(right.Type) {
+			return nil, &AnalysisError{
+				Type:    ErrTypeMismatch,
+				Message: fmt.Sprintf("jsonb containment requires jsonb or text operands, got %s and %s", left.Type, right.Type),
+			}
+		}
+		info.Type = TypeBoolean
+	case lexer.TokenQuestion, lexer.TokenQuestionPipe, lexer.TokenQuestionAmp:
 		info.Type = TypeBoolean
 	default:
 		info.Type = TypeUnknown

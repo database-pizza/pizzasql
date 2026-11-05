@@ -248,7 +248,7 @@ func TestJSONBIsAdvertised(t *testing.T) {
 			t.Errorf("json.jsonb.canonicalization does not mention %q", want)
 		}
 	}
-	for _, want := range []string{"canonical-text equality", "DISTINCT", "ORDER BY", "numeric"} {
+	for _, want := range []string{"exact canonical text bytes", "DISTINCT", "ORDER BY", "numeric"} {
 		if !strings.Contains(jsonb.Ordering, want) {
 			t.Errorf("json.jsonb.ordering does not mention %q", want)
 		}
@@ -277,16 +277,18 @@ func TestJSONBIsAdvertised(t *testing.T) {
 			t.Errorf("json.jsonb.set_returning notes do not mention %q", want)
 		}
 	}
-	if !jsonb.Parameters.Supported || jsonb.Parameters.Status != "text_format" {
+	if !jsonb.Parameters.Supported || jsonb.Parameters.Status != "text_and_binary" {
 		t.Fatalf("json.jsonb.parameters = %+v", jsonb.Parameters)
 	}
-	if !strings.Contains(jsonb.Parameters.Notes, "3802") || !strings.Contains(jsonb.Parameters.Notes, "0A000") {
-		t.Fatalf("json.jsonb.parameters notes = %q", jsonb.Parameters.Notes)
+	for _, want := range []string{"3802", "0x01", "pgx", "22P02"} {
+		if !strings.Contains(jsonb.Parameters.Notes, want) {
+			t.Fatalf("json.jsonb.parameters notes do not mention %q: %q", want, jsonb.Parameters.Notes)
+		}
 	}
 	if jsonb.Rejected.Supported || jsonb.Rejected.SQLState != pgerror.CodeFeatureNotSupported {
 		t.Fatalf("json.jsonb.rejected = %+v", jsonb.Rejected)
 	}
-	for _, want := range []string{"jsonpath", "GIN", "expression indexes", "binary", "wildcard"} {
+	for _, want := range []string{"jsonpath", "GIN", "expression indexes", "wildcard"} {
 		if !strings.Contains(jsonb.Rejected.Notes, want) {
 			t.Errorf("json.jsonb.rejected notes do not mention %q", want)
 		}

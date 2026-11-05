@@ -1365,7 +1365,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 								if !ok {
 									val = row[c.Name]
 								}
-								values = append(values, val)
+								canonical, canonErr := canonicalizeJSONBReadValue(c.Type, val)
+								if canonErr != nil {
+									return nil, canonErr
+								}
+								values = append(values, canonical)
 							}
 						}
 					}
@@ -1374,7 +1378,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					// oid/rowid/_rowid_ is an ordinary column here, not the hidden
 					// rowid alias, so use its own value key.
 					for _, c := range schema.Columns {
-						values = append(values, row[c.Name])
+						canonical, canonErr := canonicalizeJSONBReadValue(c.Type, row[c.Name])
+						if canonErr != nil {
+							return nil, canonErr
+						}
+						values = append(values, canonical)
 					}
 				}
 			} else if col.TableStar != "" {
@@ -1387,7 +1395,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					if !ok {
 						val = row[c.Name]
 					}
-					values = append(values, val)
+					canonical, canonErr := canonicalizeJSONBReadValue(c.Type, val)
+					if canonErr != nil {
+						return nil, canonErr
+					}
+					values = append(values, canonical)
 				}
 			} else if we, ok := col.Expr.(*parser.WindowExpr); ok {
 				values = append(values, windowValues[we][rowIdx])
@@ -5436,22 +5448,22 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 		if e.outerRow != nil {
 			// Step 1-2: qualified lookup in outer row
 			if val, ok := e.outerRow[ref.Table+"."+ref.Column]; ok {
-				return val, nil
+				return e.canonicalizeJSONBColumnValue(ref, val)
 			}
 			for k, v := range e.outerRow {
 				if strings.EqualFold(k, ref.Table+"."+ref.Column) {
-					return v, nil
+					return e.canonicalizeJSONBColumnValue(ref, v)
 				}
 			}
 		}
 
 		// Step 3-4: qualified lookup in current row
 		if val, ok := row[ref.Table+"."+ref.Column]; ok {
-			return val, nil
+			return e.canonicalizeJSONBColumnValue(ref, val)
 		}
 		for k, v := range row {
 			if strings.EqualFold(k, ref.Table+"."+ref.Column) {
-				return v, nil
+				return e.canonicalizeJSONBColumnValue(ref, v)
 			}
 		}
 
@@ -5461,11 +5473,11 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 		// but no "t1.b").
 		if e.outerRow != nil {
 			if val, ok := e.outerRow[ref.Column]; ok {
-				return val, nil
+				return e.canonicalizeJSONBColumnValue(ref, val)
 			}
 			for k, v := range e.outerRow {
 				if strings.EqualFold(k, ref.Column) {
-					return v, nil
+					return e.canonicalizeJSONBColumnValue(ref, v)
 				}
 			}
 		}
@@ -5474,22 +5486,22 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 	// Step 6: unqualified fallback in current row (handles unqualified refs and
 	// single-table queries like "SELECT t1.a FROM t1" where rows have plain keys).
 	if val, ok := row[ref.Column]; ok {
-		return val, nil
+		return e.canonicalizeJSONBColumnValue(ref, val)
 	}
 	for k, v := range row {
 		if strings.EqualFold(k, ref.Column) {
-			return v, nil
+			return e.canonicalizeJSONBColumnValue(ref, v)
 		}
 	}
 
 	// For unqualified refs with an outer row context (ref.Table == "").
 	if e.outerRow != nil && ref.Table == "" {
 		if val, ok := e.outerRow[ref.Column]; ok {
-			return val, nil
+			return e.canonicalizeJSONBColumnValue(ref, val)
 		}
 		for k, v := range e.outerRow {
 			if strings.EqualFold(k, ref.Column) {
-				return v, nil
+				return e.canonicalizeJSONBColumnValue(ref, v)
 			}
 		}
 	}
@@ -5500,7 +5512,7 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 	// runs last.
 	if storage.IsRowIDColumn(ref.Column) {
 		if val, ok := row["_rowid_"]; ok {
-			return val, nil
+			return e.canonicalizeJSONBColumnValue(ref, val)
 		}
 	}
 
@@ -6272,7 +6284,11 @@ func (e *Executor) evalCaseExpr(expr *parser.CaseExpr, row storage.Row) (interfa
 			if operand == nil {
 				continue
 			}
-			match = compare(operand, cond) == 0
+			equal, cmpErr := e.compareExprValues(lexer.TokenEq, expr.Operand, when.Condition, operand, cond)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			match = equal
 		} else {
 			// Searched CASE: CASE WHEN cond THEN ... — NULL condition is falsy
 			match = toBool(cond)

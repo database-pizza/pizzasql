@@ -59,6 +59,9 @@ func decodeJSONB(text string) (interface{}, error) {
 	if !utf8.ValidString(text) {
 		return nil, invalidJSONBInput(text)
 	}
+	if err := validateJSONBUnicodeEscapes(text); err != nil {
+		return nil, err
+	}
 	dec := json.NewDecoder(strings.NewReader(text))
 	dec.UseNumber()
 	var node interface{}
@@ -70,6 +73,81 @@ func decodeJSONB(text string) (interface{}, error) {
 		return nil, invalidJSONBInput(text)
 	}
 	return node, nil
+}
+
+// validateJSONBUnicodeEscapes rejects escapes that encoding/json would accept
+// by rewriting them: U+0000 and unpaired UTF-16 surrogates. PostgreSQL rejects
+// both in jsonb input with 22P02 instead of silently producing U+FFFD.
+func validateJSONBUnicodeEscapes(text string) error {
+	inString := false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		if c == '"' {
+			inString = false
+			continue
+		}
+		if c != '\\' {
+			continue
+		}
+		if i+1 >= len(text) {
+			return invalidJSONBInput(text)
+		}
+		i++
+		if text[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(text) {
+			return invalidJSONBInput(text)
+		}
+		value, ok := parseJSONBHex4(text[i+1 : i+5])
+		if !ok {
+			return invalidJSONBInput(text)
+		}
+		i += 4
+		switch {
+		case value == 0:
+			return invalidJSONBInput(text)
+		case value >= 0xD800 && value <= 0xDBFF:
+			// A high surrogate must be followed by a low surrogate escape.
+			if i+7 > len(text) || text[i+1] != '\\' || text[i+2] != 'u' {
+				return invalidJSONBInput(text)
+			}
+			low, ok := parseJSONBHex4(text[i+3 : i+7])
+			if !ok || low < 0xDC00 || low > 0xDFFF {
+				return invalidJSONBInput(text)
+			}
+			i += 6
+		case value >= 0xDC00 && value <= 0xDFFF:
+			return invalidJSONBInput(text)
+		}
+	}
+	return nil
+}
+
+func parseJSONBHex4(text string) (uint32, bool) {
+	var value uint32
+	for i := 0; i < 4; i++ {
+		digit := text[i]
+		var nibble uint32
+		switch {
+		case digit >= '0' && digit <= '9':
+			nibble = uint32(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			nibble = uint32(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			nibble = uint32(digit-'A') + 10
+		default:
+			return 0, false
+		}
+		value = value<<4 | nibble
+	}
+	return value, true
 }
 
 // encodeJSONB writes a decoded JSON tree in canonical form. pretty selects the
@@ -380,7 +458,7 @@ func (e *Executor) isJSONBExpr(expr parser.Expr) bool {
 		return strings.EqualFold(strings.TrimSpace(typed.Type.Name), "JSONB")
 	case *parser.BinaryExpr:
 		switch typed.Op {
-		case lexer.TokenArrow, lexer.TokenHashArrow:
+		case lexer.TokenArrow, lexer.TokenHashArrow, lexer.TokenHashMinus:
 			return e.isJSONBExpr(typed.Left)
 		case lexer.TokenConcat:
 			return e.isJSONBExpr(typed.Left) || e.isJSONBExpr(typed.Right)
@@ -417,6 +495,12 @@ func (e *Executor) evalJSONBBinary(op lexer.TokenType, leftExpr, rightExpr parse
 		if left == nil || right == nil {
 			return nil, true, nil
 		}
+		if (leftJSONB && !jsonbComparisonValue(right)) || (rightJSONB && !jsonbComparisonValue(left)) {
+			return nil, true, pgerror.DatatypeMismatch("jsonb comparison requires jsonb or text operands")
+		}
+		// jsonb equality and ordering compare the exact canonical bytes. Using
+		// the engine's numeric-aware compare here would round through float64 and
+		// report 1 = 1.0000000000000000001 or collapse integers above 2^53.
 		leftText, err := CanonicalizeJSONB(toString(left))
 		if err != nil {
 			return nil, true, err
@@ -425,8 +509,7 @@ func (e *Executor) evalJSONBBinary(op lexer.TokenType, leftExpr, rightExpr parse
 		if err != nil {
 			return nil, true, err
 		}
-		comparison := compare(leftText, rightText)
-		result, err := comparisonOperatorResult(op, comparison)
+		result, err := comparisonOperatorResult(op, strings.Compare(leftText, rightText))
 		return result, true, err
 	}
 
@@ -497,6 +580,49 @@ func (e *Executor) evalJSONBBinary(op lexer.TokenType, leftExpr, rightExpr parse
 	return nil, false, nil
 }
 
+// jsonbComparisonValue reports whether a runtime value can be read as a jsonb
+// document on the other side of a comparison. SQL numbers and booleans are not
+// silently reinterpreted as JSON (PostgreSQL has no jsonb = integer operator).
+func jsonbComparisonValue(value interface{}) bool {
+	switch value.(type) {
+	case string, jsonText, []byte:
+		return true
+	default:
+		return false
+	}
+}
+
+// canonicalizeJSONBReadValue canonicalizes a JSONB-typed value on read so a
+// legacy row written before native JSONB still presents canonical text to
+// projections, DISTINCT, GROUP BY, and ORDER BY.
+func canonicalizeJSONBReadValue(typeName string, value interface{}) (interface{}, error) {
+	if value == nil || !strings.EqualFold(strings.TrimSpace(typeName), "JSONB") {
+		return value, nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		if jsonValue, isJSON := value.(jsonText); isJSON {
+			text = string(jsonValue)
+		} else {
+			return value, nil
+		}
+	}
+	return CanonicalizeJSONB(text)
+}
+
+// canonicalizeJSONBColumnValue applies read canonicalization to a column
+// reference. It is a no-op for columns whose declared type is not JSONB.
+func (e *Executor) canonicalizeJSONBColumnValue(ref *parser.ColumnRef, value interface{}) (interface{}, error) {
+	if ref == nil || value == nil {
+		return value, nil
+	}
+	typeName, ok := e.resolveColumnType(ref.Table, ref.Column)
+	if !ok {
+		return value, nil
+	}
+	return canonicalizeJSONBReadValue(typeName, value)
+}
+
 // jsonbArrowPath resolves the right operand of -> and ->> for a jsonb document.
 // A $ path is validated like every other jsonb path, so wildcards and slices
 // are rejected with 0A000 rather than misinterpreted as member names.
@@ -556,7 +682,10 @@ func jsonbPathExtract(document, path interface{}, scalar bool) (interface{}, err
 	if err != nil {
 		return nil, err
 	}
-	found, ok := jsonLookup(node, segs)
+	found, ok, err := jsonLookupE(node, segs)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, nil
 	}
@@ -636,6 +765,9 @@ func jsonbKeyExists(left, right interface{}) (interface{}, error) {
 			}
 		}
 		return false, nil
+	case string:
+		// A scalar JSON string counts as the key itself: '"x"' ? 'x' is true.
+		return value == key, nil
 	default:
 		return false, nil
 	}
@@ -707,7 +839,10 @@ func (e *Executor) jsonbDeleteValue(leftExpr, rightExpr parser.Expr, left, right
 	case int64:
 		array, ok := node.([]interface{})
 		if !ok {
-			return nil, pgerror.DatatypeMismatch("cannot delete an array element from a jsonb %s", jsonbNodeTypeName(node))
+			if _, isObject := node.(map[string]interface{}); isObject {
+				return nil, pgerror.InvalidParameter("cannot delete from object using integer index")
+			}
+			return nil, pgerror.InvalidParameter("cannot delete an array element from a jsonb %s", jsonbNodeTypeName(node))
 		}
 		return encodeJSONB(jsonbDeleteIndex(array, int(value)), false)
 	case int:
@@ -826,10 +961,15 @@ func jsonbContains(container, candidate interface{}) bool {
 	case []interface{}:
 		containerArray, ok := container.([]interface{})
 		if ok {
+			used := make([]bool, len(containerArray))
 			for _, candidateElement := range candidateValue {
 				matched := false
-				for _, containerElement := range containerArray {
+				for i, containerElement := range containerArray {
+					if used[i] {
+						continue
+					}
 					if jsonbContains(containerElement, candidateElement) {
+						used[i] = true
 						matched = true
 						break
 					}
@@ -925,8 +1065,10 @@ func jsonbKeyListArg(value interface{}) ([]string, error) {
 }
 
 // parseJSONBArrayPath parses PostgreSQL text[] path text into steps. A path
-// element that looks like an integer addresses an array index; everything else
-// is an object key.
+// element is kept as raw text because its meaning depends on the container it
+// is applied to: an object key, or an integer array index. Numeric-looking
+// object keys such as "1", "01", "-1", and "1.5" therefore stay keys when the
+// container is an object.
 func parseJSONBArrayPath(text string) ([]jsonPathSeg, error) {
 	elements, err := parseArrayLiteral(text)
 	if err != nil {
@@ -937,13 +1079,37 @@ func parseJSONBArrayPath(text string) ([]jsonPathSeg, error) {
 		if element == nil {
 			return nil, pgerror.InvalidParameter("jsonb path element must not be NULL")
 		}
-		if index, convErr := strconv.Atoi(*element); convErr == nil {
-			segs = append(segs, jsonPathSeg{isIndex: true, index: index, fromEnd: index < 0})
-			continue
-		}
-		segs = append(segs, jsonPathSeg{key: *element})
+		segs = append(segs, jsonPathSeg{dynamic: true, element: *element})
 	}
 	return segs, nil
+}
+
+// resolveJSONBPathSegment converts a PostgreSQL path element into a concrete
+// object key or array index for the container it is applied to. Concrete steps
+// (JSON1 $ paths and index/key steps) pass through unchanged. resolved is false
+// when container is a scalar or missing; callers decide whether that is a
+// not-found, an unchanged target, or an error. strict selects whether a
+// non-integer element on an array is an error (jsonb path mutation and #-) or a
+// non-match (jsonb #>).
+func resolveJSONBPathSegment(seg jsonPathSeg, container interface{}, strict bool) (jsonPathSeg, bool, error) {
+	if !seg.dynamic {
+		return seg, true, nil
+	}
+	switch container.(type) {
+	case map[string]interface{}:
+		return jsonPathSeg{key: seg.element}, true, nil
+	case []interface{}:
+		index, err := strconv.Atoi(seg.element)
+		if err != nil {
+			if strict {
+				return seg, false, pgerror.InvalidText("path element %q is not an integer", seg.element)
+			}
+			return seg, false, nil
+		}
+		return jsonPathSeg{isIndex: true, index: index, fromEnd: index < 0}, true, nil
+	default:
+		return seg, false, nil
+	}
 }
 
 // parseJSONBJSONPath parses a JSON1 $ path for jsonb use and rejects the
@@ -985,20 +1151,35 @@ func unsupportedJSONPathShape(path string) bool {
 	return false
 }
 
-// jsonbSetPG implements PostgreSQL's jsonb_set path semantics. All steps except
-// the last must exist; the last step replaces an existing member or, when
-// create is true, adds a missing object key or appends at the array end.
+// jsonbSetPG implements PostgreSQL's jsonb_set path semantics. An empty path
+// leaves the target unchanged. All steps except the last must exist and be
+// containers; missing keys or a scalar on the way leave the target unchanged. A
+// missing array position at the last step is appended when create is true, and
+// an index before the start is clamped to the first position.
 func jsonbSetPG(node interface{}, segs []jsonPathSeg, value interface{}, create bool) (interface{}, error) {
 	if len(segs) == 0 {
-		return value, nil
+		return node, nil
 	}
-	segment := segs[0]
+	segment, resolved, err := resolveJSONBPathSegment(segs[0], node, true)
+	if err != nil {
+		return nil, err
+	}
+	if !resolved {
+		return nil, pgerror.InvalidParameter("cannot set path in scalar")
+	}
 	if len(segs) > 1 {
 		child, exists, err := jsonbPathChild(node, segment)
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
+			return node, nil
+		}
+		switch child.(type) {
+		case map[string]interface{}, []interface{}:
+		default:
+			// PostgreSQL leaves the target unchanged when an intermediate step
+			// names a scalar rather than a container.
 			return node, nil
 		}
 		updated, err := jsonbSetPG(child, segs[1:], value, create)
@@ -1011,7 +1192,7 @@ func jsonbSetPG(node interface{}, segs []jsonPathSeg, value interface{}, create 
 	switch container := node.(type) {
 	case map[string]interface{}:
 		if segment.isIndex {
-			return nil, pgerror.InvalidParameter("jsonb_set path element %d does not identify an object key", segment.index)
+			return nil, pgerror.InvalidText("path element is not an object key")
 		}
 		if _, exists := container[segment.key]; !exists && !create {
 			return node, nil
@@ -1024,16 +1205,21 @@ func jsonbSetPG(node interface{}, segs []jsonPathSeg, value interface{}, create 
 		return out, nil
 	case []interface{}:
 		if !segment.isIndex {
-			return nil, pgerror.InvalidParameter("jsonb_set path element %q does not identify an array index", segment.key)
+			return nil, pgerror.InvalidText("path element %q is not an integer", segment.key)
 		}
 		index := segment.index
 		if index < 0 {
 			index += len(container)
 		}
-		if index < 0 || index > len(container) {
-			return nil, pgerror.InvalidParameter("jsonb_set path array index %d is out of range", segment.index)
+		if index < 0 {
+			if !create {
+				return node, nil
+			}
+			out := make([]interface{}, 0, len(container)+1)
+			out = append(out, value)
+			return append(out, container...), nil
 		}
-		if index == len(container) {
+		if index >= len(container) {
 			if !create {
 				return node, nil
 			}
@@ -1044,24 +1230,36 @@ func jsonbSetPG(node interface{}, segs []jsonPathSeg, value interface{}, create 
 		out[index] = value
 		return out, nil
 	default:
-		return nil, pgerror.InvalidParameter("cannot set a jsonb path inside a %s", jsonbNodeTypeName(node))
+		return nil, pgerror.InvalidParameter("cannot set path in scalar")
 	}
 }
 
 // jsonbInsertPG implements PostgreSQL's jsonb_insert path semantics: array
-// elements are inserted before or after an index, and an object key is inserted
-// only when it is absent.
+// elements are inserted before or after an index (clamped into range), and an
+// object key is inserted only when it is absent. An existing object key is an
+// error, matching PostgreSQL.
 func jsonbInsertPG(node interface{}, segs []jsonPathSeg, value interface{}, after bool) (interface{}, error) {
 	if len(segs) == 0 {
 		return node, nil
 	}
-	segment := segs[0]
+	segment, resolved, err := resolveJSONBPathSegment(segs[0], node, true)
+	if err != nil {
+		return nil, err
+	}
+	if !resolved {
+		return nil, pgerror.InvalidParameter("cannot set path in scalar")
+	}
 	if len(segs) > 1 {
 		child, exists, err := jsonbPathChild(node, segment)
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
+			return node, nil
+		}
+		switch child.(type) {
+		case map[string]interface{}, []interface{}:
+		default:
 			return node, nil
 		}
 		updated, err := jsonbInsertPG(child, segs[1:], value, after)
@@ -1074,10 +1272,10 @@ func jsonbInsertPG(node interface{}, segs []jsonPathSeg, value interface{}, afte
 	switch container := node.(type) {
 	case map[string]interface{}:
 		if segment.isIndex {
-			return nil, pgerror.InvalidParameter("jsonb_insert path element %d does not identify an object key", segment.index)
+			return nil, pgerror.InvalidText("path element is not an object key")
 		}
 		if _, exists := container[segment.key]; exists {
-			return node, nil
+			return nil, pgerror.InvalidParameter("cannot replace existing key")
 		}
 		out := make(map[string]interface{}, len(container)+1)
 		for key, item := range container {
@@ -1087,20 +1285,23 @@ func jsonbInsertPG(node interface{}, segs []jsonPathSeg, value interface{}, afte
 		return out, nil
 	case []interface{}:
 		if !segment.isIndex {
-			return nil, pgerror.InvalidParameter("jsonb_insert path element %q does not identify an array index", segment.key)
+			return nil, pgerror.InvalidText("path element %q is not an integer", segment.key)
 		}
 		index := segment.index
 		if index < 0 {
 			index += len(container)
-			if after {
-				index++
-			}
+		}
+		if index < 0 {
+			index = 0
+		}
+		if index > len(container) {
+			index = len(container)
 		}
 		if after {
 			index++
 		}
-		if index < 0 || index > len(container) {
-			return nil, pgerror.InvalidParameter("jsonb_insert path array index %d is out of range", segment.index)
+		if index > len(container) {
+			index = len(container)
 		}
 		out := make([]interface{}, 0, len(container)+1)
 		out = append(out, container[:index]...)
@@ -1108,7 +1309,7 @@ func jsonbInsertPG(node interface{}, segs []jsonPathSeg, value interface{}, afte
 		out = append(out, container[index:]...)
 		return out, nil
 	default:
-		return nil, pgerror.InvalidParameter("cannot insert a jsonb path inside a %s", jsonbNodeTypeName(node))
+		return nil, pgerror.InvalidParameter("cannot set path in scalar")
 	}
 }
 
@@ -1421,13 +1622,6 @@ func (e *Executor) evalJSONBPatch(name string, fn *parser.FunctionCall, args []i
 		return nil, pgerror.Unsupported("%s() accepts the optional insert_after/create_if_missing argument only with a PostgreSQL text[] path; a $ path uses the JSON1 form", strings.ToLower(name))
 	}
 
-	newValueNode, err := jsonbNodeFromArg(args[2])
-	if err != nil {
-		return nil, err
-	}
-	if args[2] == nil {
-		return nil, nil
-	}
 	flag := false
 	if len(args) == 4 {
 		if args[3] == nil {
@@ -1437,7 +1631,9 @@ func (e *Executor) evalJSONBPatch(name string, fn *parser.FunctionCall, args []i
 	}
 
 	if !pgPath {
-		// JSON1 form: every path/value pair is applied in order.
+		// JSON1 form: every path/value pair is applied in order. A plain SQL
+		// string becomes a JSON string, which is the behavior this engine exposed
+		// before JSONB became native; a jsonb-typed value embeds its document.
 		mode := "set"
 		switch name {
 		case "JSONB_INSERT":
@@ -1453,12 +1649,14 @@ func (e *Executor) evalJSONBPatch(name string, fn *parser.FunctionCall, args []i
 			if pathErr != nil {
 				return nil, pathErr
 			}
-			patchValue, valueErr := jsonbNodeFromArg(args[i+1])
-			if valueErr != nil {
-				return nil, valueErr
+			var patchValue interface{}
+			if e.isJSONBExpr(functionArgAt(fn, i+1)) {
+				patchValue, err = jsonbNodeFromArg(args[i+1])
+			} else {
+				patchValue = jsonArgToNode(args[i+1])
 			}
-			if args[i+1] == nil {
-				return nil, nil
+			if err != nil {
+				return nil, err
 			}
 			node, err = jsonApplyPatch(node, segs, patchValue, mode)
 			if err != nil {
@@ -1468,6 +1666,13 @@ func (e *Executor) evalJSONBPatch(name string, fn *parser.FunctionCall, args []i
 		return jsonbEncodeNode(node)
 	}
 
+	if args[2] == nil {
+		return nil, nil
+	}
+	newValueNode, err := jsonbNodeFromArg(args[2])
+	if err != nil {
+		return nil, err
+	}
 	segs, err := jsonbPathArg(args[1])
 	if err != nil {
 		return nil, err
@@ -1499,10 +1704,14 @@ func jsonbTableFunction(name string, value interface{}) (columns, types []string
 	}
 	if value == nil {
 		switch strings.ToLower(name) {
-		case "jsonb_each", "jsonb_each_text":
+		case "jsonb_each":
 			return []string{"key", "value"}, []string{"TEXT", "JSONB"}, nil, nil
+		case "jsonb_each_text":
+			return []string{"key", "value"}, []string{"TEXT", "TEXT"}, nil, nil
 		case "jsonb_object_keys":
 			return []string{"jsonb_object_keys"}, []string{"TEXT"}, nil, nil
+		case "jsonb_array_elements_text":
+			return []string{"value"}, []string{"TEXT"}, nil, nil
 		default:
 			return []string{"value"}, []string{"JSONB"}, nil, nil
 		}

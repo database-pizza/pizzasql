@@ -635,6 +635,14 @@ func (e *Executor) arrayEqualityType(leftExpr, rightExpr parser.Expr) (string, b
 // equality); everything else keeps the engine's existing comparison rules.
 func (e *Executor) compareExprValues(op lexer.TokenType, leftExpr, rightExpr parser.Expr, left, right interface{}) (bool, error) {
 	if e.isJSONBExpr(leftExpr) || e.isJSONBExpr(rightExpr) {
+		// A jsonb comparison must not silently reinterpret a SQL number or
+		// boolean as a JSON value; PostgreSQL has no such operator.
+		if leftExpr != nil && e.isJSONBExpr(leftExpr) && !jsonbComparisonValue(left) {
+			return false, pgerror.DatatypeMismatch("jsonb comparison requires jsonb or text operands")
+		}
+		if rightExpr != nil && e.isJSONBExpr(rightExpr) && !jsonbComparisonValue(right) {
+			return false, pgerror.DatatypeMismatch("jsonb comparison requires jsonb or text operands")
+		}
 		// jsonb equality and ordering are defined on the canonical form, so a
 		// document with a different key order or number spelling compares equal.
 		leftText, err := CanonicalizeJSONB(toString(left))
@@ -645,7 +653,9 @@ func (e *Executor) compareExprValues(op lexer.TokenType, leftExpr, rightExpr par
 		if err != nil {
 			return false, err
 		}
-		return comparisonOperatorResult(op, compare(leftText, rightText))
+		// Compare exact canonical bytes; the general compare() helper would round
+		// numbers through float64 and disagree with =, DISTINCT, and @>.
+		return comparisonOperatorResult(op, strings.Compare(leftText, rightText))
 	}
 	if op == lexer.TokenEq || op == lexer.TokenNeq {
 		if typeName, ok := e.arrayEqualityType(leftExpr, rightExpr); ok {
