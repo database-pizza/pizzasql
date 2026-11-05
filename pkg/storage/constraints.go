@@ -47,16 +47,49 @@ func validateNotNull(schema *Schema, row Row) error {
 // durable NOT NULL violation, and gives it the default every other row received
 // from the backfill. An absent key is the only thing filled, so an explicit NULL
 // still does not select a default.
-func applySchemaDefaults(schema *Schema, row Row) error {
+//
+// A constant default is copied from the catalog. An expression default is
+// evaluated here instead, so a row that reaches storage without one (for
+// example a staged transaction row whose column was published later) receives a
+// value rather than freezing the DDL-time one. Ordinary INSERT/UPDATE resolve
+// expression defaults in the executor before the write; this is the fallback
+// for every other path.
+func (m *SchemaManager) applySchemaDefaults(schema *Schema, row Row) error {
 	for _, column := range schema.Columns {
 		if _, ok := rowColumnValue(row, column.Name); ok {
 			continue
 		}
-		if column.Default != nil {
-			row[column.Name] = column.Default
+		value, ok, err := m.columnDefaultValue(column)
+		if err != nil {
+			return err
+		}
+		if ok {
+			row[column.Name] = value
 		}
 	}
 	return validateNotNull(schema, row)
+}
+
+// columnDefaultValue returns the value a row receives for a column it omits.
+// A column with no default reports ok=false. DefaultExpr takes precedence over
+// Default; the two are never both set by DDL, which keeps constant defaults in
+// the catalog as values and clock-reading defaults as SQL text.
+func (m *SchemaManager) columnDefaultValue(column Column) (interface{}, bool, error) {
+	if column.DefaultExpr != "" {
+		eval := m.defaultEvaluator()
+		if eval == nil {
+			return nil, false, fmt.Errorf("column %q has a DEFAULT expression but no evaluator is installed", column.Name)
+		}
+		value, err := eval(column.DefaultExpr)
+		if err != nil {
+			return nil, false, fmt.Errorf("evaluate DEFAULT for column %q: %w", column.Name, err)
+		}
+		return value, true, nil
+	}
+	if column.Default != nil {
+		return column.Default, true, nil
+	}
+	return nil, false, nil
 }
 
 // rowColumnValue returns the value a row holds for a column, matching the column

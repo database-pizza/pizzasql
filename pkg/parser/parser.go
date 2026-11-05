@@ -873,6 +873,16 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 			return nil, err
 		}
 		stmt.Values = values
+	} else if p.curTokenIs(lexer.TokenDEFAULT) {
+		// INSERT ... DEFAULT VALUES supplies no values; one row is built from
+		// the schema defaults.
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenVALUES) {
+			return nil, p.curError("expected VALUES after DEFAULT")
+		}
+		p.nextToken()
+		stmt.DefaultValues = true
+		stmt.Values = [][]Expr{{}}
 	} else if p.curTokenIs(lexer.TokenSELECT) {
 		sel, err := p.parseSelect()
 		if err != nil {
@@ -890,7 +900,7 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 		}
 		stmt.Select = sel
 	} else {
-		return nil, p.curError("expected VALUES, SELECT, or WITH")
+		return nil, p.curError("expected VALUES, SELECT, WITH, or DEFAULT VALUES")
 	}
 
 	if p.curTokenIs(lexer.TokenON) {

@@ -23,26 +23,26 @@ func runExtendedMessage(t *testing.T, c *Connection, client net.Conn, msg *Messa
 	return m
 }
 
-func TestNonConstantDefaultRejectedOverSimpleQuery(t *testing.T) {
+func TestUnsupportedDefaultRejectedOverSimpleQuery(t *testing.T) {
 	c, client := newDataConnection(t)
-	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"), 0)})
+	msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte("CREATE TABLE t (id INTEGER PRIMARY KEY, token TEXT DEFAULT lower('x'))"), 0)})
 	if len(msgs) != 2 {
 		t.Fatalf("got %d messages, want ErrorResponse+ReadyForQuery", len(msgs))
 	}
 	if code := errorCode(msgs[0]); code != ErrCodeFeatureNotSupported {
 		t.Fatalf("error code = %q, want %q", code, ErrCodeFeatureNotSupported)
 	}
-	if message := errorField(t, msgs[0], ErrorFieldMessage); !bytes.Contains([]byte(message), []byte("constant")) {
-		t.Fatalf("error message = %q, want an explanation about constant defaults", message)
+	if message := errorField(t, msgs[0], ErrorFieldMessage); !bytes.Contains([]byte(message), []byte("non-constant")) {
+		t.Fatalf("error message = %q, want an explanation about non-constant defaults", message)
 	}
 }
 
-func TestNonConstantDefaultRejectedOverExtendedQuery(t *testing.T) {
+func TestUnsupportedDefaultRejectedOverExtendedQuery(t *testing.T) {
 	c, client := newDataConnection(t)
 
 	// Parse does not parse the SQL (it is parsed at Execute), so install the
 	// portal directly; this exercises the extended-protocol execution error path.
-	c.portals["p1"] = &portal{query: "CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"}
+	c.portals["p1"] = &portal{query: "CREATE TABLE t (id INTEGER PRIMARY KEY, token TEXT DEFAULT lower('x'))"}
 
 	execute := NewMessageBuilder()
 	execute.WriteString("p1")

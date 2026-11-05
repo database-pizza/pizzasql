@@ -137,9 +137,13 @@ const (
 
 // InsertStmt represents an INSERT statement.
 type InsertStmt struct {
-	Table             *TableRef
-	Columns           []string
-	Values            [][]Expr
+	Table   *TableRef
+	Columns []string
+	Values  [][]Expr
+	// DefaultValues is true for SQLite's INSERT ... DEFAULT VALUES, which
+	// supplies no values. Values then holds one empty row so the executor
+	// follows the normal single-row insert path.
+	DefaultValues     bool
 	Select            *SelectStmt    // INSERT ... SELECT
 	OnConflict        ConflictAction // OR REPLACE/IGNORE/etc.
 	ConflictTarget    []string

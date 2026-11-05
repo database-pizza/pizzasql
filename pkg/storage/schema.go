@@ -29,16 +29,35 @@ type Schema struct {
 
 // Column represents a column definition.
 type Column struct {
-	Name       string      `json:"name"`
-	Type       string      `json:"type"`
-	Nullable   bool        `json:"nullable"`
-	Default    interface{} `json:"default,omitempty"`
-	PrimaryKey bool        `json:"primary_key"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Nullable bool   `json:"nullable"`
+	// Default holds the evaluated constant DEFAULT. DefaultExpr holds the SQL
+	// text of a non-constant DEFAULT (CURRENT_TIMESTAMP and the other
+	// clock-reading forms) so it is evaluated on every write instead of being
+	// frozen at DDL time. Only one of the two is set; DefaultExpr takes
+	// precedence if a hand-edited catalog sets both.
+	Default     interface{} `json:"default,omitempty"`
+	DefaultExpr string      `json:"default_expr,omitempty"`
+	PrimaryKey  bool        `json:"primary_key"`
 	// GeneratedExpr holds the SQL text of a GENERATED ALWAYS AS (expr) column.
 	// GeneratedStored reports whether the value is materialized on write
 	// (STORED, the only form this engine persists) versus computed on read.
 	GeneratedExpr   string `json:"generated_expr,omitempty"`
 	GeneratedStored bool   `json:"generated_stored,omitempty"`
+}
+
+// DefaultLiteral returns the catalog representation of the column's default:
+// the evaluated constant value, or the SQL text of a non-constant default.
+// DefaultExpr takes precedence when a hand-edited catalog sets both.
+func (c Column) DefaultLiteral() interface{} {
+	if c.DefaultExpr != "" {
+		return c.DefaultExpr
+	}
+	if c.Default != nil {
+		return c.Default
+	}
+	return nil
 }
 
 // Index represents an index definition.
@@ -86,6 +105,30 @@ type SchemaManager struct {
 
 	rowIDMu    sync.Mutex
 	rowIDAlloc map[string]*rowIDAllocator
+
+	// defaultEval evaluates a persisted non-constant DEFAULT expression. The
+	// SQL executor registers one so storage can backfill ADD COLUMN rows and
+	// complete row images without importing the parser or executor.
+	defaultEvalMu sync.RWMutex
+	defaultEval   DefaultEvaluator
+}
+
+// DefaultEvaluator evaluates a persisted non-constant DEFAULT expression, such
+// as CURRENT_TIMESTAMP, to the value a row receives. Expression defaults are
+// never frozen at DDL time: each write reads the clock again.
+type DefaultEvaluator func(expression string) (interface{}, error)
+
+// SetDefaultEvaluator installs the evaluator used for expression defaults.
+func (m *SchemaManager) SetDefaultEvaluator(eval DefaultEvaluator) {
+	m.defaultEvalMu.Lock()
+	m.defaultEval = eval
+	m.defaultEvalMu.Unlock()
+}
+
+func (m *SchemaManager) defaultEvaluator() DefaultEvaluator {
+	m.defaultEvalMu.RLock()
+	defer m.defaultEvalMu.RUnlock()
+	return m.defaultEval
 }
 
 // BeginTransaction is retained for API compatibility. Buffered per-session
@@ -992,7 +1035,7 @@ func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) er
 
 	// A required column with nothing to write into rows that already exist
 	// cannot be declared on a populated table.
-	if !column.Nullable && column.Default == nil {
+	if !column.Nullable && !columnHasDefault(column) {
 		hasRows, err := m.tableHasRows(table)
 		if err != nil {
 			return err
@@ -1002,13 +1045,20 @@ func (m *SchemaManager) AddColumn(table string, column Column, unique *Index) er
 		}
 	}
 
-	if column.Default != nil {
-		if err := m.rewriteRows(table, func(row Row) bool {
+	if columnHasDefault(column) {
+		// Each rewritten row evaluates the default at rewrite time. That is
+		// indistinguishable from a constant default except for a clock-reading
+		// default, which stamps the rows this statement backfills.
+		if err := m.applyRows(table, func(row Row) (bool, error) {
 			if _, ok := rowColumnValue(row, column.Name); ok {
-				return false
+				return false, nil
 			}
-			row[column.Name] = column.Default
-			return true
+			value, _, err := m.columnDefaultValue(column)
+			if err != nil {
+				return false, err
+			}
+			row[column.Name] = value
+			return true, nil
 		}); err != nil {
 			return err
 		}
@@ -1546,7 +1596,10 @@ func (m *SchemaManager) applyRows(table string, transform func(Row) (bool, error
 // values would duplicate across existing rows. It reads rows as they will look
 // after the rewrite (a row that already carries the field from an interrupted
 // earlier attempt keeps its value) and mirrors ValidateUniqueIndex for a single
-// plain column: NULLs do not collide. The caller holds the table's exclusive
+// plain column: NULLs do not collide. An expression default is evaluated once
+// per row here, like the rewrite that follows; a clock-reading default can
+// still cross a second boundary between the two scans, so this prediction is
+// best effort for that combination. The caller holds the table's exclusive
 // gate, so no writer can insert a conflicting row between this check and the
 // publication of the index.
 func (m *SchemaManager) validateAddColumnUnique(table string, column Column, index *Index) error {
@@ -1554,7 +1607,11 @@ func (m *SchemaManager) validateAddColumnUnique(table string, column Column, ind
 	return m.applyRows(table, func(row Row) (bool, error) {
 		value, ok := rowColumnValue(row, column.Name)
 		if !ok {
-			value = column.Default
+			var err error
+			value, _, err = m.columnDefaultValue(column)
+			if err != nil {
+				return false, err
+			}
 		}
 		if value == nil {
 			return false, nil
@@ -1566,6 +1623,12 @@ func (m *SchemaManager) validateAddColumnUnique(table string, column Column, ind
 		seen[encoded] = struct{}{}
 		return false, nil
 	})
+}
+
+// columnHasDefault reports whether the column contributes a value to rows that
+// omit it, whether that default is a stored constant or an expression.
+func columnHasDefault(column Column) bool {
+	return column.Default != nil || column.DefaultExpr != ""
 }
 
 // tableHasRows reports whether a table holds at least one durable row.

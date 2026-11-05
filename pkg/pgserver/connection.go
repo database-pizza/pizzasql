@@ -739,7 +739,7 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 			for i, column := range schema.Columns {
 				rows = append(rows, map[string]interface{}{
 					"table_catalog": c.database, "table_schema": "public", "table_name": table,
-					"column_name": column.Name, "ordinal_position": int64(i + 1), "column_default": column.Default,
+					"column_name": column.Name, "ordinal_position": int64(i + 1), "column_default": column.DefaultLiteral(),
 					"is_nullable": yesNo(column.Nullable), "data_type": strings.ToLower(column.Type),
 				})
 			}

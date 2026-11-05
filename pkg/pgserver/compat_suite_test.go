@@ -123,7 +123,10 @@ func TestCompatibilitySuite(t *testing.T) {
 
 	expectCode("constraints.unique_23505", `INSERT INTO accounts (id, email) VALUES (3, 'a@x')`, "23505")
 	expectCode("ddl.composite_pk_0A000", `CREATE TABLE bad_pk (a INTEGER, b INTEGER, PRIMARY KEY (a, b))`, "0A000")
-	expectCode("ddl.nonconstant_default_0A000", `CREATE TABLE bad_default (id INTEGER PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`, "0A000")
+	expectOK("ddl.timestamp_default", `CREATE TABLE stamped (id INTEGER PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`)
+	expectOK("ddl.timestamp_default_insert", `INSERT INTO stamped (id) VALUES (1)`)
+	expectRows("ddl.timestamp_default_applied", `SELECT count(*) FROM stamped WHERE created_at IS NOT NULL`, "1")
+	expectCode("ddl.nonconstant_default_0A000", `CREATE TABLE bad_default (id INTEGER PRIMARY KEY, token TEXT DEFAULT lower('x'))`, "0A000")
 	expectCode("locking.for_update_0A000", `SELECT * FROM accounts FOR UPDATE`, "0A000")
 	expectCode("arrays.any_0A000", `SELECT * FROM accounts WHERE id = ANY('{1,2}')`, "0A000")
 

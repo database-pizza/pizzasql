@@ -535,8 +535,12 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 		}
 	}
 
-	// Validate VALUES
+	// Validate VALUES. INSERT ... DEFAULT VALUES supplies no values at all, so
+	// the placeholder empty row intentionally does not match the column count.
 	for _, row := range stmt.Values {
+		if stmt.DefaultValues {
+			continue
+		}
 		if len(row) != len(targetCols) {
 			return &AnalysisError{
 				Type:    ErrTypeMismatch,
