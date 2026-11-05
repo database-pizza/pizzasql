@@ -305,6 +305,20 @@ func TestParseInsertMultipleRows(t *testing.T) {
 	}
 }
 
+func TestParseInsertDefaultValues(t *testing.T) {
+	stmt := parse(t, "INSERT INTO users DEFAULT VALUES")
+	ins, ok := stmt.(*InsertStmt)
+	if !ok {
+		t.Fatalf("expected InsertStmt, got %T", stmt)
+	}
+	if !ins.DefaultValues {
+		t.Fatal("expected DefaultValues to be set")
+	}
+	if len(ins.Values) != 1 || len(ins.Values[0]) != 0 {
+		t.Fatalf("values = %v, want one empty row", ins.Values)
+	}
+}
+
 func TestParseInsertOrReplace(t *testing.T) {
 	stmt := parse(t, "INSERT OR REPLACE INTO users (id, name) VALUES (1, 'John')")
 	ins := stmt.(*InsertStmt)

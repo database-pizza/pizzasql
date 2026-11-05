@@ -1,10 +1,7 @@
 package executor
 
 import (
-	"errors"
 	"testing"
-
-	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 )
 
 // TestGoatCounterSQLiteMigrations runs the shapes of GoatCounter's SQLite
@@ -85,12 +82,10 @@ func TestGoatCounterMigrationRebuildShape(t *testing.T) {
 		user_id INTEGER PRIMARY KEY AUTOINCREMENT,
 		site_id INTEGER NOT NULL,
 		email VARCHAR NOT NULL,
-		last_report_at TIMESTAMP NOT NULL DEFAULT ''
+		last_report_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 	)`)
-	// GoatCounter's real migration declares DEFAULT current_timestamp. That is
-	// rejected (see TestGoatCounterMigrationRejectsFrozenTimestampDefault), so
-	// this rebuild-shape test uses a constant default to keep exercising the
-	// copy/drop/rename/index steps.
+	// GoatCounter's real migration declares DEFAULT current_timestamp; the rows
+	// copied below omit it and receive the INSERT ... SELECT evaluation.
 	execMust(t, e, `INSERT INTO users2 (user_id, site_id, email)
 		SELECT user_id, site_id, email FROM users`)
 	execMust(t, e, "DROP TABLE users")
@@ -108,22 +103,25 @@ func TestGoatCounterMigrationRebuildShape(t *testing.T) {
 	}
 }
 
-// TestGoatCounterMigrationRejectsFrozenTimestampDefault records the deliberate
-// break: the GoatCounter schema uses a non-constant timestamp default, which the
-// engine now rejects instead of freezing at DDL time. A fresh GoatCounter tenant
-// cannot be bootstrapped until that schema is changed or a legacy import mode is
-// designed.
-func TestGoatCounterMigrationRejectsFrozenTimestampDefault(t *testing.T) {
+// TestGoatCounterMigrationAcceptsTimestampDefault covers the shape the real
+// 2021-12-09 migration declares: a NOT NULL column with a non-constant
+// timestamp default. The default is evaluated on write, not frozen at DDL time,
+// so every inserted row gets a value.
+func TestGoatCounterMigrationAcceptsTimestampDefault(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
-	_, err := execSQL(e, `CREATE TABLE users2 (
+	if _, err := execSQL(e, `CREATE TABLE users2 (
 		user_id INTEGER PRIMARY KEY AUTOINCREMENT,
 		site_id INTEGER NOT NULL,
 		email VARCHAR NOT NULL,
 		last_report_at TIMESTAMP NOT NULL DEFAULT current_timestamp
-	)`)
-	if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
-		t.Fatalf("error = %v, want ErrFeatureNotSupported", err)
+	)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	execMust(t, e, "INSERT INTO users2 (site_id, email) VALUES (1, 'a@x')")
+	res := execMust(t, e, "SELECT count(*) FROM users2 WHERE last_report_at IS NOT NULL")
+	if got := res.Rows[0][0]; got != int64(1) {
+		t.Fatalf("rows with a timestamp default = %v, want 1", got)
 	}
 }
 

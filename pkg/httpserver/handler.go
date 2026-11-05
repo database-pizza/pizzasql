@@ -387,7 +387,7 @@ func (s *Server) handleSchemaTable(w http.ResponseWriter, r *http.Request) {
 			"type":       col.Type,
 			"nullable":   col.Nullable,
 			"primaryKey": col.PrimaryKey,
-			"default":    col.Default,
+			"default":    col.DefaultLiteral(),
 		}
 	}
 

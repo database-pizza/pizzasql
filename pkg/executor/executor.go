@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
@@ -83,6 +84,11 @@ type Executor struct {
 	lastInsertRowID int64 // rowid of the most recent successful INSERT
 	changes         int64 // rows changed by the most recent INSERT/UPDATE/DELETE
 	totalChanges    int64 // rows changed since this connection opened (monotonic)
+
+	// clock supplies the time for non-constant DEFAULT evaluation. Nil means
+	// time.Now; tests inject it to observe per-statement evaluation without
+	// depending on the wall clock.
+	clock func() time.Time
 }
 
 type correlatedAggCache struct {
@@ -124,6 +130,14 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 	// evaluator is a package function with no per-connection state, so
 	// registering it here is idempotent and safe across concurrent executors.
 	table.SetExpressionEvaluator(EvalStoredExpression)
+	// Non-constant DEFAULT expressions are likewise stored as SQL text; storage
+	// evaluates them when it backfills ADD COLUMN rows or completes a row image
+	// that predates the column. Storage samples the clock once per ALTER
+	// statement through this executor, so the session clock also drives
+	// storage-side evaluation; ordinary writes evaluate defaults once per
+	// statement in this package.
+	schema.SetDefaultEvaluator(evalDefaultExpressionAt)
+	schema.SetDefaultClock(executor.statementNow)
 	schema.SetCheckEvaluator(EvalCheckExpression)
 
 	// Register the main database
@@ -2736,6 +2750,13 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 			}
 		}
 	}
+	// Expression defaults are evaluated once per statement, so all rows of a
+	// multi-row INSERT share one value and the next statement reads the clock
+	// again. Constant defaults are applied by storage from the catalog.
+	defaults, err := e.statementDefaults(schema)
+	if err != nil {
+		return nil, err
+	}
 	force := stmt.OnConflict == parser.ConflictReplace
 
 	// INSERT ... SELECT: materialise the SELECT result and bulk-insert.
@@ -2767,6 +2788,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 					dst++
 				}
 			}
+			applyRowDefaults(row, defaults)
 			if len(generated) > 0 {
 				if err := e.ensureGeneratedRowID(tableName, schema, row); err != nil {
 					return nil, err
@@ -2844,6 +2866,7 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 				}
 			}
 
+			applyRowDefaults(row, defaults)
 			if len(generated) > 0 {
 				if err := e.ensureGeneratedRowID(tableName, schema, row); err != nil {
 					return err
@@ -3709,11 +3732,12 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 				col.Nullable = false
 			case parser.ConstraintDefault:
 				if constraint.Default != nil {
-					val, err := constantDefaultValue(e, col.Name, constraint.Default)
+					val, exprText, err := defaultColumnValue(e, col.Name, constraint.Default)
 					if err != nil {
 						return nil, err
 					}
 					col.Default = val
+					col.DefaultExpr = exprText
 				}
 			case parser.ConstraintAutoIncrement:
 				schema.AutoIncrement = true
@@ -4125,10 +4149,12 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 	}
 }
 
-// executeAlterTableAddColumn adds a column to a table. A constant DEFAULT is
-// written into every existing row (see SchemaManager.AddColumn), so the column
-// reads the default on rows that predate the statement as well as on later
-// INSERTs that omit it.
+// executeAlterTableAddColumn adds a column to a table. A DEFAULT is written
+// into every existing row (see SchemaManager.AddColumn), so the column reads
+// the default on rows that predate the statement as well as on later INSERTs
+// that omit it. A constant default is copied from the catalog; a non-constant
+// one is evaluated at a single instant sampled for the ALTER statement, so
+// validation and the backfill write the same CURRENT_TIMESTAMP value.
 func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddColumnAction) (*Result, error) {
 	schema, err := e.schema.GetSchema(table)
 	if err != nil {
@@ -4162,11 +4188,12 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 			uniqueConstraint = &unique
 		case parser.ConstraintDefault:
 			if constraint.Default != nil {
-				val, err := constantDefaultValue(e, col.Name, constraint.Default)
+				val, exprText, err := defaultColumnValue(e, col.Name, constraint.Default)
 				if err != nil {
 					return nil, err
 				}
 				col.Default = val
+				col.DefaultExpr = exprText
 			}
 		case parser.ConstraintCheck:
 			// Validated with the other CHECK predicates once the column shape is
@@ -4192,7 +4219,7 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 	// staged in an open transaction are invisible to that scan, so reject them
 	// here as well; the commit re-validates them against the schema that is
 	// current by then.
-	if !col.Nullable && col.Default == nil {
+	if !col.Nullable && col.Default == nil && col.DefaultExpr == "" {
 		stagedRows, err := e.session.CountFast(table)
 		if err != nil {
 			return nil, err
@@ -4732,7 +4759,7 @@ func (e *Executor) pragmaTableInfo(tableName string) (*Result, error) {
 		if col.PrimaryKey {
 			pk = 1
 		}
-		result.AddRow(int64(i), col.Name, col.Type, int64(notnull), col.Default, int64(pk))
+		result.AddRow(int64(i), col.Name, col.Type, int64(notnull), col.DefaultLiteral(), int64(pk))
 	}
 
 	return result, nil

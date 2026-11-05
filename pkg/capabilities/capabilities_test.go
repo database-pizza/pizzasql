@@ -68,7 +68,23 @@ func TestAddColumnBackfillIsAdvertised(t *testing.T) {
 		t.Fatalf("add_column_backfill status = %q, want rewrites_rows", doc.DDL.AddColumnBackfill.Status)
 	}
 	if doc.DDL.AddColumn.Status == "metadata_only" {
-		t.Fatalf("add_column status = %q, but a constant DEFAULT rewrites rows", doc.DDL.AddColumn.Status)
+		t.Fatalf("add_column status = %q, but a DEFAULT rewrites rows", doc.DDL.AddColumn.Status)
+	}
+}
+
+// The capability document must describe the current default semantics: constant
+// and whitelisted clock defaults are supported, the clock ones are evaluated on
+// write, and only the remaining non-constant forms are rejected.
+func TestNonConstantDefaultsAreAdvertisedAsEvaluatedAtWriteTime(t *testing.T) {
+	defaults := Current().Constraints.DefaultValues
+	if !defaults.Supported {
+		t.Fatalf("default_values = %+v, want supported", defaults)
+	}
+	if defaults.Status != "evaluated_at_write_time" {
+		t.Fatalf("default_values status = %q, want evaluated_at_write_time", defaults.Status)
+	}
+	if defaults.SQLState != "0A000" {
+		t.Fatalf("default_values SQLSTATE = %q, want 0A000 for the remaining rejected forms", defaults.SQLState)
 	}
 }
 

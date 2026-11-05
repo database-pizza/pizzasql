@@ -303,7 +303,7 @@ func (e *Executor) pragmaTableXInfo(table string) (*Result, error) {
 				hidden = 2
 			}
 		}
-		result.AddRow(int64(i), col.Name, col.Type, notnull, col.Default, pk, hidden)
+		result.AddRow(int64(i), col.Name, col.Type, notnull, col.DefaultLiteral(), pk, hidden)
 	}
 	return result, nil
 }
@@ -351,6 +351,11 @@ func recreateColumnDef(s *storage.Schema, col storage.Column) string {
 	if col.Default != nil {
 		b.WriteString(" DEFAULT ")
 		b.WriteString(sqlLiteral(col.Default))
+	} else if col.DefaultExpr != "" {
+		// The catalog stores the expression text, so the rebuilt DDL keeps the
+		// default non-constant instead of freezing the value it had at DDL time.
+		b.WriteString(" DEFAULT ")
+		b.WriteString(col.DefaultExpr)
 	}
 	if col.GeneratedExpr != "" {
 		b.WriteString(" GENERATED ALWAYS AS (")

@@ -69,14 +69,21 @@ func formatSQLiteReal(f float64) string {
 // column of that name) to support DEFAULT current_timestamp and expressions
 // like strftime('%Y', current_timestamp).
 func sqliteCurrentTimeValue(name string) (interface{}, bool) {
-	now := time.Now().UTC()
+	return sqliteCurrentTimeValueAt(name, time.Now().UTC())
+}
+
+// sqliteCurrentTimeValueAt resolves the SQLite date/time keywords against now.
+// The values are UTC text in the engine's datetime storage convention, which
+// is also what a non-constant DEFAULT stores and what the timestamptz OID path
+// sends.
+func sqliteCurrentTimeValueAt(name string, now time.Time) (interface{}, bool) {
 	switch strings.ToLower(name) {
 	case "current_timestamp":
-		return now.Format("2006-01-02 15:04:05"), true
+		return now.UTC().Format("2006-01-02 15:04:05"), true
 	case "current_date":
-		return now.Format("2006-01-02"), true
+		return now.UTC().Format("2006-01-02"), true
 	case "current_time":
-		return now.Format("15:04:05"), true
+		return now.UTC().Format("15:04:05"), true
 	}
 	return nil, false
 }

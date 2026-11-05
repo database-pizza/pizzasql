@@ -426,7 +426,7 @@ func (s *Session) applyOverlaySchemaDefaults() error {
 			if entry.absent {
 				continue
 			}
-			if err := applySchemaDefaults(schema, entry.row); err != nil {
+			if err := s.schema.applySchemaDefaults(schema, entry.row); err != nil {
 				return err
 			}
 			if err := s.schema.validateChecks(schema, entry.row); err != nil {

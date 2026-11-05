@@ -132,8 +132,12 @@ func generateCreateTable(schema *storage.Schema) string {
 			sb.WriteString(" NOT NULL")
 		}
 
-		// Add DEFAULT value
-		if col.Default != nil {
+		// Add DEFAULT value. A non-constant default is emitted as its stored SQL
+		// text so the dump keeps evaluating it instead of freezing a value.
+		if col.DefaultExpr != "" {
+			sb.WriteString(" DEFAULT ")
+			sb.WriteString(col.DefaultExpr)
+		} else if col.Default != nil {
 			sb.WriteString(" DEFAULT ")
 			sb.WriteString(formatValue(col.Default, col.Type))
 		}

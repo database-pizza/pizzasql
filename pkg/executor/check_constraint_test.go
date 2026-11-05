@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
@@ -256,6 +257,122 @@ func TestAlterTableAddColumnCheckValidatesExistingRows(t *testing.T) {
 	execMust(t, e, "ALTER TABLE t ADD COLUMN note TEXT CHECK (LENGTH(note) > 0)")
 	if res := execMust(t, e, "SELECT id, note FROM t ORDER BY id"); res.RowCount != 2 || res.Rows[0][1] != nil {
 		t.Fatalf("rows after nullable ADD COLUMN = %v, want NULL notes", res.Rows)
+	}
+}
+
+// A clock-reading default must reach an ADD COLUMN ... CHECK predicate as the
+// value the backfill writes, not as NULL (which CHECK always passes). Validation
+// resolves the default at the statement instant, and the rewrite writes that
+// same instant, so every backfilled row carries the value the predicate checked.
+func TestAlterTableAddColumnCheckSeesClockDefault(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	calls := 0
+	e.clock = func() time.Time {
+		at := base.Add(time.Duration(calls) * time.Second)
+		calls++
+		return at
+	}
+
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
+	execMust(t, e, "ALTER TABLE t ADD COLUMN ts TEXT DEFAULT CURRENT_TIMESTAMP CHECK (ts IS NOT NULL)")
+
+	if calls != 1 {
+		t.Fatalf("clock sampled %d times, want once per ALTER statement", calls)
+	}
+	res := execMust(t, e, "SELECT id, ts FROM t ORDER BY id")
+	if res.RowCount != 2 {
+		t.Fatalf("rows = %d, want 2", res.RowCount)
+	}
+	if got, want := res.Rows[0][1], "2026-01-02 03:04:05"; got != want {
+		t.Fatalf("row 1 ts = %v, want the statement instant %q", got, want)
+	}
+	if res.Rows[0][1] != res.Rows[1][1] {
+		t.Fatalf("timestamps %v and %v differ; the backfill must use one statement instant", res.Rows[0][1], res.Rows[1][1])
+	}
+
+	stored, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if _, ok := stored.GetColumn("ts"); !ok {
+		t.Fatal("ADD COLUMN ... CHECK published no column")
+	}
+	if len(stored.Checks) != 1 {
+		t.Fatalf("checks = %+v, want 1", stored.Checks)
+	}
+
+	// A clock default that violates the predicate rejects the DDL. NULL passes
+	// CHECK, so this also proves the predicate saw the evaluated value.
+	e.clock = newTestClock().Now
+	_, err = execSQL(e, "ALTER TABLE t ADD COLUMN bad_ts TEXT DEFAULT CURRENT_TIMESTAMP CHECK (bad_ts < '2026-01-02 03:04:05')")
+	requireCheckViolation(t, err, "")
+	stored, err = schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema after rejected DDL: %v", err)
+	}
+	if _, ok := stored.GetColumn("bad_ts"); ok {
+		t.Fatal("rejected ADD COLUMN ... CHECK left the clock-default column in the schema")
+	}
+	if len(stored.Checks) != 1 {
+		t.Fatalf("checks after rejected DDL = %+v, want the original one", stored.Checks)
+	}
+}
+
+// One instant is sampled per ALTER statement and shared by the CHECK validation
+// and the rewrite. A stepping clock reproduces the old race: a second sample in
+// the rewrite could cross a literal boundary and publish a row that violates the
+// predicate the statement just validated.
+func TestAlterTableAddColumnCheckUsesOneInstantForValidationAndRewrite(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	boundary := "2026-01-02 03:04:06"
+	calls := 0
+	e.clock = func() time.Time {
+		at := base.Add(time.Duration(calls) * time.Second)
+		calls++
+		return at
+	}
+
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+	execMust(t, e, "ALTER TABLE t ADD COLUMN ts TEXT DEFAULT CURRENT_TIMESTAMP CHECK (ts < '"+boundary+"')")
+
+	if calls != 1 {
+		t.Fatalf("clock sampled %d times, want one instant per ALTER statement", calls)
+	}
+	res := execMust(t, e, "SELECT ts FROM t WHERE id = 1")
+	if got := res.Rows[0][0]; got == nil || got == boundary || compare(got, boundary) >= 0 {
+		t.Fatalf("backfilled ts = %v, want the pre-boundary statement instant %q", got, base.Format("2006-01-02 15:04:05"))
+	}
+	if len(execMust(t, e, "SELECT ts FROM t").Rows) != 1 {
+		t.Fatal("ADD COLUMN ... CHECK published an unexpected row set")
+	}
+}
+
+// A constant default that violates an ADD COLUMN ... CHECK still fails with
+// 23514 and publishes nothing.
+func TestAlterTableAddColumnCheckRejectsViolatingConstantDefault(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+
+	_, err := execSQL(e, "ALTER TABLE t ADD COLUMN n INTEGER DEFAULT -1 CHECK (n >= 0)")
+	requireCheckViolation(t, err, "")
+
+	stored, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if _, ok := stored.GetColumn("n"); ok {
+		t.Fatal("rejected ADD COLUMN ... CHECK left the column in the schema")
+	}
+	if len(stored.Checks) != 0 {
+		t.Fatalf("checks = %+v, want none", stored.Checks)
 	}
 }
 

@@ -535,8 +535,15 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 		}
 	}
 
-	// Validate VALUES
+	// Validate VALUES. INSERT ... DEFAULT VALUES supplies no values at all, so
+	// the placeholder empty row intentionally does not match the column count.
+	// SQLite rejects the column-list form (INSERT INTO t (n) DEFAULT VALUES with
+	// "0 values for 1 columns"); PizzaSQL accepts it and fills every column from
+	// the schema defaults. This is a documented compatibility deviation.
 	for _, row := range stmt.Values {
+		if stmt.DefaultValues {
+			continue
+		}
 		if len(row) != len(targetCols) {
 			return &AnalysisError{
 				Type:    ErrTypeMismatch,

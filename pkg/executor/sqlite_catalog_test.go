@@ -190,6 +190,41 @@ func TestRecreateCreateTableSQLQuotesIdentifiers(t *testing.T) {
 	}
 }
 
+func TestRecreateCreateTableSQLKeepsDefaultExpression(t *testing.T) {
+	s := &storage.Schema{
+		Name: "t",
+		Columns: []storage.Column{
+			{Name: "created_at", Type: "TIMESTAMP", Nullable: false, DefaultExpr: "CURRENT_TIMESTAMP"},
+		},
+	}
+	got := recreateCreateTableSQL(s)
+	if !strings.Contains(got, "DEFAULT CURRENT_TIMESTAMP") {
+		t.Fatalf("rebuilt DDL lost the default expression: %q", got)
+	}
+}
+
+// The catalog read must expose the persisted expression text, exactly as SQLite
+// reports it for a non-constant default.
+func TestPragmaTableInfoReportsDefaultExpression(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+
+	res := execMust(t, e, "PRAGMA table_info('t')")
+	if len(res.Rows) != 2 {
+		t.Fatalf("table_info rows = %d, want 2", len(res.Rows))
+	}
+	if got := res.Rows[1][4]; got != "CURRENT_TIMESTAMP" {
+		t.Fatalf("dflt_value = %v, want CURRENT_TIMESTAMP", got)
+	}
+
+	master := execMust(t, e, "SELECT sql FROM sqlite_master WHERE type='table' AND name='t'")
+	sql, _ := master.Rows[0][0].(string)
+	if !strings.Contains(sql, "DEFAULT CURRENT_TIMESTAMP") {
+		t.Fatalf("sqlite_master SQL = %q, want the default expression", sql)
+	}
+}
+
 func TestRecreateCreateTableSQLStripsRowID(t *testing.T) {
 	s := &storage.Schema{
 		Name:       "t",

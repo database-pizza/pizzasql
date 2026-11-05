@@ -537,8 +537,15 @@ func (m *TableManager) prepareInsert(table string, row Row) (Row, string, error)
 		}
 	}
 	for _, col := range schema.Columns {
-		if _, ok := normalizedRow[col.Name]; !ok && col.Default != nil {
-			normalizedRow[col.Name] = col.Default
+		if _, ok := normalizedRow[col.Name]; ok {
+			continue
+		}
+		value, hasDefault, err := m.schema.columnDefaultValue(col, m.schema.defaultNow())
+		if err != nil {
+			return nil, "", err
+		}
+		if hasDefault {
+			normalizedRow[col.Name] = value
 		}
 	}
 
@@ -595,7 +602,7 @@ func (m *TableManager) InsertWithRowID(table string, row Row) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := applySchemaDefaults(schema, nr); err != nil {
+	if err := m.schema.applySchemaDefaults(schema, nr); err != nil {
 		return 0, err
 	}
 	if err := m.schema.validateChecks(schema, nr); err != nil {
@@ -718,8 +725,15 @@ func (m *TableManager) InsertBulkWithLastRowID(table string, rows []Row) (int, i
 			}
 		}
 		for _, col := range schema.Columns {
-			if _, ok := nr[col.Name]; !ok && col.Default != nil {
-				nr[col.Name] = col.Default
+			if _, ok := nr[col.Name]; ok {
+				continue
+			}
+			value, hasDefault, err := m.schema.columnDefaultValue(col, m.schema.defaultNow())
+			if err != nil {
+				return 0, 0, err
+			}
+			if hasDefault {
+				nr[col.Name] = value
 			}
 		}
 		var rowid int64
@@ -1102,7 +1116,7 @@ func (m *TableManager) UpdateByPK(table, pk string, updateFn func(Row) (Row, err
 		}
 	}
 
-	if err := applySchemaDefaults(schema, row); err != nil {
+	if err := m.schema.applySchemaDefaults(schema, row); err != nil {
 		return nil, false, err
 	}
 	if err := m.schema.validateChecks(schema, row); err != nil {
