@@ -9,17 +9,18 @@ import (
 
 // SQLSTATE codes used by PizzaSQL's protocol and HTTP surfaces.
 const (
-	CodeFeatureNotSupported  = "0A000"
-	CodeInvalidText          = "22P02"
-	CodeInvalidParameter     = "22023"
-	CodeDatatypeMismatch     = "42804"
-	CodeUniqueViolation      = "23505"
-	CodeForeignKeyViolation  = "23503"
-	CodeCheckViolation       = "23514"
-	CodeSerializationFailure = "40001"
-	CodeSyntaxError          = "42601"
-	CodeUndefinedTable       = "42P01"
-	CodeInternalError        = "XX000"
+	CodeFeatureNotSupported    = "0A000"
+	CodeInvalidText            = "22P02"
+	CodeInvalidParameter       = "22023"
+	CodeDatatypeMismatch       = "42804"
+	CodeUniqueViolation        = "23505"
+	CodeForeignKeyViolation    = "23503"
+	CodeCheckViolation         = "23514"
+	CodeSerializationFailure   = "40001"
+	CodeSyntaxError            = "42601"
+	CodeUndefinedTable         = "42P01"
+	CodeInvalidColumnReference = "42P10"
+	CodeInternalError          = "XX000"
 )
 
 // ErrUndefinedTable marks a reference to a relation or type name that does not
@@ -65,6 +66,17 @@ var ErrInvalidParameter = errors.New("invalid parameter value")
 // client-facing explanation of the rejected value.
 func InvalidParameter(format string, args ...interface{}) error {
 	return fmt.Errorf("%w: %s", ErrInvalidParameter, fmt.Sprintf(format, args...))
+}
+
+// ErrInvalidColumnReference marks a reference whose shape does not match the
+// relation it names, such as a table-function column alias list with the wrong
+// arity. Protocol layers map it to SQLSTATE 42P10 (invalid_column_reference).
+var ErrInvalidColumnReference = errors.New("invalid column reference")
+
+// InvalidColumnReference returns an error that wraps
+// ErrInvalidColumnReference with a client-facing explanation.
+func InvalidColumnReference(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrInvalidColumnReference, fmt.Sprintf(format, args...))
 }
 
 // ErrDatatypeMismatch marks a value whose type is wrong for the operation it is

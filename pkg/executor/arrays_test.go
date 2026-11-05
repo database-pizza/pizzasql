@@ -969,3 +969,102 @@ func TestViewArrayTyping(t *testing.T) {
 		}
 	}
 }
+
+func TestTableFunctionColumnAliasList(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+
+	res := execMust(t, e, `SELECT unnest FROM unnest(ARRAY[1,2,3]) AS t(unnest)`)
+	if len(res.Columns) != 1 || res.Columns[0] != "unnest" {
+		t.Fatalf("aliased unnest columns = %v, want [unnest]", res.Columns)
+	}
+	if res.RowCount != 3 || res.Rows[2][0] != int64(3) {
+		t.Fatalf("aliased unnest rows = %v", res.Rows)
+	}
+
+	res = execMust(t, e, `SELECT t.n FROM unnest(ARRAY[10,20,30]) AS t(n) WHERE n > 10 ORDER BY n`)
+	if res.RowCount != 2 || res.Rows[0][0] != int64(20) || res.Rows[1][0] != int64(30) {
+		t.Fatalf("aliased unnest WHERE rows = %v", res.Rows)
+	}
+	if len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != "INTEGER" {
+		t.Fatalf("aliased unnest column type = %v, want INTEGER", res.ColumnTypes)
+	}
+
+	res = execMust(t, e, `SELECT n FROM unnest('{a,b}'::TEXT[]) AS t(n) WHERE n = 'b'`)
+	if res.RowCount != 1 || res.Rows[0][0] != "b" {
+		t.Fatalf("aliased text unnest rows = %v", res.Rows)
+	}
+
+	_, err := execSQL(e, `SELECT * FROM unnest(ARRAY[1]) AS t(a, b)`)
+	if !errors.Is(err, pgerror.ErrInvalidColumnReference) {
+		t.Fatalf("alias arity error = %v, want ErrInvalidColumnReference", err)
+	}
+}
+
+func TestArrayContainment(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, `CREATE TABLE t (
+		id INTEGER PRIMARY KEY,
+		nums INTEGER[],
+		tags TEXT[],
+		flags BOOLEAN[],
+		exact NUMERIC[]
+	)`)
+	execMust(t, e, `INSERT INTO t VALUES
+		(1, '{1,2,3}', '{a,b}', '{t,f}', '{1.10,3}'),
+		(2, '{1,NULL}', '{NULL,"x"}', NULL, NULL),
+		(3, '{}', '{}', '{}', '{}'),
+		(4, NULL, NULL, NULL, NULL)`)
+
+	cases := []struct {
+		sql  string
+		want interface{}
+	}{
+		// Each contained element needs some containing element; duplicates are
+		// irrelevant.
+		{`SELECT nums @> ARRAY[1] FROM t WHERE id = 1`, true},
+		{`SELECT nums @> ARRAY[3,1] FROM t WHERE id = 1`, true},
+		{`SELECT nums @> ARRAY[2,2] FROM t WHERE id = 1`, true},
+		{`SELECT nums @> ARRAY[4] FROM t WHERE id = 1`, false},
+		{`SELECT nums <@ ARRAY[3,2,1,5] FROM t WHERE id = 1`, true},
+		{`SELECT ARRAY[3,2,1,5] @> nums FROM t WHERE id = 1`, true},
+		// Empty arrays: the empty array is contained by everything.
+		{`SELECT nums @> ARRAY[]::INTEGER[] FROM t WHERE id = 1`, true},
+		{`SELECT nums @> ARRAY[1] FROM t WHERE id = 3`, false},
+		{`SELECT nums @> ARRAY[]::INTEGER[] FROM t WHERE id = 3`, true},
+		{`SELECT nums <@ ARRAY[1] FROM t WHERE id = 3`, true},
+		// NULL elements only match other NULL elements.
+		{`SELECT nums @> ARRAY[NULL]::INTEGER[] FROM t WHERE id = 2`, true},
+		{`SELECT nums @> ARRAY[1] FROM t WHERE id = 2`, true},
+		{`SELECT nums @> ARRAY[2] FROM t WHERE id = 2`, false},
+		{`SELECT nums @> ARRAY[1, NULL]::INTEGER[] FROM t WHERE id = 2`, true},
+		{`SELECT nums @> ARRAY[1, NULL]::INTEGER[] FROM t WHERE id = 1`, false},
+		// A NULL operand yields NULL.
+		{`SELECT nums @> NULL FROM t WHERE id = 1`, nil},
+		{`SELECT NULL::INTEGER[] @> nums FROM t WHERE id = 1`, nil},
+		{`SELECT nums @> ARRAY[1] FROM t WHERE id = 4`, nil},
+		// Other element types and a text array literal on the right.
+		{`SELECT tags @> ARRAY['a'] FROM t WHERE id = 1`, true},
+		{`SELECT tags @> ARRAY['c'] FROM t WHERE id = 1`, false},
+		{`SELECT tags @> '{a,b}' FROM t WHERE id = 1`, true},
+		{`SELECT tags @> '{a,b,c}' FROM t WHERE id = 1`, false},
+		{`SELECT '{1,2}' <@ nums FROM t WHERE id = 1`, true},
+		{`SELECT '{1,4}' <@ nums FROM t WHERE id = 1`, false},
+		{`SELECT tags @> ARRAY[NULL]::TEXT[] FROM t WHERE id = 2`, true},
+		{`SELECT flags @> ARRAY[TRUE] FROM t WHERE id = 1`, true},
+		{`SELECT flags @> ARRAY[TRUE] FROM t WHERE id = 3`, false},
+		// NUMERIC elements compare exactly, so 1.10 matches 1.1.
+		{`SELECT exact @> ARRAY[1.1]::NUMERIC[] FROM t WHERE id = 1`, true},
+	}
+	for _, tc := range cases {
+		res := execMust(t, e, tc.sql)
+		if res.RowCount != 1 || res.Rows[0][0] != tc.want {
+			t.Errorf("%s = %v, want %v", tc.sql, res.Rows, tc.want)
+		}
+	}
+
+	if _, err := execSQL(e, `SELECT nums @> 5 FROM t`); jsonbErrorCode(t, err) != pgerror.CodeDatatypeMismatch {
+		t.Fatalf("integer containment error = %v, want 42804", err)
+	}
+}

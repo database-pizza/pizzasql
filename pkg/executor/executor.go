@@ -1756,8 +1756,11 @@ func (e *Executor) executeSelectFromTableFunction(stmt *parser.SelectStmt) (*Res
 			rows = append(rows, []interface{}{typed})
 		}
 	}
-	column := "unnest"
-	result, err := e.executeSelectOnMaterialized(stmt, []string{column}, rows)
+	columns, err := ref.ApplyColumnAliases([]string{"unnest"})
+	if err != nil {
+		return nil, err
+	}
+	result, err := e.executeSelectOnMaterialized(stmt, columns, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -1769,7 +1772,7 @@ func (e *Executor) executeSelectFromTableFunction(stmt *parser.SelectStmt) (*Res
 				continue
 			}
 			types = append(types, inferExprType(projection.Expr, func(_, columnName string) (string, bool) {
-				if strings.EqualFold(columnName, column) {
+				if strings.EqualFold(columnName, columns[0]) {
 					return elementType, true
 				}
 				return "", false
@@ -1793,6 +1796,10 @@ func (e *Executor) executeSelectFromJSONBTableFunction(stmt *parser.SelectStmt, 
 		return nil, fmt.Errorf("%s argument: %w", name, err)
 	}
 	columns, types, rows, err := jsonbTableFunction(name, value)
+	if err != nil {
+		return nil, err
+	}
+	columns, err = ref.ApplyColumnAliases(columns)
 	if err != nil {
 		return nil, err
 	}

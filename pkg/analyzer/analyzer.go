@@ -300,10 +300,22 @@ func (a *Analyzer) defineTableRef(ref parser.TableRef) error {
 				return err
 			}
 		}
+		columns := tableFunctionColumns(ref.Function.Name)
+		names := make([]string, len(columns))
+		for i, column := range columns {
+			names[i] = column.Name
+		}
+		renamed, err := ref.ApplyColumnAliases(names)
+		if err != nil {
+			return err
+		}
+		for i := range columns {
+			columns[i].Name = renamed[i]
+		}
 		a.scope.DefineTable(&TableInfo{
 			Name:    ref.Name,
 			Alias:   ref.Alias,
-			Columns: tableFunctionColumns(ref.Function.Name),
+			Columns: columns,
 		})
 		return nil
 	}
@@ -1167,8 +1179,19 @@ func (a *Analyzer) analyzeBinaryExpr(e *parser.BinaryExpr) (*ExprInfo, error) {
 			info.Type = TypeJSONB
 		}
 	case lexer.TokenAtArrow, lexer.TokenLtAt:
-		// Containment needs a jsonb operand (or text read as a jsonb document)
-		// on both sides; a number is not silently reinterpreted as JSON.
+		// Array containment compares two arrays element-wise. A jsonb
+		// containment needs a jsonb or text operand on both sides; a number is
+		// not silently reinterpreted as JSON.
+		if left.Array || right.Array {
+			if !comparisonTypesCompatible(left, right) {
+				return nil, &AnalysisError{
+					Type:    ErrTypeMismatch,
+					Message: fmt.Sprintf("array containment requires two arrays, got %s and %s", left.Type, right.Type),
+				}
+			}
+			info.Type = TypeBoolean
+			return info, nil
+		}
 		if !jsonbTextOperand(left.Type) || !jsonbTextOperand(right.Type) {
 			return nil, &AnalysisError{
 				Type:    ErrTypeMismatch,

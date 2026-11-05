@@ -466,6 +466,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 				if c.txStatus == TxStatusInBlock {
 					c.txStatus = TxStatusFailed
 				}
+			} else if errors.Is(err, pgerror.ErrInvalidColumnReference) {
+				code = ErrCodeInvalidColumnReference
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if errors.Is(err, pgerror.ErrUndefinedTable) || analysisUndefinedTable(err) {
 				code = ErrCodeUndefinedTable
 				if c.txStatus == TxStatusInBlock {
@@ -805,6 +810,11 @@ func (c *Connection) classifyExecuteError(stmt parser.Statement, err error) *exe
 		}
 	} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
 		code = ErrCodeDatatypeMismatch
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.Is(err, pgerror.ErrInvalidColumnReference) {
+		code = ErrCodeInvalidColumnReference
 		if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
 		}

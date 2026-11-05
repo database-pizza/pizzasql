@@ -1,10 +1,12 @@
 package analyzer
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 )
 
 // arrayCatalog describes an array-typed table so expression analysis sees the
@@ -100,5 +102,47 @@ func TestUnnestFromDefinesRelation(t *testing.T) {
 	stmt := parse(t, `SELECT u.unnest FROM unnest('{1,2}'::INTEGER[]) AS u`).(*parser.SelectStmt)
 	if err := a.Analyze(stmt); err != nil {
 		t.Fatalf("unnest FROM analysis: %v", err)
+	}
+}
+
+func TestTableFunctionColumnAliasesAnalyze(t *testing.T) {
+	a := New(arrayCatalog())
+	for _, sql := range []string{
+		`SELECT u.x FROM unnest('{1,2}'::INTEGER[]) AS u(x)`,
+		`SELECT x FROM unnest('{1,2}'::INTEGER[]) AS u(x) WHERE x > 1`,
+		`SELECT e.k, e.v FROM jsonb_each('{"a":1}') AS e(k, v)`,
+	} {
+		if err := a.Analyze(parse(t, sql)); err != nil {
+			t.Errorf("analyze %q: %v", sql, err)
+		}
+	}
+
+	// A column alias list must match the function's output arity.
+	err := a.Analyze(parse(t, `SELECT * FROM jsonb_each('{"a":1}') AS e(k)`))
+	if !errors.Is(err, pgerror.ErrInvalidColumnReference) {
+		t.Fatalf("arity error = %v, want ErrInvalidColumnReference", err)
+	}
+}
+
+func TestArrayContainmentAnalyzes(t *testing.T) {
+	a := New(arrayCatalog())
+	for _, sql := range []string{
+		`SELECT nums FROM documents WHERE nums @> ARRAY[1]`,
+		`SELECT nums FROM documents WHERE ARRAY[1] <@ nums`,
+		`SELECT nums FROM documents WHERE nums @> '{1}'`,
+		`SELECT tags FROM documents WHERE tags @> ARRAY['go']`,
+		`SELECT nums FROM documents WHERE nums @> NULL`,
+	} {
+		if err := a.Analyze(parse(t, sql)); err != nil {
+			t.Errorf("analyze %q: %v", sql, err)
+		}
+	}
+	for _, sql := range []string{
+		`SELECT nums FROM documents WHERE nums @> 5`,
+		`SELECT nums FROM documents WHERE 5 <@ nums`,
+	} {
+		if err := a.Analyze(parse(t, sql)); err == nil {
+			t.Errorf("analyze %q succeeded, want an array containment type error", sql)
+		}
 	}
 }
