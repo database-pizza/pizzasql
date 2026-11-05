@@ -1,8 +1,11 @@
 package executor
 
 import (
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
 // ADD COLUMN only appends schema metadata. Existing rows are not rewritten, so
@@ -112,33 +115,146 @@ func TestAlterTableDropColumnRewritesPopulatedRows(t *testing.T) {
 	}
 }
 
-// RENAME COLUMN rewrites row keys but deliberately leaves index metadata
-// unchanged. Documented guidance: drop and recreate indexes after a rename.
-func TestAlterTableRenameColumnLeavesIndexMetadataStale(t *testing.T) {
-	_, schema, table := newTestDB(t)
+// RENAME COLUMN rewrites the durable index definitions along with the schema
+// and rows, so single- and multi-column indexes name the new column while
+// keeping their original index names.
+func TestAlterTableRenameColumnUpdatesIndexMetadata(t *testing.T) {
+	pool, schema, table := newTestDB(t)
 	e := newExec(schema, table)
-	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
-	execMust(t, e, "INSERT INTO t (id, a) VALUES (1, 'x')")
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+	execMust(t, e, "INSERT INTO t (id, a, b) VALUES (1, 'x', 'y')")
 	execMust(t, e, "CREATE INDEX idx_a ON t(a)")
+	execMust(t, e, "CREATE INDEX idx_ab ON t(a, b)")
 
 	execMust(t, e, "ALTER TABLE t RENAME COLUMN a TO aa")
 
-	res := execMust(t, e, "SELECT aa FROM t WHERE id = 1")
-	if got := res.Rows[0][0]; got != "x" {
-		t.Fatalf("renamed value = %v, want x", got)
+	single, err := schema.GetIndex("idx_a")
+	if err != nil {
+		t.Fatalf("get idx_a: %v", err)
+	}
+	if len(single.Columns) != 1 || single.Columns[0].Name != "aa" {
+		t.Fatalf("idx_a columns = %#v, want [aa]", single.Columns)
 	}
 
-	names, err := schema.ListIndexes()
+	composite, err := schema.GetIndex("idx_ab")
 	if err != nil {
-		t.Fatalf("list indexes: %v", err)
+		t.Fatalf("get idx_ab: %v", err)
 	}
-	found := false
-	for _, name := range names {
-		if name == "idx_a" {
-			found = true
-		}
+	if len(composite.Columns) != 2 || composite.Columns[0].Name != "aa" || composite.Columns[1].Name != "b" {
+		t.Fatalf("idx_ab columns = %#v, want [aa b]", composite.Columns)
 	}
-	if !found {
-		t.Fatalf("indexes = %v, want idx_a to still exist (rename does not rewrite index metadata)", names)
+
+	// index_info reports the renamed column and resolves its column id.
+	res := execMust(t, e, "PRAGMA index_info(idx_a)")
+	if len(res.Rows) != 1 || res.Rows[0][1] != int64(1) || res.Rows[0][2] != "aa" {
+		t.Fatalf("index_info(idx_a) = %v, want [[0 1 aa]]", res.Rows)
+	}
+
+	// sqlite_master renders the recreated index over the new column name.
+	res = execMust(t, e, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_ab'")
+	if len(res.Rows) != 1 || !strings.Contains(res.Rows[0][0].(string), "(`aa`, `b`)") {
+		t.Fatalf("recreated idx_ab SQL = %v, want a definition over aa, b", res.Rows)
+	}
+
+	// The definition is durable, not just cached on this SchemaManager.
+	reloaded := storage.NewSchemaManager(pool, "testdb")
+	composite, err = reloaded.GetIndex("idx_ab")
+	if err != nil {
+		t.Fatalf("reload idx_ab: %v", err)
+	}
+	if len(composite.Columns) != 2 || composite.Columns[0].Name != "aa" || composite.Columns[1].Name != "b" {
+		t.Fatalf("reloaded idx_ab columns = %#v, want [aa b]", composite.Columns)
+	}
+
+	// Index-backed equality lookup still returns the row after the rename.
+	res = execMust(t, e, "SELECT id, aa FROM t WHERE aa = 'x'")
+	if res.RowCount != 1 || res.Rows[0][0] != int64(1) || res.Rows[0][1] != "x" {
+		t.Fatalf("indexed lookup after rename = %v, want [[1 x]]", res.Rows)
+	}
+}
+
+// A UNIQUE index keeps enforcing uniqueness after its column is renamed.
+func TestAlterTableRenameColumnKeepsUniqueIndexEnforcement(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, tag TEXT)")
+	execMust(t, e, "CREATE UNIQUE INDEX uq_email ON t(email)")
+	execMust(t, e, "INSERT INTO t (id, email, tag) VALUES (1, 'a', 'first')")
+
+	if _, err := execSQL(e, "INSERT INTO t (id, email, tag) VALUES (2, 'a', 'dup')"); err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		t.Fatalf("pre-rename duplicate error = %v, want UNIQUE constraint failure", err)
+	}
+
+	execMust(t, e, "ALTER TABLE t RENAME COLUMN email TO mail")
+
+	if _, err := execSQL(e, "INSERT INTO t (id, mail, tag) VALUES (3, 'a', 'dup')"); err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		t.Fatalf("post-rename duplicate error = %v, want UNIQUE constraint failure", err)
+	}
+	execMust(t, e, "INSERT INTO t (id, mail, tag) VALUES (4, 'b', 'ok')")
+
+	res := execMust(t, e, "SELECT id, mail, tag FROM t ORDER BY id")
+	if res.RowCount != 2 || res.Rows[0][1] != "a" || res.Rows[1][1] != "b" {
+		t.Fatalf("rows after rename = %v, want two distinct emails", res.Rows)
+	}
+
+	res = execMust(t, e, "PRAGMA index_list(t)")
+	if len(res.Rows) != 1 || res.Rows[0][1] != "uq_email" || res.Rows[0][2] != int64(1) {
+		t.Fatalf("index_list(t) = %v, want the unique uq_email index", res.Rows)
+	}
+}
+
+// ON CONFLICT resolves against the renamed column and rejects the old name.
+func TestAlterTableRenameColumnResolvesOnConflictTarget(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, tag TEXT)")
+	execMust(t, e, "CREATE UNIQUE INDEX uq_email ON t(email)")
+	execMust(t, e, "INSERT INTO t (id, email, tag) VALUES (1, 'a', 'old')")
+
+	execMust(t, e, "ALTER TABLE t RENAME COLUMN email TO mail")
+
+	execMust(t, e, "INSERT INTO t (id, mail, tag) VALUES (2, 'a', 'new') ON CONFLICT (mail) DO UPDATE SET tag = excluded.tag")
+	res := execMust(t, e, "SELECT id, mail, tag FROM t")
+	if res.RowCount != 1 || res.Rows[0][0] != int64(1) || res.Rows[0][2] != "new" {
+		t.Fatalf("upsert on renamed column = %v, want the existing row updated", res.Rows)
+	}
+
+	if _, err := execSQL(e, "INSERT INTO t (id, mail, tag) VALUES (3, 'a', 'x') ON CONFLICT (email) DO UPDATE SET tag = excluded.tag"); err == nil || !strings.Contains(err.Error(), "column not found: email") {
+		t.Fatalf("upsert on old column error = %v, want column not found: email", err)
+	}
+}
+
+// Renaming a column back restores the original index metadata, and renaming to
+// an existing column name still fails without touching that metadata.
+func TestAlterTableRenameColumnCycleRestoresIndexMetadata(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+	execMust(t, e, "CREATE UNIQUE INDEX uq_a ON t(a)")
+	execMust(t, e, "INSERT INTO t (id, a) VALUES (1, 'x')")
+
+	execMust(t, e, "ALTER TABLE t RENAME COLUMN a TO b")
+	execMust(t, e, "ALTER TABLE t RENAME COLUMN b TO a")
+
+	idx, err := schema.GetIndex("uq_a")
+	if err != nil {
+		t.Fatalf("get uq_a: %v", err)
+	}
+	if len(idx.Columns) != 1 || idx.Columns[0].Name != "a" {
+		t.Fatalf("uq_a columns after cycle = %#v, want [a]", idx.Columns)
+	}
+	if _, err := execSQL(e, "INSERT INTO t (id, a) VALUES (2, 'x')"); err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		t.Fatalf("duplicate error after rename cycle = %v, want UNIQUE constraint failure", err)
+	}
+
+	if _, err := execSQL(e, "ALTER TABLE t RENAME COLUMN a TO id"); err == nil || !strings.Contains(err.Error(), "column already exists: id") {
+		t.Fatalf("rename to existing column error = %v, want column already exists: id", err)
+	}
+	idx, err = schema.GetIndex("uq_a")
+	if err != nil {
+		t.Fatalf("get uq_a after rejected rename: %v", err)
+	}
+	if len(idx.Columns) != 1 || idx.Columns[0].Name != "a" {
+		t.Fatalf("uq_a columns after rejected rename = %#v, want [a]", idx.Columns)
 	}
 }

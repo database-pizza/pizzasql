@@ -522,6 +522,17 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 		}
 	}
 
+	// An ON CONFLICT target names columns of the target table. An unknown name
+	// must fail the statement rather than silently degrading to a scan.
+	for _, colName := range stmt.ConflictTarget {
+		if _, ok := table.GetColumn(colName); !ok {
+			return &AnalysisError{
+				Type:    ErrColumnNotFound,
+				Message: fmt.Sprintf("column not found: %s", colName),
+			}
+		}
+	}
+
 	// Validate VALUES
 	for _, row := range stmt.Values {
 		if len(row) != len(targetCols) {

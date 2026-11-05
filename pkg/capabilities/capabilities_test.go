@@ -39,4 +39,7 @@ func TestCurrentDocumentIsVersionedAndMarshalable(t *testing.T) {
 	if round.Notifications.PayloadLimit != 8000 || round.Notifications.DurableReplay {
 		t.Fatalf("unexpected notification limits: %+v", round.Notifications)
 	}
+	if !round.DDL.RenameColumnIndexes.Supported {
+		t.Fatal("RENAME COLUMN must advertise index metadata rewriting")
+	}
 }
