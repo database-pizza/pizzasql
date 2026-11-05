@@ -360,7 +360,7 @@ func TestMultiRowResultBuffersRows(t *testing.T) {
 	for i := 0; i < rows; i++ {
 		result.AddRow(int64(i))
 	}
-	if err := c.sendResult(result, &parser.SelectStmt{}); err != nil {
+	if err := c.sendResult(result, &parser.SelectStmt{}, result.ColumnTypes, nil); err != nil {
 		t.Fatal(err)
 	}
 	// sendResult emits RowDescription + rows DataRows + CommandComplete. With

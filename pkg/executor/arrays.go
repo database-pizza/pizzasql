@@ -220,6 +220,14 @@ func CanonicalizeArrayText(text, typeName string) (string, error) {
 	return canonicalArrayText(text, typeName)
 }
 
+// ParseArrayText splits stored array text into its element strings, with nil for
+// a SQL NULL element. The wire layer reuses it to encode the same text in the
+// PostgreSQL binary array format, so both formats are produced from one
+// canonical representation.
+func ParseArrayText(text string) ([]*string, error) {
+	return parseArrayLiteral(text)
+}
+
 // canonicalArrayText parses array text and re-encodes it for the given array
 // type, converting each element to its canonical spelling.
 func canonicalArrayText(text, typeName string) (string, error) {

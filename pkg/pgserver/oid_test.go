@@ -76,7 +76,7 @@ func TestSendResultEmptyProjectionSendsRowDescription(t *testing.T) {
 	result := executor.NewResult("SELECT")
 	result.AddColumnWithType("id", "BIGINT")
 	result.AddColumnWithType("created_at", "DATETIME")
-	if err := c.sendResult(result, &parser.SelectStmt{}); err != nil {
+	if err := c.sendResult(result, &parser.SelectStmt{}, result.ColumnTypes, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.sendReadyForQuery(); err != nil {

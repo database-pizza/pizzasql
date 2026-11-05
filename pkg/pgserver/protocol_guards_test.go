@@ -39,8 +39,6 @@ func TestUnsupportedExtendedRequestsFailBeforeSideEffects(t *testing.T) {
 		message *Message
 		code    string
 	}{
-		{"binary_results", &Message{Type: MsgBind, Data: guardBind(nil, []int16{1})}, ErrCodeFeatureNotSupported},
-		{"per_column_results", &Message{Type: MsgBind, Data: guardBind(nil, []int16{0, 0})}, ErrCodeFeatureNotSupported},
 		{"invalid_result_format", &Message{Type: MsgBind, Data: guardBind(nil, []int16{2})}, ErrCodeProtocolViolation},
 		{"invalid_parameter_format", &Message{Type: MsgBind, Data: guardBind([]int16{2}, nil)}, ErrCodeProtocolViolation},
 		{"parameter_format_count", &Message{Type: MsgBind, Data: guardBind([]int16{0, 0}, nil)}, ErrCodeProtocolViolation},

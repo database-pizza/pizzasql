@@ -266,6 +266,24 @@ func (mb *MessageBuilder) WriteBytes(b []byte) {
 	mb.data = append(mb.data, b...)
 }
 
+// AppendBinary appends a length-prefixed payload produced by encode. encode
+// appends the payload directly into the message buffer and returns the
+// extended slice, so a binary value is encoded once without an intermediate
+// buffer; a length of -1 is never produced here because NULL values are written
+// by the caller.
+func (mb *MessageBuilder) AppendBinary(encode func(dst []byte) ([]byte, error)) error {
+	start := len(mb.data)
+	mb.data = append(mb.data, 0, 0, 0, 0)
+	encoded, err := encode(mb.data)
+	if err != nil {
+		mb.data = mb.data[:start]
+		return err
+	}
+	mb.data = encoded
+	binary.BigEndian.PutUint32(mb.data[start:start+4], uint32(len(mb.data)-start-4))
+	return nil
+}
+
 // Bytes returns the built message data
 func (mb *MessageBuilder) Bytes() []byte {
 	return mb.data

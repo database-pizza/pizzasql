@@ -300,3 +300,26 @@ func TestJSONBIsAdvertised(t *testing.T) {
 		t.Fatalf("22023 mapping = %q, want invalid_parameter_value", got)
 	}
 }
+
+// Binary result support is advertised with the encodable OIDs and the SQLSTATE
+// for a type that has no binary encoder. pkg/pgserver covers each claim.
+func TestBinaryResultsAreAdvertised(t *testing.T) {
+	results := Current().Protocol.BinaryResults
+	if !results.Supported {
+		t.Fatalf("binary_results = %+v, want supported", results)
+	}
+	if results.Status != "supported" {
+		t.Fatalf("binary_results status = %q, want supported", results.Status)
+	}
+	for _, claim := range []string{
+		"bool (16)", "bytea (17)", "int8 (20)", "int2 (21)", "int4 (23)", "text (25)",
+		"float4 (700)", "float8 (701)", "varchar (1043)", "numeric (1700) only as the element type of numeric[] (1231)", "jsonb (3802,",
+		"1000, 1005, 1007, 1009, 1015, 1016, 1021, 1022, 1231", "0A000",
+		"unrepresentable stored value", "22P02",
+		"Describe and simple-query results stay text",
+	} {
+		if !strings.Contains(results.Notes, claim) {
+			t.Errorf("binary_results notes do not mention %q", claim)
+		}
+	}
+}
