@@ -931,7 +931,39 @@ func (m *SchemaManager) removeFromIndexList(name string) error {
 }
 
 // AddColumn adds a new column to a table.
+//
+// A constant DEFAULT is materialized into every existing row before the schema
+// is published. NOT NULL, UNIQUE, and index validation all read persisted row
+// values, so a default that only existed in the catalog would be invisible to
+// them: a UNIQUE index over the new column could not see the duplicate values
+// every existing row shares, and an UPDATE to NULL would look non-null. The
+// rewrite is the same shape as DropColumn: the table's exclusive gate keeps
+// point writes and CAS commits out while rows are scanned and rewritten, the
+// transform is idempotent, and the schema is saved last so an interrupted
+// operation resumes against the old schema. A nullable column without a default
+// needs no rewrite because a missing row field already reads as NULL. Like
+// DROP COLUMN, the statement holds the catalog lock for the whole rewrite, so
+// the cost is one table scan and a table-wide stall per ADD COLUMN with a
+// default.
 func (m *SchemaManager) AddColumn(table string, column Column) error {
+	if column.Default == nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		schema, err := m.getSchemaUnsafe(table)
+		if err != nil {
+			return err
+		}
+		if err := checkColumnAbsent(schema, column.Name); err != nil {
+			return err
+		}
+		return m.publishAddedColumn(schema, column)
+	}
+
+	tableLock := m.tableLock(table)
+	tableLock.Lock()
+	defer tableLock.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -939,20 +971,43 @@ func (m *SchemaManager) AddColumn(table string, column Column) error {
 	if err != nil {
 		return err
 	}
-
-	// Check if column already exists
-	for _, col := range schema.Columns {
-		if strings.EqualFold(col.Name, column.Name) {
-			return fmt.Errorf("column already exists: %s", column.Name)
-		}
+	if err := checkColumnAbsent(schema, column.Name); err != nil {
+		return err
 	}
 
+	if err := m.rewriteRows(table, func(row Row) bool {
+		for key := range row {
+			if strings.EqualFold(key, column.Name) {
+				return false
+			}
+		}
+		row[column.Name] = column.Default
+		return true
+	}); err != nil {
+		return err
+	}
+
+	return m.publishAddedColumn(schema, column)
+}
+
+// publishAddedColumn appends an absent column to the published schema snapshot
+// (m.mu must be held).
+func (m *SchemaManager) publishAddedColumn(schema *Schema, column Column) error {
 	// Publish a fresh snapshot instead of mutating readers' shared pointer.
 	schema = cloneSchema(schema)
 	schema.Columns = append(schema.Columns, column)
 
 	// Update schema
 	return m.updateSchemaUnsafe(schema)
+}
+
+func checkColumnAbsent(schema *Schema, name string) error {
+	for _, col := range schema.Columns {
+		if strings.EqualFold(col.Name, name) {
+			return fmt.Errorf("column already exists: %s", name)
+		}
+	}
+	return nil
 }
 
 // DropColumn removes a column from a table.

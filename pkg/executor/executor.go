@@ -4071,22 +4071,28 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 	}
 }
 
-// executeAlterTableAddColumn adds a column to a table.
+// executeAlterTableAddColumn adds a column to a table. A constant DEFAULT is
+// written into every existing row (see SchemaManager.AddColumn), so the column
+// reads the default on rows that predate the statement as well as on later
+// INSERTs that omit it.
 func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddColumnAction) (*Result, error) {
-	if action.IfNotExists {
-		schema, err := e.schema.GetSchema(table)
-		if err != nil {
-			return nil, err
-		}
-		if _, exists := schema.GetColumn(action.Column.Name); exists {
+	schema, err := e.schema.GetSchema(table)
+	if err != nil {
+		return nil, err
+	}
+	if _, exists := schema.GetColumn(action.Column.Name); exists {
+		if action.IfNotExists {
 			return NewResult("ALTER TABLE"), nil
 		}
+		return nil, fmt.Errorf("column already exists: %s", action.Column.Name)
 	}
+
 	col := storage.Column{
 		Name:     action.Column.Name,
 		Type:     action.Column.Type.Name,
 		Nullable: true,
 	}
+	var uniqueConstraint *parser.ColumnConstraint
 
 	// Process column constraints
 	for _, constraint := range action.Column.Constraints {
@@ -4096,6 +4102,9 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 			col.Nullable = false
 		case parser.ConstraintNotNull:
 			col.Nullable = false
+		case parser.ConstraintUnique:
+			unique := constraint
+			uniqueConstraint = &unique
 		case parser.ConstraintDefault:
 			if constraint.Default != nil {
 				val, err := constantDefaultValue(e, col.Name, constraint.Default)
@@ -4117,6 +4126,37 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 		}
 	}
 
+	var uniqueIndex *storage.Index
+	if uniqueConstraint != nil {
+		uniqueIndex = e.addColumnUniqueIndex(table, col.Name, uniqueConstraint)
+	}
+
+	// A required column with no default has no value for rows that already
+	// exist. Refusing before the rewrite leaves the table untouched instead of
+	// failing NOT NULL validation on a later read or write.
+	if !col.Nullable && col.Default == nil {
+		existingRows, err := e.session.CountFast(table)
+		if err != nil {
+			return nil, err
+		}
+		if existingRows > 0 {
+			return nil, &storage.NotNullViolationError{Table: table, Column: col.Name}
+		}
+	}
+
+	// Every existing row receives the same constant, so a non-NULL default
+	// duplicates immediately once the table holds more than one row. Check
+	// before rewriting so a rejected UNIQUE column leaves no durable changes.
+	if uniqueIndex != nil && col.Default != nil {
+		rows, err := e.session.CountFast(table)
+		if err != nil {
+			return nil, err
+		}
+		if rows > 1 {
+			return nil, &storage.UniqueViolationError{Constraint: uniqueIndex.Name}
+		}
+	}
+
 	if err := e.schema.AddColumn(table, col); err != nil {
 		if action.IfNotExists && strings.Contains(err.Error(), "column already exists") {
 			return NewResult("ALTER TABLE"), nil
@@ -4127,8 +4167,67 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 	// Update catalog
 	e.SyncCatalog()
 
+	if uniqueIndex != nil {
+		if err := e.createAddedColumnUniqueIndex(uniqueIndex); err != nil {
+			return nil, err
+		}
+	}
+
 	result := NewResult("ALTER TABLE")
 	return result, nil
+}
+
+// addColumnUniqueIndex names the index an ADD COLUMN ... UNIQUE constraint
+// materializes, using the declared constraint name when there is one and the
+// same deterministic internal name CREATE TABLE gives an unnamed column-level
+// UNIQUE constraint otherwise, suffixing collisions.
+func (e *Executor) addColumnUniqueIndex(table, column string, constraint *parser.ColumnConstraint) *storage.Index {
+	base := "uniq_" + strings.ToLower(table) + "_" + strings.ToLower(column)
+	if constraint.Name != "" {
+		base = constraint.Name
+	}
+	name := base
+	for n := 2; e.schema.IndexExists(name); n++ {
+		name = fmt.Sprintf("%s_%d", base, n)
+	}
+	index := &storage.Index{
+		Name:    name,
+		Table:   table,
+		Unique:  true,
+		Columns: []storage.IndexColumn{{Name: column}},
+	}
+	if constraint.HasOnConflict {
+		index.OnConflict = conflictActionName(constraint.OnConflict)
+	}
+	return index
+}
+
+// createAddedColumnUniqueIndex registers and populates the unique index for an
+// ADD COLUMN. Uniqueness is validated after the backfill has written the new
+// values, so the check sees what later INSERTs and index scans will see. DDL is
+// not transactional, but a failure here drops the column again (best effort)
+// instead of leaving a half-applied ADD COLUMN that a retry would reject as an
+// existing column.
+func (e *Executor) createAddedColumnUniqueIndex(index *storage.Index) error {
+	if err := e.table.CreateUniqueIndex(index); err != nil {
+		e.rollbackAddedColumn(index.Table, index.Columns[0].Name)
+		return err
+	}
+	columns := []string{index.Columns[0].Name}
+	if err := e.session.BuildIndex(index.Name, index.Table, columns); err != nil {
+		e.schema.DropIndex(index.Name)
+		e.rollbackAddedColumn(index.Table, index.Columns[0].Name)
+		return fmt.Errorf("failed to build index: %w", err)
+	}
+	return nil
+}
+
+// rollbackAddedColumn removes a column whose unique index could not be built.
+func (e *Executor) rollbackAddedColumn(table, column string) {
+	if err := e.schema.DropColumn(table, column); err != nil {
+		return
+	}
+	e.SyncCatalog()
 }
 
 // executeAlterTableDropColumn drops a column from a table.

@@ -423,8 +423,8 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 // sqlStateHTTPError maps engine errors onto the same SQLSTATE codes the
 // PostgreSQL endpoint reports. The executor returns plain errors on released
-// builds, so the unique-violation and unsupported-feature markers are matched
-// on their stable message prefixes.
+// builds, so the unique-violation, not-null, and unsupported-feature markers are
+// matched on their stable message prefixes.
 func sqlStateHTTPError(err error) *HTTPError {
 	if err == nil {
 		return nil
@@ -437,6 +437,13 @@ func sqlStateHTTPError(err error) *HTTPError {
 			Code:    "23505",
 			Message: message,
 			Details: map[string]interface{}{"constraint": constraint},
+		}
+	}
+	if strings.HasPrefix(message, "NOT NULL constraint failed: ") {
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    "23502",
+			Message: message,
 		}
 	}
 	if errors.Is(err, storage.ErrSerialization) {

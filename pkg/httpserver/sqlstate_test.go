@@ -54,6 +54,7 @@ func TestSQLStateHTTPErrorMapping(t *testing.T) {
 		code   string
 	}{
 		{"unique", fmt.Errorf("UNIQUE constraint failed: uniq_users_email"), http.StatusConflict, "23505"},
+		{"not null", fmt.Errorf("NOT NULL constraint failed: t.v"), http.StatusBadRequest, "23502"},
 		{"serialization", fmt.Errorf("commit: %w", storage.ErrSerialization), http.StatusConflict, "40001"},
 		{"unsupported", fmt.Errorf("feature not supported: DEFAULT is not constant"), http.StatusBadRequest, "0A000"},
 		{"other", errors.New("boom"), http.StatusInternalServerError, "EXECUTION_ERROR"},

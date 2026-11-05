@@ -1,13 +1,16 @@
 package executor
 
 import (
+	"errors"
 	"sync"
 	"testing"
+
+	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
-// ADD COLUMN only appends schema metadata. Existing rows are not rewritten, so
-// a declared DEFAULT applies to later INSERTs only.
-func TestAlterTableAddColumnDoesNotBackfillPopulatedTable(t *testing.T) {
+// ADD COLUMN with a constant DEFAULT materializes the value into rows that
+// already exist, so the column reads the default everywhere.
+func TestAlterTableAddColumnBackfillsPopulatedTable(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
 	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -20,8 +23,8 @@ func TestAlterTableAddColumnDoesNotBackfillPopulatedTable(t *testing.T) {
 		t.Fatalf("row count = %d, want 2", res.RowCount)
 	}
 	for _, row := range res.Rows {
-		if row[1] != nil {
-			t.Fatalf("existing row %v note = %v, want NULL (no backfill)", row[0], row[1])
+		if row[1] != "later" {
+			t.Fatalf("existing row %v note = %v, want later", row[0], row[1])
 		}
 	}
 
@@ -29,6 +32,204 @@ func TestAlterTableAddColumnDoesNotBackfillPopulatedTable(t *testing.T) {
 	res = execMust(t, e, "SELECT note FROM t WHERE id = 3")
 	if got := res.Rows[0][0]; got != "later" {
 		t.Fatalf("new row note = %v, want later", got)
+	}
+}
+
+// A DEFAULT declared on an empty table has no rows to rewrite; later INSERTs
+// that omit the column take it, and an explicit NULL still wins.
+func TestAlterTableAddColumnDefaultOnEmptyTable(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+
+	execMust(t, e, "ALTER TABLE t ADD COLUMN note TEXT DEFAULT 'later'")
+
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+	execMust(t, e, "INSERT INTO t (id, note) VALUES (2, NULL)")
+	res := execMust(t, e, "SELECT id, note FROM t ORDER BY id")
+	if len(res.Rows) != 2 || res.Rows[0][1] != "later" || res.Rows[1][1] != nil {
+		t.Fatalf("rows = %v, want [[1 later] [2 NULL]]", res.Rows)
+	}
+}
+
+// ADD COLUMN without a DEFAULT leaves existing rows NULL.
+func TestAlterTableAddColumnWithoutDefaultLeavesExistingRowsNull(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
+
+	execMust(t, e, "ALTER TABLE t ADD COLUMN note TEXT")
+
+	res := execMust(t, e, "SELECT id, note FROM t ORDER BY id")
+	if res.RowCount != 2 {
+		t.Fatalf("row count = %d, want 2", res.RowCount)
+	}
+	for _, row := range res.Rows {
+		if row[1] != nil {
+			t.Fatalf("existing row %v note = %v, want NULL", row[0], row[1])
+		}
+	}
+}
+
+// A NOT NULL column with a constant DEFAULT backfills existing rows, so the
+// constraint holds for rows that predate the statement.
+func TestAlterTableAddColumnNotNullWithDefaultBackfills(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
+
+	execMust(t, e, "ALTER TABLE t ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+
+	fresh := newExec(schema, table)
+	res := execMust(t, fresh, "SELECT status FROM t ORDER BY id")
+	if res.RowCount != 2 {
+		t.Fatalf("row count = %d, want 2", res.RowCount)
+	}
+	for _, row := range res.Rows {
+		if row[0] != "pending" {
+			t.Fatalf("existing status = %v, want pending", row[0])
+		}
+	}
+
+	execMust(t, e, "INSERT INTO t (id) VALUES (3)")
+	res = execMust(t, e, "SELECT status FROM t WHERE id = 3")
+	if got := res.Rows[0][0]; got != "pending" {
+		t.Fatalf("new row status = %v, want pending", got)
+	}
+}
+
+// A NOT NULL column without a DEFAULT has nothing to write into existing rows
+// and must not report the table as migrated.
+func TestAlterTableAddColumnNotNullWithoutDefaultRejectsPopulatedTable(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+
+	_, err := execSQL(e, "ALTER TABLE t ADD COLUMN status TEXT NOT NULL")
+	var violation *storage.NotNullViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("error = %v, want NotNullViolationError", err)
+	}
+
+	s, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if _, exists := s.GetColumn("status"); exists {
+		t.Fatal("rejected ADD COLUMN left the column in the schema")
+	}
+	if rows := execMust(t, e, "SELECT id FROM t").Rows; len(rows) != 1 {
+		t.Fatalf("rows = %v, want the existing row untouched", rows)
+	}
+}
+
+// The same statement is legal on an empty table; the constraint is then
+// enforced on the INSERTs that follow.
+func TestAlterTableAddColumnNotNullWithoutDefaultOnEmptyTable(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+
+	execMust(t, e, "ALTER TABLE t ADD COLUMN status TEXT NOT NULL")
+
+	_, err := execSQL(e, "INSERT INTO t (id) VALUES (1)")
+	var violation *storage.NotNullViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("insert without status error = %v, want NotNullViolationError", err)
+	}
+
+	execMust(t, e, "INSERT INTO t (id, status) VALUES (1, 'active')")
+	res := execMust(t, e, "SELECT status FROM t WHERE id = 1")
+	if got := res.Rows[0][0]; got != "active" {
+		t.Fatalf("status = %v, want active", got)
+	}
+}
+
+// Backfilling one constant into several rows would duplicate the value, so the
+// UNIQUE constraint must reject the ALTER instead of creating a silently
+// non-unique column.
+func TestAlterTableAddColumnUniqueWithDefaultRejectsPopulatedTable(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1), (2)")
+
+	_, err := execSQL(e, "ALTER TABLE t ADD COLUMN code TEXT DEFAULT 'same' UNIQUE")
+	var violation *storage.UniqueViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("error = %v, want UniqueViolationError", err)
+	}
+
+	s, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if _, exists := s.GetColumn("code"); exists {
+		t.Fatal("rejected ADD COLUMN left the column in the schema")
+	}
+	indexes, err := schema.ListTableIndexes("t")
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	if len(indexes) != 0 {
+		t.Fatalf("indexes = %v, want none", indexes)
+	}
+}
+
+// A single-row table can take a UNIQUE column with a default, and the
+// constraint is enforced for every later INSERT that omits the column.
+func TestAlterTableAddColumnUniqueWithDefaultEnforcesLaterInserts(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+
+	execMust(t, e, "ALTER TABLE t ADD COLUMN code TEXT DEFAULT 'same' UNIQUE")
+
+	_, err := execSQL(e, "INSERT INTO t (id) VALUES (2)")
+	var violation *storage.UniqueViolationError
+	if !errors.As(err, &violation) {
+		t.Fatalf("insert with duplicated default error = %v, want UniqueViolationError", err)
+	}
+
+	execMust(t, e, "INSERT INTO t (id, code) VALUES (2, 'other')")
+	res := execMust(t, e, "SELECT code FROM t ORDER BY id")
+	if len(res.Rows) != 2 || res.Rows[0][0] != "same" || res.Rows[1][0] != "other" {
+		t.Fatalf("codes = %v, want [same other]", res.Rows)
+	}
+}
+
+// IF NOT EXISTS stays idempotent on a populated table: the second statement is
+// a no-op even when it declares a different default.
+func TestAlterTableAddColumnIfNotExistsKeepsBackfilledValues(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t (id) VALUES (1)")
+
+	execMust(t, e, "ALTER TABLE t ADD COLUMN IF NOT EXISTS note TEXT DEFAULT 'first'")
+	execMust(t, e, "ALTER TABLE t ADD COLUMN IF NOT EXISTS note TEXT DEFAULT 'second'")
+
+	res := execMust(t, e, "SELECT note FROM t WHERE id = 1")
+	if got := res.Rows[0][0]; got != "first" {
+		t.Fatalf("note = %v, want the first default to stand", got)
+	}
+
+	s, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	count := 0
+	for _, col := range s.Columns {
+		if col.Name == "note" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("column note appears %d times, want 1", count)
 	}
 }
 

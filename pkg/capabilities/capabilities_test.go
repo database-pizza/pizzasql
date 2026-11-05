@@ -40,3 +40,16 @@ func TestCurrentDocumentIsVersionedAndMarshalable(t *testing.T) {
 		t.Fatalf("unexpected notification limits: %+v", round.Notifications)
 	}
 }
+
+func TestAddColumnBackfillIsAdvertised(t *testing.T) {
+	doc := Current()
+	if !doc.DDL.AddColumnBackfill.Supported {
+		t.Fatalf("add_column_backfill = %+v, want supported", doc.DDL.AddColumnBackfill)
+	}
+	if doc.DDL.AddColumnBackfill.Status != "rewrites_rows" {
+		t.Fatalf("add_column_backfill status = %q, want rewrites_rows", doc.DDL.AddColumnBackfill.Status)
+	}
+	if doc.DDL.AddColumn.Status == "metadata_only" {
+		t.Fatalf("add_column status = %q, but a constant DEFAULT rewrites rows", doc.DDL.AddColumn.Status)
+	}
+}
