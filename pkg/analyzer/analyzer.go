@@ -1359,6 +1359,8 @@ func (a *Analyzer) analyzeFunctionCall(e *parser.FunctionCall) (*ExprInfo, error
 		argInfo, _ := a.analyzeExpr(e.Args[0])
 		if argInfo != nil {
 			info.Type = argInfo.Type
+			info.Array = argInfo.Array
+			info.Nullable = argInfo.Nullable
 		}
 	}
 
