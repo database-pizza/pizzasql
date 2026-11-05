@@ -134,7 +134,8 @@ func TestCompatibilitySuite(t *testing.T) {
 	expectOK("ddl.parenthesized_defaults_insert", `INSERT INTO paren_defaults (id) VALUES (1)`)
 	expectRows("ddl.parenthesized_defaults_applied", `SELECT count(*) FROM paren_defaults WHERE a IS NOT NULL AND b IS NOT NULL`, "1")
 	expectCode("ddl.nonconstant_default_0A000", `CREATE TABLE bad_default (id INTEGER PRIMARY KEY, token TEXT DEFAULT lower('x'))`, "0A000")
-	expectCode("locking.for_update_0A000", `SELECT * FROM accounts FOR UPDATE`, "0A000")
+	expectOK("locking.for_update", `SELECT id FROM accounts FOR UPDATE SKIP LOCKED`)
+	expectCode("locking.for_update_join_0A000", `SELECT accounts.id FROM accounts a JOIN accounts b ON a.id = b.id FOR UPDATE`, "0A000")
 
 	// Array types, array literals, ANY/ALL, and array parameters.
 	expectOK("arrays.ddl", `CREATE TABLE array_values (id INTEGER PRIMARY KEY, tags TEXT[], nums INTEGER[])`)

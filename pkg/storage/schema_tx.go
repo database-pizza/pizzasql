@@ -1373,7 +1373,7 @@ func (s *Session) DropTable(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.schemaTx == nil {
-		return s.schema.DropTable(name)
+		return s.guardTable(name, func() error { return s.schema.DropTable(name) })
 	}
 	return s.stageDDL(func(tx *SchemaTx) error { return tx.dropTable(name) })
 }
@@ -1386,10 +1386,12 @@ func (s *Session) CreateIndex(index *Index) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.schemaTx == nil {
-		if index.Unique {
-			return s.table.CreateUniqueIndex(index)
-		}
-		return s.schema.CreateIndex(index)
+		return s.guardTable(index.Table, func() error {
+			if index.Unique {
+				return s.table.CreateUniqueIndex(index)
+			}
+			return s.schema.CreateIndex(index)
+		})
 	}
 	return s.stageDDL(func(tx *SchemaTx) error {
 		if err := tx.createIndex(index); err != nil {
@@ -1443,7 +1445,7 @@ func (s *Session) AddColumn(table string, column Column, checks []CheckConstrain
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.schemaTx == nil {
-		return s.schema.AddColumn(table, column, checks, unique)
+		return s.guardTable(table, func() error { return s.schema.AddColumn(table, column, checks, unique) })
 	}
 	return s.stageDDL(func(tx *SchemaTx) error { return tx.addColumn(table, column, checks, unique) })
 }
@@ -1454,7 +1456,7 @@ func (s *Session) DropColumn(table, columnName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.schemaTx == nil {
-		return s.schema.DropColumn(table, columnName)
+		return s.guardTable(table, func() error { return s.schema.DropColumn(table, columnName) })
 	}
 	return s.stageDDL(func(tx *SchemaTx) error { return tx.dropColumn(table, columnName) })
 }
@@ -1465,7 +1467,7 @@ func (s *Session) RenameTable(oldName, newName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.schemaTx == nil {
-		return s.schema.RenameTable(oldName, newName)
+		return s.guardTable(oldName, func() error { return s.schema.RenameTable(oldName, newName) })
 	}
 	return s.stageDDL(func(tx *SchemaTx) error { return tx.renameTable(oldName, newName) })
 }
@@ -1476,7 +1478,7 @@ func (s *Session) RenameColumn(table, oldName, newName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.schemaTx == nil {
-		return s.schema.RenameColumn(table, oldName, newName)
+		return s.guardTable(table, func() error { return s.schema.RenameColumn(table, oldName, newName) })
 	}
 	return s.stageDDL(func(tx *SchemaTx) error { return tx.renameColumn(table, oldName, newName) })
 }

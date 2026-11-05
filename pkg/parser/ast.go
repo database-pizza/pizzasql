@@ -45,6 +45,29 @@ type CompoundSelect struct {
 func (c *CompoundSelect) node()     {}
 func (c *CompoundSelect) stmtNode() {}
 
+// LockStrength is the row-lock mode of a SELECT locking clause.
+type LockStrength int
+
+const (
+	LockUpdate LockStrength = iota
+	LockShare
+)
+
+// LockWait is the contention policy of a SELECT locking clause.
+type LockWait int
+
+const (
+	LockWaitBlock LockWait = iota
+	LockWaitNoWait
+	LockWaitSkipLocked
+)
+
+// LockingClause is the trailing FOR UPDATE/SHARE clause of a SELECT.
+type LockingClause struct {
+	Strength LockStrength
+	Wait     LockWait
+}
+
 // SelectStmt represents a SELECT statement.
 type SelectStmt struct {
 	Distinct bool
@@ -62,6 +85,8 @@ type SelectStmt struct {
 	// SELECT runs. Non-recursive CTEs are desugared by the parser instead; this
 	// list carries recursive CTEs (and the CTEs that depend on them).
 	With []*CTE
+	// Locking is the trailing row-locking clause, or nil.
+	Locking *LockingClause
 }
 
 // CTE is a common table expression from a WITH clause.

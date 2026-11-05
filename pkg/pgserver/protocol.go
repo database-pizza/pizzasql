@@ -102,6 +102,8 @@ const (
 	ErrCodeUndefinedCursor        = "34000"
 	ErrCodeTransactionAborted     = "25P02"
 	ErrCodeSerializationFailure   = "40001"
+	ErrCodeLockNotAvailable       = "55P03"
+	ErrCodeDeadlockDetected       = "40P01"
 	ErrCodeUniqueViolation        = "23505"
 	ErrCodeForeignKeyViolation    = "23503"
 	ErrCodeCheckViolation         = "23514"

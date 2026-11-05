@@ -17,6 +17,8 @@ const (
 	CodeForeignKeyViolation    = "23503"
 	CodeCheckViolation         = "23514"
 	CodeSerializationFailure   = "40001"
+	CodeLockNotAvailable       = "55P03"
+	CodeDeadlockDetected       = "40P01"
 	CodeSyntaxError            = "42601"
 	CodeUndefinedTable         = "42P01"
 	CodeInvalidColumnReference = "42P10"
@@ -32,6 +34,24 @@ var ErrUndefinedTable = errors.New("undefined table")
 // client-facing explanation of the name that did not resolve.
 func UndefinedTable(format string, args ...interface{}) error {
 	return fmt.Errorf("%w: %s", ErrUndefinedTable, fmt.Sprintf(format, args...))
+}
+
+// ErrLockNotAvailable marks a NOWAIT locking read whose row is held by another
+// transaction. Protocol layers map it to SQLSTATE 55P03 (lock_not_available).
+var ErrLockNotAvailable = errors.New("lock not available")
+
+// LockNotAvailable returns a 55P03 error for a contended NOWAIT lock.
+func LockNotAvailable(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrLockNotAvailable, fmt.Sprintf(format, args...))
+}
+
+// ErrDeadlockDetected marks a row-lock wait cycle. Protocol layers map it to
+// SQLSTATE 40P01 (deadlock_detected).
+var ErrDeadlockDetected = errors.New("deadlock detected")
+
+// DeadlockDetected returns a 40P01 error for a wait cycle.
+func DeadlockDetected(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", ErrDeadlockDetected, fmt.Sprintf(format, args...))
 }
 
 // ErrFeatureNotSupported marks SQL that PizzaSQL intentionally rejects instead

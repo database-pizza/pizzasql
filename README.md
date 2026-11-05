@@ -553,6 +553,33 @@ windows, subquery projections, or explicit-transaction overlay validation keep
 the full execution path. Equality predicates inside `AND` can use a primary or
 single-column index lookup; the original predicate is still checked on candidates.
 
+**Row locks:**
+```sql
+BEGIN;
+SELECT id FROM jobs
+ WHERE status = 'pending'
+ ORDER BY id
+ LIMIT 1
+ FOR UPDATE SKIP LOCKED;
+UPDATE jobs SET status = 'processing' WHERE id = ...;
+COMMIT;
+```
+
+`FOR UPDATE` and `FOR SHARE` are supported on one base table, with `NOWAIT`
+(SQLSTATE `55P03`) and `SKIP LOCKED`. Locks are held until `COMMIT`/`ROLLBACK`;
+an autocommit locking SELECT releases at statement end. A locking read re-reads
+each row after acquiring its lock, so it sees a concurrent commit instead of a
+stale image, and a `WHERE` predicate is re-checked after a wait.
+
+Writers do not block on these locks in the current optimistic model: a commit
+that touches a row locked by another transaction fails with `40001` and must be
+retried. The lock holder itself is protected; another worker can never commit
+over the row while the lock is held. There are no gap or predicate locks, so a
+concurrent INSERT that would match a locked range is not blocked. Locks are
+in-process and are not a substitute for MVCC or repeatable-read snapshots.
+`ROLLBACK TO SAVEPOINT` does not release locks acquired after the savepoint;
+they remain held until the transaction ends (stricter than PostgreSQL).
+
 **Indexes:**
 ```sql
 CREATE INDEX idx_users_email ON users(email);
