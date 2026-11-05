@@ -17,6 +17,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgerror"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqliteimport"
@@ -531,6 +532,13 @@ func sqlStateHTTPError(err error) *HTTPError {
 		return &HTTPError{
 			Status:  http.StatusBadRequest,
 			Code:    "0A000",
+			Message: message,
+		}
+	}
+	if errors.Is(err, pgerror.ErrInvalidText) {
+		return &HTTPError{
+			Status:  http.StatusBadRequest,
+			Code:    pgerror.CodeInvalidText,
 			Message: message,
 		}
 	}

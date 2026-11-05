@@ -59,7 +59,21 @@ func FormatExpr(expr Expr) string {
 		}
 		return strings.ToLower(e.Name) + "(" + prefix + strings.Join(args, ", ") + ")"
 	case *CastExpr:
-		return fmt.Sprintf("CAST(%s AS %s)", FormatExpr(e.Expr), e.Type.Name)
+		return fmt.Sprintf("CAST(%s AS %s)", FormatExpr(e.Expr), e.Type.SQLTypeName())
+	case *ArrayExpr:
+		elements := make([]string, len(e.Elements))
+		for i, element := range e.Elements {
+			elements[i] = FormatExpr(element)
+		}
+		return "ARRAY[" + strings.Join(elements, ", ") + "]"
+	case *SubscriptExpr:
+		return fmt.Sprintf("%s[%s]", FormatExpr(e.Expr), FormatExpr(e.Index))
+	case *AnyAllExpr:
+		quantifier := "ANY"
+		if e.All {
+			quantifier = "ALL"
+		}
+		return fmt.Sprintf("(%s %s %s(%s))", FormatExpr(e.Left), operatorString(e.Op), quantifier, FormatExpr(e.Array))
 	case *CaseExpr:
 		var b strings.Builder
 		b.WriteString("CASE")

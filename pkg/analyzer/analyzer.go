@@ -294,6 +294,27 @@ func (a *Analyzer) resolveFromClause(tables []parser.TableRef) error {
 // defineTableRef adds a single FROM/JOIN table to scope. The reference may be a
 // derived table (subquery), a CTE, or a real catalog table.
 func (a *Analyzer) defineTableRef(ref parser.TableRef) error {
+	if ref.Function != nil {
+		for _, arg := range ref.Function.Args {
+			if _, err := a.analyzeExpr(arg); err != nil {
+				return err
+			}
+		}
+		// unnest() produces one column with the function's name, matching
+		// PostgreSQL's output column name.
+		a.scope.DefineTable(&TableInfo{
+			Name:  ref.Name,
+			Alias: ref.Alias,
+			Columns: []ColumnInfo{{
+				Name:      strings.ToLower(ref.Function.Name),
+				Type:      TypeAny,
+				Nullable:  true,
+				TableName: ref.Name,
+			}},
+		})
+		return nil
+	}
+
 	if ref.Subquery != nil {
 		if err := a.analyzeSelect(ref.Subquery); err != nil {
 			return err
@@ -844,6 +865,12 @@ func (a *Analyzer) analyzeExpr(expr parser.Expr) (*ExprInfo, error) {
 		}, nil
 	case *parser.ExistsExpr:
 		return a.analyzeExistsExpr(e)
+	case *parser.ArrayExpr:
+		return a.analyzeArrayExpr(e)
+	case *parser.SubscriptExpr:
+		return a.analyzeSubscriptExpr(e)
+	case *parser.AnyAllExpr:
+		return a.analyzeAnyAllExpr(e)
 	case *parser.SubqueryExpr:
 		return a.analyzeSubqueryExpr(e)
 	case *parser.WindowExpr:
@@ -851,6 +878,67 @@ func (a *Analyzer) analyzeExpr(expr parser.Expr) (*ExprInfo, error) {
 	default:
 		return &ExprInfo{Type: TypeUnknown}, nil
 	}
+}
+
+// analyzeArrayExpr validates every element of an ARRAY[...] constructor.
+func (a *Analyzer) analyzeArrayExpr(e *parser.ArrayExpr) (*ExprInfo, error) {
+	info := &ExprInfo{Type: TypeUnknown}
+	for _, element := range e.Elements {
+		elementInfo, err := a.analyzeExpr(element)
+		if err != nil {
+			return nil, err
+		}
+		if elementInfo.IsAggregate {
+			info.IsAggregate = true
+		}
+		if elementInfo.Nullable || element == nil {
+			info.Nullable = true
+		}
+		if elementInfo.Type != TypeNull {
+			info.Type = elementInfo.Type
+		}
+	}
+	return info, nil
+}
+
+// analyzeSubscriptExpr validates the array expression and the index of arr[idx].
+func (a *Analyzer) analyzeSubscriptExpr(e *parser.SubscriptExpr) (*ExprInfo, error) {
+	arrayInfo, err := a.analyzeExpr(e.Expr)
+	if err != nil {
+		return nil, err
+	}
+	indexInfo, err := a.analyzeExpr(e.Index)
+	if err != nil {
+		return nil, err
+	}
+	if indexInfo.Type != TypeUnknown && indexInfo.Type != TypeNull && !indexInfo.Type.IsNumeric() {
+		return nil, &AnalysisError{
+			Type:    ErrTypeMismatch,
+			Message: "array subscript must be an integer expression",
+		}
+	}
+	return &ExprInfo{
+		Type:        arrayInfo.Type,
+		IsAggregate: arrayInfo.IsAggregate || indexInfo.IsAggregate,
+		Nullable:    true,
+	}, nil
+}
+
+// analyzeAnyAllExpr validates both sides of a quantified comparison.
+func (a *Analyzer) analyzeAnyAllExpr(e *parser.AnyAllExpr) (*ExprInfo, error) {
+	leftInfo, err := a.analyzeExpr(e.Left)
+	if err != nil {
+		return nil, err
+	}
+	arrayInfo, err := a.analyzeExpr(e.Array)
+	if err != nil {
+		return nil, err
+	}
+	return &ExprInfo{
+		Type:        TypeBoolean,
+		IsAggregate: leftInfo.IsAggregate || arrayInfo.IsAggregate,
+		Nullable:    true,
+	}, nil
 }
 
 // analyzeWindowExpr analyzes a window function. Window functions are not

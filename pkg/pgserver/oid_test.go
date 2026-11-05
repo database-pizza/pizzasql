@@ -428,3 +428,31 @@ func TestEmptyResultWildcardMatchesNames(t *testing.T) {
 		})
 	}
 }
+
+func TestGetOIDForTypeArrays(t *testing.T) {
+	c := &Connection{}
+	cases := map[string]int32{
+		"TEXT[]":             1009,
+		"VARCHAR[]":          1015,
+		"VARCHAR(10)[]":      1015,
+		"CHAR[]":             1009,
+		"INTEGER[]":          1007,
+		"INT[]":              1007,
+		"BIGINT[]":           1016,
+		"SMALLINT[]":         1016,
+		"BOOLEAN[]":          1000,
+		"BOOL[]":             1000,
+		"REAL[]":             1021,
+		"DOUBLE[]":           1022,
+		"DOUBLE PRECISION[]": 1022,
+		"NUMERIC[]":          1231,
+	}
+	for name, want := range cases {
+		if got := c.getOIDForType(name); got != want {
+			t.Errorf("getOIDForType(%q) = %d, want %d", name, got, want)
+		}
+		if size := c.getTypeSizeForType(name); size != -1 {
+			t.Errorf("getTypeSizeForType(%q) = %d, want -1", name, size)
+		}
+	}
+}

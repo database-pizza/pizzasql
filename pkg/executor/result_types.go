@@ -149,10 +149,16 @@ func inferExprType(expr parser.Expr, resolve columnTypeResolver) string {
 	case *parser.LiteralExpr:
 		return literalType(e)
 	case *parser.CastExpr:
-		if typeName, ok := castResultType(e.Type.Name); ok {
+		if typeName, ok := castResultType(e.Type.SQLTypeName()); ok {
 			return typeName
 		}
 		return "TEXT"
+	case *parser.ArrayExpr:
+		return arrayConstructorType(e, resolve)
+	case *parser.SubscriptExpr:
+		return subscriptResultType(e, resolve)
+	case *parser.AnyAllExpr:
+		return "BOOLEAN"
 	case *parser.FunctionCall:
 		return functionResultType(e, resolve)
 	case *parser.BinaryExpr:
@@ -203,6 +209,9 @@ func literalType(lit *parser.LiteralExpr) string {
 // real targets, and it does not range-check them. A narrower advertised type
 // (int2/int4/float4) could otherwise fail to decode a value the engine accepted.
 func castResultType(name string) (string, bool) {
+	if element, isArray := arrayElementType(name); isArray {
+		return arrayResultTypeName(element), true
+	}
 	switch strings.ToUpper(strings.TrimSpace(name)) {
 	case "INTEGER", "INT", "SMALLINT", "TINYINT", "MEDIUMINT", "BIGINT":
 		return "BIGINT", true
@@ -214,6 +223,63 @@ func castResultType(name string) (string, bool) {
 		return "BLOB", true
 	default:
 		return "", false
+	}
+}
+
+// arrayConstructorType reports the array type of an ARRAY[...] constructor. The
+// element type follows the first non-NULL element; a constructor mixing element
+// types falls back to TEXT[].
+func arrayConstructorType(expr *parser.ArrayExpr, resolve columnTypeResolver) string {
+	elementType := ""
+	for _, element := range expr.Elements {
+		typeName := inferExprType(element, resolve)
+		if isUnknownTypeName(typeName) {
+			continue
+		}
+		if elementType == "" {
+			elementType = typeName
+			continue
+		}
+		if !strings.EqualFold(elementType, typeName) {
+			elementType = "TEXT"
+		}
+	}
+	if elementType == "" {
+		elementType = "TEXT"
+	}
+	return arrayResultTypeName(elementType)
+}
+
+// subscriptResultType reports the element type of an array subscript. A
+// subscript of a non-array expression keeps the TEXT fallback.
+func subscriptResultType(expr *parser.SubscriptExpr, resolve columnTypeResolver) string {
+	if element, ok := arrayElementType(inferExprType(expr.Expr, resolve)); ok {
+		return element
+	}
+	return "TEXT"
+}
+
+// arrayResultTypeName maps an element type name to the type name the wire layer
+// reports for the array. The mapping follows the element's carrier: INTEGER is
+// int4 and REAL is float4, matching the scalar mappings; narrower integer types
+// report int8[] because values are not range-checked, and NUMERIC/DECIMAL report
+// float8[] because the engine carries them as float64.
+func arrayResultTypeName(elementType string) string {
+	switch strings.ToUpper(strings.TrimSpace(elementType)) {
+	case "INTEGER", "INT", "INT4":
+		return "INTEGER[]"
+	case "BIGINT", "INT8", "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+		return "BIGINT[]"
+	case "REAL", "FLOAT", "FLOAT4":
+		return "REAL[]"
+	case "DOUBLE", "FLOAT8", "NUMERIC", "DECIMAL":
+		return "DOUBLE[]"
+	case "BOOLEAN", "BOOL":
+		return "BOOLEAN[]"
+	case "VARCHAR", "NVARCHAR", "CHARACTER VARYING":
+		return "VARCHAR[]"
+	default:
+		return "TEXT[]"
 	}
 }
 
@@ -231,6 +297,8 @@ func functionResultType(fn *parser.FunctionCall, resolve columnTypeResolver) str
 		return "DOUBLE"
 	case "AVG":
 		return "DOUBLE"
+	case "ARRAY_LENGTH":
+		return "INTEGER"
 	case "MIN", "MAX":
 		// MIN/MAX return one of the input values unchanged.
 		return firstArgType(fn, resolve)

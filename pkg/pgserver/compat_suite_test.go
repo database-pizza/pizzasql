@@ -135,7 +135,18 @@ func TestCompatibilitySuite(t *testing.T) {
 	expectRows("ddl.parenthesized_defaults_applied", `SELECT count(*) FROM paren_defaults WHERE a IS NOT NULL AND b IS NOT NULL`, "1")
 	expectCode("ddl.nonconstant_default_0A000", `CREATE TABLE bad_default (id INTEGER PRIMARY KEY, token TEXT DEFAULT lower('x'))`, "0A000")
 	expectCode("locking.for_update_0A000", `SELECT * FROM accounts FOR UPDATE`, "0A000")
-	expectCode("arrays.any_0A000", `SELECT * FROM accounts WHERE id = ANY('{1,2}')`, "0A000")
+
+	// Array types, array literals, ANY/ALL, and array parameters.
+	expectOK("arrays.ddl", `CREATE TABLE array_values (id INTEGER PRIMARY KEY, tags TEXT[], nums INTEGER[])`)
+	expectOK("arrays.insert", `INSERT INTO array_values VALUES (1, '{a,b}', '{1,2,NULL}')`)
+	expectRows("arrays.any", `SELECT count(*) FROM array_values WHERE 'a' = ANY(tags)`, "1")
+	expectRows("arrays.any_null_element", `SELECT count(*) FROM array_values WHERE 3 = ANY(nums)`, "0")
+	expectRows("arrays.all", `SELECT count(*) FROM array_values WHERE 9 <> ALL('{1,2}')`, "1")
+	expectRows("arrays.all_null_element", `SELECT count(*) FROM array_values WHERE 9 <> ALL(nums)`, "0")
+	expectRows("arrays.subscript", `SELECT tags[1] FROM array_values`, "a")
+	expectRows("arrays.length", `SELECT array_length(tags, 1) FROM array_values`, "2")
+	expectRows("arrays.any_parameter", `SELECT count(*) FROM array_values WHERE id = ANY('{1}')`, "1")
+	expectCode("arrays.multidim_0A000", `CREATE TABLE array_bad (v INTEGER[][])`, "0A000")
 
 	// CHECK and FOREIGN KEY are accepted and enforced.
 	expectOK("ddl.check_accepted", `CREATE TABLE checked (n INTEGER CHECK (n > 0))`)

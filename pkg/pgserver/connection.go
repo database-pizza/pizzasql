@@ -426,6 +426,11 @@ func (c *Connection) handleQuery(msg *Message) error {
 			if errors.Is(err, storage.ErrSerialization) {
 				code = ErrCodeSerializationFailure
 				c.txStatus = TxStatusIdle
+			} else if errors.Is(err, pgerror.ErrInvalidText) {
+				code = ErrCodeInvalidText
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			} else if errors.As(err, &notNullErr) {
 				code = "23502"
 				if _, commit := stmt.(*parser.CommitStmt); commit {
@@ -585,6 +590,9 @@ func (c *Connection) handleBind(msg *Message) error {
 		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
 			code = ErrCodeFeatureNotSupported
 		}
+		if errors.Is(err, pgerror.ErrInvalidText) {
+			code = ErrCodeInvalidText
+		}
 		return c.failExtended(code, err)
 	}
 	c.portals[portalName] = &portal{query: query}
@@ -690,6 +698,11 @@ func (c *Connection) handleExecute(msg *Message) error {
 		if errors.Is(err, storage.ErrSerialization) {
 			code = ErrCodeSerializationFailure
 			c.txStatus = TxStatusIdle
+		} else if errors.Is(err, pgerror.ErrInvalidText) {
+			code = ErrCodeInvalidText
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
 		} else if errors.As(err, &notNullErr) {
 			code = "23502"
 			if _, commit := stmt.(*parser.CommitStmt); commit {
@@ -1129,6 +1142,9 @@ func parameterLiteral(param boundParameter) (string, error) {
 		return "NULL", nil
 	}
 	if param.format == 1 {
+		if _, isArray := arrayParamElementType(param.oid); isArray {
+			return "", fmt.Errorf("%w: binary array parameter format for OID %d; send arrays in text format", pgerror.ErrFeatureNotSupported, param.oid)
+		}
 		switch param.oid {
 		case 16:
 			if len(param.value) != 1 {
@@ -1158,6 +1174,17 @@ func parameterLiteral(param boundParameter) (string, error) {
 		}
 	}
 	value := string(param.value)
+	if element, isArray := arrayParamElementType(param.oid); isArray {
+		// The bound value is PostgreSQL array text. Validate and canonicalize it
+		// now so a malformed array fails at Bind instead of during row
+		// evaluation, then emit a typed literal the executor accepts unchanged.
+		arrayType := element + "[]"
+		canonical, err := executor.CanonicalizeArrayText(value, arrayType)
+		if err != nil {
+			return "", err
+		}
+		return "'" + strings.ReplaceAll(canonical, "'", "''") + "'::" + arrayType, nil
+	}
 	switch param.oid {
 	case 0:
 		if strings.EqualFold(value, "true") || strings.EqualFold(value, "false") {
@@ -1447,6 +1474,72 @@ func (c *Connection) writeMessage(msgType byte, data []byte) error {
 	return WriteMessage(c.writer, msgType, data)
 }
 
+// arrayElementTypeName reports the element type of an array type name such as
+// "INTEGER[]". It reports false for scalar type names.
+func arrayElementTypeName(typeName string) (string, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(typeName))
+	if !strings.HasSuffix(upper, "[]") {
+		return "", false
+	}
+	return strings.TrimSpace(strings.TrimSuffix(upper, "[]")), true
+}
+
+// arrayOIDForElement maps an array element type name to its PostgreSQL array
+// OID. Narrower integer types report int8[] because values are not
+// range-checked, matching the scalar carrier rule; NUMERIC reports numeric[]
+// because array elements stay text.
+func arrayOIDForElement(element string) int32 {
+	base := strings.ToUpper(strings.TrimSpace(element))
+	if idx := strings.IndexByte(base, '('); idx >= 0 {
+		base = strings.TrimSpace(base[:idx])
+	}
+	switch base {
+	case "INTEGER", "INT", "INT4":
+		return 1007 // INT4ARRAYOID
+	case "BIGINT", "INT8", "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
+		return 1016 // INT8ARRAYOID
+	case "BOOLEAN", "BOOL":
+		return 1000 // BOOLARRAYOID
+	case "REAL", "FLOAT", "FLOAT4":
+		return 1021 // FLOAT4ARRAYOID
+	case "DOUBLE", "DOUBLE PRECISION", "FLOAT8":
+		return 1022 // FLOAT8ARRAYOID
+	case "NUMERIC", "DECIMAL":
+		return 1231 // NUMERICARRAYOID
+	case "VARCHAR", "NVARCHAR", "CHARACTER VARYING":
+		return 1015 // VARCHARARRAYOID
+	default:
+		return 1009 // TEXTARRAYOID
+	}
+}
+
+// arrayParamElementType maps an array parameter OID to the element type the
+// bound literal is cast to. Unknown OIDs are handled by callers.
+func arrayParamElementType(oid int32) (string, bool) {
+	switch oid {
+	case 1009:
+		return "TEXT", true
+	case 1015:
+		return "VARCHAR", true
+	case 1007:
+		return "INTEGER", true
+	case 1016:
+		return "BIGINT", true
+	case 1005:
+		return "SMALLINT", true
+	case 1000:
+		return "BOOLEAN", true
+	case 1021:
+		return "REAL", true
+	case 1022:
+		return "DOUBLE", true
+	case 1231:
+		return "NUMERIC", true
+	default:
+		return "", false
+	}
+}
+
 // getOIDForType returns PostgreSQL OID for type.
 //
 // Types narrower than the value the engine carries are reported as the carrier
@@ -1455,6 +1548,9 @@ func (c *Connection) writeMessage(msgType byte, data []byte) error {
 // than having been rejected on write. INTEGER and REAL keep their declared
 // mappings, which predate this rule and are what existing clients expect.
 func (c *Connection) getOIDForType(typeName string) int32 {
+	if element, ok := arrayElementTypeName(typeName); ok {
+		return arrayOIDForElement(element)
+	}
 	switch strings.ToUpper(typeName) {
 	case "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
 		// Carried as int64 and not range-checked, so int8 is the honest type.
@@ -1492,6 +1588,9 @@ func (c *Connection) getOIDForType(typeName string) int32 {
 
 // getTypeSizeForType returns type size in bytes, or -1 for variable length.
 func (c *Connection) getTypeSizeForType(typeName string) int16 {
+	if _, ok := arrayElementTypeName(typeName); ok {
+		return -1 // arrays are variable length
+	}
 	switch strings.ToUpper(typeName) {
 	case "SMALLINT", "INT2", "TINYINT", "MEDIUMINT":
 		return 8 // Reported as int8; see getOIDForType.

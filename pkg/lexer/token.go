@@ -199,6 +199,11 @@ const (
 	TokenCONFLICT
 	TokenDO
 	TokenNOTHING
+
+	// PostgreSQL-style syntax
+	TokenColonColon // ::
+	TokenLBracket   // [ (only when it subscripts an expression)
+	TokenRBracket   // ]
 )
 
 var keywords = map[string]TokenType{
@@ -422,6 +427,9 @@ var tokenNames = map[TokenType]string{
 	TokenComma:      ",",
 	TokenSemicolon:  ";",
 	TokenDot:        ".",
+	TokenColonColon: "::",
+	TokenLBracket:   "[",
+	TokenRBracket:   "]",
 }
 
 func (t TokenType) String() string {

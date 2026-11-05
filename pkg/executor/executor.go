@@ -384,7 +384,7 @@ func isCountStarSingleTable(stmt *parser.SelectStmt) bool {
 		return false
 	}
 	ref := stmt.From[0]
-	if ref.Subquery != nil || ref.Join != nil {
+	if ref.Subquery != nil || ref.Join != nil || ref.Function != nil {
 		return false
 	}
 	if len(stmt.Columns) != 1 || stmt.Columns[0].Star {
@@ -411,6 +411,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if len(stmt.From) == 0 {
 		// SELECT without FROM (e.g., SELECT 1+1)
 		return e.executeSelectExpr(stmt)
+	}
+
+	if stmt.From[0].Function != nil {
+		return e.executeSelectFromTableFunction(stmt)
 	}
 
 	// Non-recursive CTEs are desugared to derived tables by the parser. Preserve
@@ -1503,6 +1507,65 @@ func (e *Executor) executeSelectExpr(stmt *parser.SelectStmt) (*Result, error) {
 	}
 	result.AddRow(values...)
 
+	return result, nil
+}
+
+// executeSelectFromTableFunction materializes unnest(array) as a one-column
+// relation and runs the rest of the SELECT over it. The parser restricts this
+// form to a single FROM entry with no joins.
+func (e *Executor) executeSelectFromTableFunction(stmt *parser.SelectStmt) (*Result, error) {
+	ref := stmt.From[0]
+	if !strings.EqualFold(ref.Function.Name, "unnest") {
+		return nil, pgerror.Unsupported("table function %s() is not supported", ref.Function.Name)
+	}
+	if len(ref.Function.Args) != 1 {
+		return nil, fmt.Errorf("unnest() requires exactly one array argument")
+	}
+	value, err := e.evalExpr(ref.Function.Args[0], nil)
+	if err != nil {
+		return nil, fmt.Errorf("unnest argument: %w", err)
+	}
+	elementType := "TEXT"
+	if typeName := inferExprType(ref.Function.Args[0], nil); typeName != "" {
+		if element, ok := arrayElementType(typeName); ok {
+			elementType = element
+		}
+	}
+	rows := make([][]interface{}, 0)
+	if value != nil {
+		elements, parseErr := parseArrayLiteral(toString(value))
+		if parseErr != nil {
+			return nil, fmt.Errorf("unnest requires an array value: %w", parseErr)
+		}
+		for _, element := range elements {
+			typed, valueErr := arrayElementValue(element, elementType)
+			if valueErr != nil {
+				return nil, fmt.Errorf("unnest element: %w", valueErr)
+			}
+			rows = append(rows, []interface{}{typed})
+		}
+	}
+	column := "unnest"
+	result, err := e.executeSelectOnMaterialized(stmt, []string{column}, rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Columns) == len(stmt.Columns) {
+		types := make([]string, 0, len(stmt.Columns))
+		for _, projection := range stmt.Columns {
+			if projection.Star {
+				types = append(types, elementType)
+				continue
+			}
+			types = append(types, inferExprType(projection.Expr, func(_, columnName string) (string, bool) {
+				if strings.EqualFold(columnName, column) {
+					return elementType, true
+				}
+				return "", false
+			}))
+		}
+		result.ColumnTypes = types
+	}
 	return result, nil
 }
 
@@ -2743,6 +2806,9 @@ func (e *Executor) applyUpsert(table string, schema *storage.Schema, existing, r
 			updates[assignment.Column] = value
 			merged[assignment.Column] = value
 		}
+		if normalizeErr := e.normalizeArrayRow(schema, updates); normalizeErr != nil {
+			return nil, normalizeErr
+		}
 		// Recompute STORED generated columns so an upsert keeps them current.
 		if err := e.applyGeneratedColumns(schema, merged); err != nil {
 			return nil, err
@@ -2951,6 +3017,11 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 // RETURNING. An ON CONFLICT DO UPDATE returns the merged existing row, not the
 // candidate, so RETURNING and unique-target upserts observe the real row.
 func (e *Executor) insertOneRow(tableName string, schema *storage.Schema, row storage.Row, stmt *parser.InsertStmt, wantStored bool) (int64, bool, bool, storage.Row, error) {
+	// Canonicalize array column values once, before conflict matching reads
+	// them and before storage encodes them.
+	if err := e.normalizeArrayRow(schema, row); err != nil {
+		return 0, false, false, nil, err
+	}
 	if stmt.OnConflict == parser.ConflictIgnore || (stmt.ConflictDoNothing && len(stmt.ConflictTarget) == 0) {
 		conflict, err := e.hasAnyInsertConflict(tableName, schema, row)
 		if err != nil {
@@ -3256,6 +3327,16 @@ func (e *Executor) primeSubqueries(expr parser.Expr) {
 			walk(n.Expr)
 		case *parser.CastExpr:
 			walk(n.Expr)
+		case *parser.ArrayExpr:
+			for _, element := range n.Elements {
+				walk(element)
+			}
+		case *parser.SubscriptExpr:
+			walk(n.Expr)
+			walk(n.Index)
+		case *parser.AnyAllExpr:
+			walk(n.Left)
+			walk(n.Array)
 		}
 	}
 	walk(expr)
@@ -3313,6 +3394,9 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 			}
 			updates[assign.Column] = val
 			merged[assign.Column] = val
+		}
+		if err := e.normalizeArrayRow(schema, updates); err != nil {
+			return nil, err
 		}
 		if err := e.applyGeneratedColumns(schema, merged); err != nil {
 			return nil, err
@@ -3496,6 +3580,9 @@ func (e *Executor) executeUpdateFrom(stmt *parser.UpdateStmt, schema *storage.Sc
 				return nil, err
 			}
 			row[assign.Column] = val
+		}
+		if err := e.normalizeArrayRow(schema, row); err != nil {
+			return nil, err
 		}
 		if err := e.applyGeneratedColumns(schema, row); err != nil {
 			return nil, err
@@ -3756,7 +3843,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	for _, colDef := range stmt.Columns {
 		col := storage.Column{
 			Name:     colDef.Name,
-			Type:     colDef.Type.Name,
+			Type:     colDef.Type.SQLTypeName(),
 			Nullable: true,
 		}
 
@@ -3789,6 +3876,10 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			case parser.ConstraintDefault:
 				if constraint.Default != nil {
 					val, exprText, err := defaultColumnValue(e, col.Name, constraint.Default)
+					if err != nil {
+						return nil, err
+					}
+					val, exprText, err = canonicalArrayDefault(col.Type, val, exprText)
 					if err != nil {
 						return nil, err
 					}
@@ -4280,7 +4371,7 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 
 	col := storage.Column{
 		Name:     action.Column.Name,
-		Type:     action.Column.Type.Name,
+		Type:     action.Column.Type.SQLTypeName(),
 		Nullable: true,
 	}
 	var uniqueConstraint *parser.ColumnConstraint
@@ -4302,6 +4393,10 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 		case parser.ConstraintDefault:
 			if constraint.Default != nil {
 				val, exprText, err := defaultColumnValue(e, col.Name, constraint.Default)
+				if err != nil {
+					return nil, err
+				}
+				val, exprText, err = canonicalArrayDefault(col.Type, val, exprText)
 				if err != nil {
 					return nil, err
 				}
@@ -5095,6 +5190,12 @@ func (e *Executor) evalExpr(expr parser.Expr, row storage.Row) (interface{}, err
 		return e.evalSubqueryExpr(ex, row)
 	case *parser.ExistsExpr:
 		return e.evalExistsExpr(ex, row)
+	case *parser.ArrayExpr:
+		return e.evalArrayExpr(ex, row)
+	case *parser.SubscriptExpr:
+		return e.evalSubscriptExpr(ex, row)
+	case *parser.AnyAllExpr:
+		return e.evalAnyAllExpr(ex, row)
 	default:
 		return nil, fmt.Errorf("unsupported expression type: %T", expr)
 	}
@@ -5924,6 +6025,10 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		return evalTimediffFunc(args)
 	case "PERCENT_DIFF":
 		return evalPercentDiff(args)
+	case "ARRAY_LENGTH":
+		return evalArrayLength(args)
+	case "UNNEST":
+		return nil, pgerror.Unsupported("unnest() is only supported as a table function in FROM, as in SELECT * FROM unnest(array)")
 	case "PIZZASQL_VERSION":
 		return version.String(), nil
 	case "SQLITE_VERSION":
@@ -6214,6 +6319,9 @@ func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interfa
 
 	if val == nil {
 		return nil, nil // CAST(NULL AS any) = NULL
+	}
+	if expr.Type.Array {
+		return evalArrayCast(expr.Type, val)
 	}
 
 	typeName := strings.ToUpper(expr.Type.Name)
@@ -6769,6 +6877,9 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if val == nil {
 			return nil, nil
 		}
+		if ex.Type.Array {
+			return evalArrayCast(ex.Type, val)
+		}
 		switch strings.ToUpper(ex.Type.Name) {
 		case "INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT", "SIGNED":
 			if isIntVal(val) {
@@ -6891,6 +7002,47 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			}
 			return compare(val, high) <= 0, nil
 		}
+	case *parser.ArrayExpr:
+		elements := make([]*string, len(ex.Elements))
+		for i, element := range ex.Elements {
+			value, err := e.evalExprWithAggregates(element, rows)
+			if err != nil {
+				return nil, err
+			}
+			text, err := arrayValueElement(value)
+			if err != nil {
+				return nil, fmt.Errorf("ARRAY element %d: %w", i+1, err)
+			}
+			elements[i] = text
+		}
+		return formatArrayLiteral(elements), nil
+	case *parser.SubscriptExpr:
+		value, err := e.evalExprWithAggregates(ex.Expr, rows)
+		if err != nil {
+			return nil, err
+		}
+		index, err := e.evalExprWithAggregates(ex.Index, rows)
+		if err != nil {
+			return nil, err
+		}
+		return subscriptArrayValue(value, index)
+	case *parser.AnyAllExpr:
+		left, err := e.evalExprWithAggregates(ex.Left, rows)
+		if err != nil {
+			return nil, err
+		}
+		arrayValue, err := e.evalExprWithAggregates(ex.Array, rows)
+		if err != nil {
+			return nil, err
+		}
+		if arrayValue == nil {
+			return nil, nil
+		}
+		elements, err := parseArrayLiteral(toString(arrayValue))
+		if err != nil {
+			return nil, fmt.Errorf("ANY/ALL requires an array operand: %w", err)
+		}
+		return evalQuantifiedComparison(ex.Op, ex.All, left, elements)
 	case *parser.InExpr:
 		left, err := e.evalExprWithAggregates(ex.Left, rows)
 		if err != nil {
@@ -7056,6 +7208,17 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 		}
 	case *parser.CastExpr:
 		return e.isAggregate(ex.Expr)
+	case *parser.ArrayExpr:
+		for _, element := range ex.Elements {
+			if e.isAggregate(element) {
+				return true
+			}
+		}
+		return false
+	case *parser.SubscriptExpr:
+		return e.isAggregate(ex.Expr) || e.isAggregate(ex.Index)
+	case *parser.AnyAllExpr:
+		return e.isAggregate(ex.Left) || e.isAggregate(ex.Array)
 	case *parser.IsNullExpr:
 		return e.isAggregate(ex.Left)
 	case *parser.IsDistinctExpr:
@@ -7648,6 +7811,16 @@ func collectColumnRefs(expr parser.Expr) []string {
 			walk(n.Expr)
 		case *parser.CastExpr:
 			walk(n.Expr)
+		case *parser.ArrayExpr:
+			for _, element := range n.Elements {
+				walk(element)
+			}
+		case *parser.SubscriptExpr:
+			walk(n.Expr)
+			walk(n.Index)
+		case *parser.AnyAllExpr:
+			walk(n.Left)
+			walk(n.Array)
 		case *parser.SubqueryExpr:
 			// Subqueries may reference outer columns
 			hasSubquery = true
@@ -7716,6 +7889,16 @@ func collectTableColumnRefs(expr parser.Expr) []tableColRef {
 			walk(n.Expr)
 		case *parser.CastExpr:
 			walk(n.Expr)
+		case *parser.ArrayExpr:
+			for _, element := range n.Elements {
+				walk(element)
+			}
+		case *parser.SubscriptExpr:
+			walk(n.Expr)
+			walk(n.Index)
+		case *parser.AnyAllExpr:
+			walk(n.Left)
+			walk(n.Array)
 		}
 	}
 	walk(expr)

@@ -499,7 +499,7 @@ func (p *Parser) parseSelectColumns() ([]SelectColumn, error) {
 func (p *Parser) parseTableRefs() ([]TableRef, error) {
 	var tables []TableRef
 
-	table, err := p.parseTableRef()
+	table, err := p.parseTableRef(true)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +509,7 @@ func (p *Parser) parseTableRefs() ([]TableRef, error) {
 	for {
 		if p.curTokenIs(lexer.TokenComma) {
 			p.nextToken()
-			table, err := p.parseTableRef()
+			table, err := p.parseTableRef(true)
 			if err != nil {
 				return nil, err
 			}
@@ -539,10 +539,19 @@ func (p *Parser) parseTableRefs() ([]TableRef, error) {
 		}
 	}
 
+	for _, table := range tables {
+		if table.Function == nil {
+			continue
+		}
+		if len(tables) > 1 || table.Join != nil {
+			return nil, pgerror.Unsupported("unnest(array) in FROM must be the only table reference; joins around a table function are not supported")
+		}
+	}
+
 	return tables, nil
 }
 
-func (p *Parser) parseTableRef() (*TableRef, error) {
+func (p *Parser) parseTableRef(allowFunction bool) (*TableRef, error) {
 	ref := &TableRef{}
 
 	// Check for subquery (SELECT ...)
@@ -607,6 +616,31 @@ func (p *Parser) parseTableRef() (*TableRef, error) {
 
 	ref.Name = p.curToken.Literal
 	p.nextToken()
+
+	// Table function: FROM unnest(array). Only unnest is recognized; other
+	// function names in FROM are reported as an unknown table.
+	if allowFunction && p.curTokenIs(lexer.TokenLParen) {
+		if !strings.EqualFold(ref.Name, "unnest") {
+			return nil, pgerror.Unsupported("table function %s() is not supported; only unnest(array) is available in FROM", ref.Name)
+		}
+		call, err := p.parseFunctionCall(ref.Name)
+		if err != nil {
+			return nil, err
+		}
+		fn, ok := call.(*FunctionCall)
+		if !ok {
+			return nil, p.curError("invalid table function")
+		}
+		ref.Function = fn
+		if p.curTokenIs(lexer.TokenAS) {
+			p.nextToken()
+		}
+		if p.curTokenIs(lexer.TokenIdent) && !p.isClauseKeyword() {
+			ref.Alias = p.curToken.Literal
+			p.nextToken()
+		}
+		return ref, nil
+	}
 
 	// Check for schema.table
 	if p.curTokenIs(lexer.TokenDot) {
@@ -732,7 +766,7 @@ func (p *Parser) parseJoin() (*JoinClause, error) {
 	}
 
 	// Parse table reference
-	table, err := p.parseTableRef()
+	table, err := p.parseTableRef(true)
 	if err != nil {
 		return nil, err
 	}
@@ -845,7 +879,7 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 	p.nextToken()
 
 	// Parse table name
-	table, err := p.parseTableRef()
+	table, err := p.parseTableRef(false)
 	if err != nil {
 		return nil, err
 	}
@@ -1006,7 +1040,7 @@ func (p *Parser) parseUpdate() (*UpdateStmt, error) {
 	p.nextToken() // consume UPDATE
 
 	// Parse table name
-	table, err := p.parseTableRef()
+	table, err := p.parseTableRef(false)
 	if err != nil {
 		return nil, err
 	}
@@ -1087,7 +1121,7 @@ func (p *Parser) parseDelete() (*DeleteStmt, error) {
 	p.nextToken()
 
 	// Parse table name
-	table, err := p.parseTableRef()
+	table, err := p.parseTableRef(false)
 	if err != nil {
 		return nil, err
 	}
@@ -1170,7 +1204,7 @@ func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
 	}
 
 	// Parse table name
-	table, err := p.parseTableRef()
+	table, err := p.parseTableRef(false)
 	if err != nil {
 		return nil, err
 	}
@@ -1337,6 +1371,12 @@ func (p *Parser) parseDataType() (*DataType, error) {
 		p.nextToken()
 	}
 
+	// DOUBLE PRECISION is the PostgreSQL spelling of the DOUBLE type. PRECISION
+	// is not a reserved word, so consume it as a trailing type qualifier.
+	if dt.Name == "DOUBLE" && p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "PRECISION") {
+		p.nextToken()
+	}
+
 	// Check for precision/scale
 	if p.curTokenIs(lexer.TokenLParen) {
 		p.nextToken()
@@ -1362,7 +1402,39 @@ func (p *Parser) parseDataType() (*DataType, error) {
 		p.nextToken()
 	}
 
+	// A single trailing [] declares a one-dimensional array. Only element types
+	// the engine can encode are accepted.
+	if p.curTokenIs(lexer.TokenLBracket) {
+		if !p.peekTokenIs(lexer.TokenRBracket) {
+			return nil, p.curError("expected ] after [ in array type")
+		}
+		p.nextToken() // [
+		p.nextToken() // ]
+		if p.curTokenIs(lexer.TokenLBracket) {
+			return nil, pgerror.Unsupported("multidimensional arrays are not supported; declare a single trailing []")
+		}
+		if !isSupportedArrayElementType(dt.Name) {
+			return nil, pgerror.Unsupported("arrays of %s are not supported; supported element types are TEXT, VARCHAR, INTEGER, BIGINT, SMALLINT, BOOLEAN, REAL, DOUBLE PRECISION, and NUMERIC", dt.Name)
+		}
+		dt.Array = true
+	}
+
 	return dt, nil
+}
+
+// isSupportedArrayElementType reports whether an element type name can be
+// encoded as an array element. The list mirrors the element types the executor
+// canonicalizes and the pgserver advertises array OIDs for.
+func isSupportedArrayElementType(name string) bool {
+	switch strings.ToUpper(name) {
+	case "TEXT", "VARCHAR", "CHAR", "CHARACTER", "CLOB", "NCHAR", "NVARCHAR",
+		"INTEGER", "INT", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT",
+		"BOOLEAN", "BOOL",
+		"REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Parser) isDataTypeKeyword() bool {
@@ -1860,7 +1932,7 @@ func (p *Parser) parseDropTable() (*DropTableStmt, error) {
 
 	// Parse table names
 	for {
-		table, err := p.parseTableRef()
+		table, err := p.parseTableRef(false)
 		if err != nil {
 			return nil, err
 		}
@@ -1955,7 +2027,7 @@ func (p *Parser) parseDropView() (*DropViewStmt, error) {
 	}
 
 	for {
-		view, err := p.parseTableRef()
+		view, err := p.parseTableRef(false)
 		if err != nil {
 			return nil, err
 		}
@@ -2515,10 +2587,27 @@ func (p *Parser) parseComparisonExpr() (Expr, error) {
 		return nil, p.curError("expected IN, BETWEEN, or LIKE after NOT")
 	}
 
-	// Handle comparison operators
+	// Handle comparison operators, including the quantified forms
+	// `expr op ANY(array)` and `expr op ALL(array)`.
 	if isComparisonOp(p.curToken.Type) {
 		op := p.curToken.Type
 		p.nextToken()
+		if p.curTokenIs(lexer.TokenALL) && p.peekTokenIs(lexer.TokenLParen) {
+			p.nextToken() // ALL
+			array, err := p.parseQuantifierArray()
+			if err != nil {
+				return nil, err
+			}
+			return &AnyAllExpr{Left: left, Op: op, All: true, Array: array}, nil
+		}
+		if p.curTokenIs(lexer.TokenIdent) && strings.EqualFold(p.curToken.Literal, "ANY") && p.peekTokenIs(lexer.TokenLParen) {
+			p.nextToken() // ANY
+			array, err := p.parseQuantifierArray()
+			if err != nil {
+				return nil, err
+			}
+			return &AnyAllExpr{Left: left, Op: op, Array: array}, nil
+		}
 		right, err := p.parseBitwiseExpr()
 		if err != nil {
 			return nil, err
@@ -2527,6 +2616,63 @@ func (p *Parser) parseComparisonExpr() (Expr, error) {
 	}
 
 	return left, nil
+}
+
+// parseQuantifierArray parses the parenthesized operand of ANY(...) or
+// ALL(...). Arrays are the only supported operand; a subquery would need a
+// materialized set the executor does not build for this form.
+func (p *Parser) parseQuantifierArray() (Expr, error) {
+	if !p.curTokenIs(lexer.TokenLParen) {
+		return nil, p.curError("expected ( after ANY or ALL")
+	}
+	p.nextToken()
+	if p.curTokenIs(lexer.TokenSELECT) {
+		return nil, pgerror.Unsupported("ANY/ALL over a subquery is not supported; pass an array value instead")
+	}
+	array, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.curTokenIs(lexer.TokenRParen) {
+		return nil, p.curError("expected ) after ANY/ALL operand")
+	}
+	p.nextToken()
+	return array, nil
+}
+
+// parseArrayConstructor parses ARRAY[...] with the current token on ARRAY.
+// Nested constructors and nested array literals are rejected: PizzaSQL has no
+// multidimensional arrays.
+func (p *Parser) parseArrayConstructor() (Expr, error) {
+	p.nextToken() // ARRAY
+	if !p.curTokenIs(lexer.TokenLBracket) {
+		return nil, p.curError("expected [ after ARRAY")
+	}
+	p.nextToken()
+	expr := &ArrayExpr{}
+	if p.curTokenIs(lexer.TokenRBracket) {
+		p.nextToken()
+		return expr, nil
+	}
+	for {
+		element, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, nested := element.(*ArrayExpr); nested {
+			return nil, pgerror.Unsupported("multidimensional arrays are not supported; ARRAY[...] elements must be scalars")
+		}
+		expr.Elements = append(expr.Elements, element)
+		if p.curTokenIs(lexer.TokenComma) {
+			p.nextToken()
+			continue
+		}
+		if !p.curTokenIs(lexer.TokenRBracket) {
+			return nil, p.curError("expected ] after ARRAY elements")
+		}
+		p.nextToken()
+		return expr, nil
+	}
 }
 
 func isComparisonOp(t lexer.TokenType) bool {
@@ -2711,11 +2857,45 @@ func (p *Parser) parseUnaryExpr() (Expr, error) {
 	return p.parsePrimaryExpr()
 }
 
+// parsePrimaryExpr parses a primary expression and applies the postfix
+// operators that bind tighter than any prefix operator: array element
+// subscripts (arr[idx]) and PostgreSQL-style casts (expr::type).
 func (p *Parser) parsePrimaryExpr() (Expr, error) {
+	expr, err := p.parsePrimaryExprBase()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		switch {
+		case p.curTokenIs(lexer.TokenLBracket):
+			p.nextToken()
+			index, indexErr := p.parseExpr()
+			if indexErr != nil {
+				return nil, indexErr
+			}
+			if !p.curTokenIs(lexer.TokenRBracket) {
+				return nil, p.curError("expected ] after array subscript")
+			}
+			p.nextToken()
+			expr = &SubscriptExpr{Expr: expr, Index: index}
+		case p.curTokenIs(lexer.TokenColonColon):
+			p.nextToken()
+			dataType, typeErr := p.parseDataType()
+			if typeErr != nil {
+				return nil, typeErr
+			}
+			expr = &CastExpr{Expr: expr, Type: *dataType}
+		default:
+			return expr, nil
+		}
+	}
+}
+
+func (p *Parser) parsePrimaryExprBase() (Expr, error) {
 	switch p.curToken.Type {
 	case lexer.TokenALL:
 		if p.peekTokenIs(lexer.TokenLParen) {
-			return nil, pgerror.Unsupported("array parameters and ANY/ALL predicates are not supported (PizzaSQL has no array type); expand the list into IN (...) with individual parameters")
+			return nil, pgerror.Unsupported("ALL(...) is a quantified predicate and must follow a comparison operator, as in expr <> ALL(array)")
 		}
 		return nil, p.curError("unexpected token in expression: " + p.curToken.Type.String())
 
@@ -2803,6 +2983,9 @@ func (p *Parser) parsePrimaryExpr() (Expr, error) {
 		return p.parseIdentOrFunction()
 
 	case lexer.TokenIdent:
+		if strings.EqualFold(p.curToken.Literal, "ARRAY") && p.peekTokenIs(lexer.TokenLBracket) {
+			return p.parseArrayConstructor()
+		}
 		return p.parseIdentOrFunction()
 
 	case lexer.TokenStar:
@@ -2823,7 +3006,7 @@ func (p *Parser) parseIdentOrFunction() (Expr, error) {
 	// Check for function call
 	if p.curTokenIs(lexer.TokenLParen) {
 		if strings.EqualFold(name, "ANY") {
-			return nil, pgerror.Unsupported("array parameters and ANY/ALL predicates are not supported (PizzaSQL has no array type); expand the list into IN (...) with individual parameters")
+			return nil, pgerror.Unsupported("ANY(...) is a quantified predicate and must follow a comparison operator, as in expr = ANY(array)")
 		}
 		return p.parseFunctionCall(name)
 	}

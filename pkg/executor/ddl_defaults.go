@@ -54,6 +54,13 @@ func isConstantExpr(expr parser.Expr) bool {
 		return isConstantExpr(ex.Expr)
 	case *parser.CastExpr:
 		return isConstantExpr(ex.Expr)
+	case *parser.ArrayExpr:
+		for _, element := range ex.Elements {
+			if !isConstantExpr(element) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
