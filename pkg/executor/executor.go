@@ -163,6 +163,13 @@ func (e *Executor) NewSessionExecutor() *Executor {
 	return exec
 }
 
+// Session exposes the executor's catalog and row session. Protocol layers that
+// emulate system catalogs must read through it so their introspection observes
+// DDL staged by an open transaction, exactly like the SQL executor does.
+func (e *Executor) Session() *storage.Session {
+	return e.session
+}
+
 // SyncCatalog synchronizes the analyzer catalog with the storage schema.
 func (e *Executor) SyncCatalog() error {
 	tables, err := e.session.ListTables()

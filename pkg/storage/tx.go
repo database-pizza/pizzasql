@@ -196,16 +196,37 @@ func (s *Session) RollbackToSavepoint(sp *SessionSavepoint) {
 // rollbackToSavepointLocked restores a savepoint (caller holds the session
 // lock).
 func (s *Session) rollbackToSavepointLocked(sp *SessionSavepoint) {
-	s.overlay = sp.overlay
-	s.log = sp.mutationLog
-	s.reads = sp.reads
-	s.scanGens = sp.scanGens
-	s.predicateGens = sp.predicateGens
+	// Copy rather than alias: the savepoint stays installed for a later
+	// ROLLBACK TO SAVEPOINT, and writes staged after this restore must not
+	// mutate the retained state.
+	s.overlay = copyOverlay(sp.overlay)
+	s.log = append([]txMutation(nil), sp.mutationLog...)
+	s.reads = copyLSNMap(sp.reads)
+	s.scanGens = copyLSNMap(sp.scanGens)
+	s.predicateGens = make(map[string]predicateRead, len(sp.predicateGens))
+	for key, predicate := range sp.predicateGens {
+		s.predicateGens[key] = predicate
+	}
 	if s.schemaTx != nil && sp.schema != nil {
 		s.schemaTx.restore(*sp.schema)
 	}
 	s.fkCatalog = nil
 	s.fkVersion = 0
+}
+
+// copyOverlay copies the two-level staged row map. Overlay entries are
+// immutable once staged (rows are cloned before they are stored), so the inner
+// maps are copied but the entries themselves are shared.
+func copyOverlay(source map[string]map[string]*overlayEntry) map[string]map[string]*overlayEntry {
+	cloned := make(map[string]map[string]*overlayEntry, len(source))
+	for table, entries := range source {
+		staged := make(map[string]*overlayEntry, len(entries))
+		for key, entry := range entries {
+			staged[key] = entry
+		}
+		cloned[table] = staged
+	}
+	return cloned
 }
 
 func copyLSNMap(source map[string]uint64) map[string]uint64 {
@@ -351,7 +372,7 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 			s.resetLocked()
 			return 0, err
 		}
-		dataOps, dataEntries, err := s.schemaTx.commitDataOps()
+		dataOps, dataEntries, err := s.schemaTx.commitDataOps(&ddlBatchBudget{})
 		if err != nil {
 			s.resetLocked()
 			return 0, err
@@ -449,6 +470,21 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		return 0, nil
 	}
 
+	// Pre-flight the assembled batch so an oversized commit fails with an
+	// actionable error instead of the storage protocol's generic limit error.
+	if len(ops) > maxOperations {
+		s.resetLocked()
+		return 0, fmt.Errorf("transaction cannot be published atomically: %d operations exceed the storage batch limit of %d; split the transaction or run the DDL outside a transaction so it can page its writes", len(ops), maxOperations)
+	}
+	batchBytes := 0
+	for _, op := range ops {
+		batchBytes += batchOpBytes(op)
+	}
+	if batchBytes > maxTransactionSize {
+		s.resetLocked()
+		return 0, fmt.Errorf("transaction cannot be published atomically: %d bytes exceed the storage batch limit of %d; split the transaction or run the DDL outside a transaction so it can page its writes", batchBytes, maxTransactionSize)
+	}
+
 	var committed bool
 	var commitLSN uint64
 	err = s.table.pool.WithClient(func(c *KVClient) error {
@@ -462,6 +498,15 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 		// also expose an out-of-band writer. Rebuild derived state next time.
 		for table := range s.overlay {
 			s.table.invalidateWriteFailure(table)
+		}
+		if hasDDL {
+			// Staged DDL may have become durable even though the response was
+			// lost, so the shared catalog view cannot be trusted either: drop it
+			// for every touched table and reload from storage on the next read.
+			s.schema.invalidateCommittedDDL(touchedTables)
+			for _, table := range touchedTables {
+				s.table.invalidateWriteFailure(table)
+			}
 		}
 	}
 	if err != nil {
@@ -507,7 +552,7 @@ func (s *Session) CommitWithLSN() (uint64, error) {
 // reload lazily from the committed records. The caller still holds the table
 // gates, which is the documented lock order (table gate, then catalog mutex).
 func (s *Session) publishCommittedCatalog(tables []string) {
-	s.schema.invalidateCommittedDDL()
+	s.schema.invalidateCommittedDDL(tables)
 	for _, table := range tables {
 		s.table.InvalidateCache(table)
 		s.table.bumpIndexPredicateWildcard(table)
@@ -1326,25 +1371,29 @@ func (s *Session) deleteByPKLocked(table, pk string) (Row, bool, error) {
 	return row, true, nil
 }
 
-// getByPKLocked reads a row observing the overlay (caller holds s.mu).
+// getByPKLocked reads a row observing the overlay (caller holds s.mu). The
+// staged key addresses the overlay; the durable read follows the committed name
+// when RENAME TABLE has staged a move, so a point UPDATE/DELETE issued after a
+// rename still finds the row instead of silently matching nothing.
 func (s *Session) getByPKLocked(table, pk string) (Row, error) {
-	key := s.table.dataKey(table, pk)
+	stagedKey := s.table.dataKey(table, pk)
 	tl := strings.ToLower(table)
-	if e, ok := s.overlay[tl][key]; ok {
+	if e, ok := s.overlay[tl][stagedKey]; ok {
 		if e.absent {
 			return nil, ErrKeyNotFound
 		}
 		return cloneRow(e.row), nil
 	}
-	row, lsn, err := s.table.getByPKWithLSN(table, pk)
+	durableKey := s.durableDataKeyLocked(table, pk)
+	row, lsn, err := s.table.getKeyWithLSN(durableKey)
 	if err != nil {
 		if err == ErrKeyNotFound {
-			s.reads[key] = 0
+			s.reads[durableKey] = 0
 			return nil, ErrKeyNotFound
 		}
 		return nil, err
 	}
-	s.reads[key] = lsn
+	s.reads[durableKey] = lsn
 	if err := s.applyStagedRewritesLocked(table, row); err != nil {
 		return nil, err
 	}

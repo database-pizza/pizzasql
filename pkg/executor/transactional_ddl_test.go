@@ -657,3 +657,197 @@ func TestTransactionalDDLIndexCachesSurviveRollback(t *testing.T) {
 		t.Fatalf("index unusable after committing a re-created index: %v", err)
 	}
 }
+
+// Transactional DDL: a RENAME followed by an UPDATE must still delete the
+// committed row under the old prefix. The updated image lives in the session
+// overlay under the new prefix, so the commit has to move-or-delete every
+// durable old key, not only the rows whose image it rewrites.
+func TestTransactionalDDLRenameThenUpdateKeepsNoOrphanRows(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)")
+	execMust(t, e, "INSERT INTO a VALUES (1, 'one'), (2, 'two')")
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "ALTER TABLE a RENAME TO b")
+	execMust(t, e, "UPDATE b SET v = 'changed' WHERE id = 1")
+	execMust(t, e, "COMMIT")
+
+	if schema.TableExists("a") {
+		t.Fatal("renamed table is still addressable under its old name")
+	}
+	if res := execMust(t, e, "SELECT id, v FROM b ORDER BY id"); res.RowCount != 2 || res.Rows[0][1] != "changed" || res.Rows[1][1] != "two" {
+		t.Fatalf("rows after committed rename+update = %v", res.Rows)
+	}
+	// The decisive check: a table re-created with the old name must start empty.
+	// Any durable row left under _data:a: would resurface here as a ghost.
+	execMust(t, e, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)")
+	if res := execMust(t, e, "SELECT COUNT(*) FROM a"); res.Rows[0][0] != int64(0) {
+		t.Fatalf("orphaned rows resurfaced under the re-created old name: %v", res.Rows)
+	}
+	if rows, err := table.Select("b", nil); err != nil || len(rows) != 2 {
+		t.Fatalf("durable rows after rename+update = %v err=%v", rows, err)
+	}
+}
+
+// Transactional DDL: the same guarantee for a staged DELETE after a RENAME.
+func TestTransactionalDDLRenameThenDeleteKeepsNoOrphanRows(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)")
+	execMust(t, e, "INSERT INTO a VALUES (1, 'one'), (2, 'two')")
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "ALTER TABLE a RENAME TO b")
+	execMust(t, e, "DELETE FROM b WHERE id = 2")
+	execMust(t, e, "COMMIT")
+
+	if res := execMust(t, e, "SELECT id FROM b"); res.RowCount != 1 || res.Rows[0][0] != int64(1) {
+		t.Fatalf("rows after committed rename+delete = %v", res.Rows)
+	}
+	execMust(t, e, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)")
+	if res := execMust(t, e, "SELECT COUNT(*) FROM a"); res.Rows[0][0] != int64(0) {
+		t.Fatalf("deleted row or its sibling resurfaced under the re-created old name: %v", res.Rows)
+	}
+	if rows, err := table.Select("b", nil); err != nil || len(rows) != 1 {
+		t.Fatalf("durable rows after rename+delete = %v err=%v", rows, err)
+	}
+}
+
+// Transactional DDL: renaming a table away and back inside one transaction must
+// not publish a put+delete for the same key; all rows and the schema survive.
+func TestTransactionalDDLRenameAwayAndBack(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)")
+	execMust(t, e, "INSERT INTO a VALUES (1, 'one'), (2, 'two')")
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "ALTER TABLE a RENAME TO b")
+	execMust(t, e, "ALTER TABLE b RENAME TO a")
+	execMust(t, e, "INSERT INTO a VALUES (3, 'three')")
+	execMust(t, e, "COMMIT")
+
+	if schema.TableExists("b") {
+		t.Fatal("intermediate rename name survived the commit")
+	}
+	if res := execMust(t, e, "SELECT id, v FROM a ORDER BY id"); res.RowCount != 3 {
+		t.Fatalf("rows after rename away and back = %v", res.Rows)
+	}
+	if rows, err := table.Select("a", nil); err != nil || len(rows) != 3 {
+		t.Fatalf("durable rows after rename away and back = %v err=%v", rows, err)
+	}
+}
+
+// Transactional DDL: ROLLBACK TO SAVEPOINT can be repeated. The savepoint is
+// retained, so DDL and rows staged after the first rollback must not leak into
+// the state a second rollback installs.
+func TestTransactionalDDLRepeatedRollbackToSavepoint(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "SAVEPOINT s")
+	execMust(t, e, "CREATE TABLE x (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t VALUES (1)")
+	execMust(t, e, "ROLLBACK TO SAVEPOINT s")
+
+	execMust(t, e, "CREATE TABLE y (id INTEGER PRIMARY KEY)")
+	execMust(t, e, "INSERT INTO t VALUES (2)")
+	execMust(t, e, "ROLLBACK TO SAVEPOINT s")
+	execMust(t, e, "COMMIT")
+
+	if schema.TableExists("x") || schema.TableExists("y") {
+		t.Fatalf("DDL staged between rollbacks survived: x=%v y=%v", schema.TableExists("x"), schema.TableExists("y"))
+	}
+	if res := execMust(t, e, "SELECT COUNT(*) FROM t"); res.Rows[0][0] != int64(0) {
+		t.Fatalf("rows staged between rollbacks survived: %v", res.Rows)
+	}
+}
+
+// Transactional DDL: committing DDL on one table must not reset another table's
+// ROWID allocator. A concurrent transaction that staged a TEXT-keyed insert
+// holds a ROWID that is not durable yet; if the allocator is wiped, a later
+// insert derives that same value again and both rows become durable with the
+// same _rowid_, mis-associating every rowid-keyed index cache entry.
+func TestTransactionalDDLCommitKeepsUnrelatedRowIDAllocators(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	stager := newExec(schema, table)
+	ddl := newExec(schema, table)
+	other := newExec(schema, table)
+
+	execMust(t, stager, "CREATE TABLE events (name TEXT PRIMARY KEY, v TEXT)")
+
+	execMust(t, stager, "BEGIN")
+	execMust(t, stager, "INSERT INTO events VALUES ('staged', 'a')")
+
+	// An unrelated transactional DDL commit must not touch the events allocator.
+	execMust(t, ddl, "BEGIN")
+	execMust(t, ddl, "CREATE TABLE side (id INTEGER PRIMARY KEY)")
+	execMust(t, ddl, "COMMIT")
+
+	// Another session allocates its own ROWID while the first insert is staged.
+	execMust(t, other, "INSERT INTO events VALUES ('later', 'b')")
+	execMust(t, stager, "COMMIT")
+
+	rows, err := table.Select("events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("events rows = %d, want 2", len(rows))
+	}
+	seen := make(map[int64]bool, len(rows))
+	for _, row := range rows {
+		rowid, ok := row["_rowid_"].(int64)
+		if !ok {
+			t.Fatalf("row without a rowid: %v", row)
+		}
+		if seen[rowid] {
+			t.Fatalf("duplicate durable _rowid_ %d after an unrelated DDL commit: %v", rowid, rows)
+		}
+		seen[rowid] = true
+	}
+}
+
+// Transactional DDL: a RENAME whose row move cannot fit in the commit's single
+// storage transaction fails at COMMIT with an explicit limit error instead of
+// buffering the whole table and failing inside the storage protocol, and the
+// failed commit publishes nothing.
+func TestTransactionalDDLRenameExceedingBatchCeilingFails(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE big (id INTEGER PRIMARY KEY, v TEXT)")
+
+	// A rename publishes a put and a delete per row, so just over half of the
+	// store's 65,535-operation ceiling is enough to exceed it.
+	const rows = 33000
+	const chunk = 5000
+	for start := 0; start < rows; start += chunk {
+		batch := make([]storage.Row, 0, chunk)
+		for i := start; i < start+chunk && i < rows; i++ {
+			batch = append(batch, storage.Row{"id": int64(i + 1), "v": "x"})
+		}
+		if _, err := table.InsertBulk("big", batch); err != nil {
+			t.Fatalf("seed rows %d-%d: %v", start, start+len(batch), err)
+		}
+	}
+
+	execMust(t, e, "BEGIN")
+	execMust(t, e, "ALTER TABLE big RENAME TO big_renamed")
+	_, err := execSQL(e, "COMMIT")
+	if err == nil {
+		t.Fatal("commit of an oversized rename succeeded")
+	}
+	if !strings.Contains(err.Error(), "storage batch limit") {
+		t.Fatalf("commit error = %v, want the storage batch limit", err)
+	}
+	// Nothing was published: the old name, its schema, and every row survive.
+	if !schema.TableExists("big") || schema.TableExists("big_renamed") {
+		t.Fatalf("failed commit published the rename: big=%v big_renamed=%v", schema.TableExists("big"), schema.TableExists("big_renamed"))
+	}
+	if count, err := table.CountFast("big"); err != nil || count != rows {
+		t.Fatalf("rows after failed commit = %d err=%v, want %d", count, err, rows)
+	}
+}

@@ -32,6 +32,7 @@ type Connection struct {
 	writer         *bufio.Writer
 	executor       *executor.Executor
 	schema         *storage.SchemaManager
+	table          *storage.TableManager
 	dbManager      *storage.DatabaseManager
 	database       string
 	params         map[string]string
@@ -45,6 +46,9 @@ type Connection struct {
 	// next Sync. Notifications are not interleaved into an extended-protocol
 	// sequence; they are held until Sync.
 	extendedCycle bool
+	// catalogFallback serves catalog emulation before the executor exists, when
+	// a connection has managers but has not completed startup.
+	catalogFallback *storage.Session
 }
 
 // backendPIDSeq gives each connection a distinct synthetic backend PID. It is
@@ -276,6 +280,7 @@ func (c *Connection) initDatabase(dbName string) error {
 	}
 
 	c.schema = db.Schema
+	c.table = db.Table
 	c.executor = executor.New(db.Schema, db.Table)
 	c.executor.SetBackendPID(c.backendPID)
 	c.executor.SetNotificationHub(db.Hub)
@@ -737,6 +742,24 @@ func (c *Connection) handleExecute(msg *Message) error {
 	return nil
 }
 
+// catalogSession is the catalog view this connection serves. The executor's
+// session is authoritative because it resolves against the transaction-scoped
+// DDL overlay, so catalog emulation inside a transaction sees staged tables,
+// columns, and indexes. The fallback only covers a connection that has not
+// completed startup yet.
+func (c *Connection) catalogSession() *storage.Session {
+	if c.executor != nil {
+		return c.executor.Session()
+	}
+	if c.schema == nil || c.table == nil {
+		return nil
+	}
+	if c.catalogFallback == nil {
+		c.catalogFallback = storage.NewSession(c.schema, c.table)
+	}
+	return c.catalogFallback
+}
+
 var catalogFilterPattern = regexp.MustCompile(`(?i)\b(table_name|tablename|table_schema|schemaname|constraint_name|indexname)\s*=\s*'((?:''|[^'])*)'`)
 
 func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
@@ -747,12 +770,12 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 	if source == "" {
 		return nil, false, nil
 	}
-	if c.txStatus == TxStatusIdle {
-		c.schema.LockStatement()
-		defer c.schema.UnlockStatement()
+	session := c.catalogSession()
+	if session == nil {
+		return nil, false, nil
 	}
 
-	tables, err := c.schema.ListTables()
+	tables, err := session.ListTables()
 	if err != nil {
 		return nil, true, err
 	}
@@ -766,7 +789,7 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 		}
 	case "PG_TABLES":
 		for _, table := range tables {
-			indexes, _ := c.schema.ListTableIndexes(table)
+			indexes, _ := session.ListTableIndexes(table)
 			rows = append(rows, map[string]interface{}{
 				"schemaname": "public", "tablename": table, "tableowner": c.params["user"], "tablespace": nil,
 				"hasindexes": len(indexes) > 0, "hasrules": false, "hastriggers": false, "rowsecurity": false,
@@ -774,7 +797,7 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 		}
 	case "INFORMATION_SCHEMA.COLUMNS":
 		for _, table := range tables {
-			schema, schemaErr := c.schema.GetSchema(table)
+			schema, schemaErr := session.GetSchema(table)
 			if schemaErr != nil {
 				continue
 			}
@@ -788,7 +811,7 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 		}
 	case "INFORMATION_SCHEMA.TABLE_CONSTRAINTS", "INFORMATION_SCHEMA.KEY_COLUMN_USAGE":
 		for _, table := range tables {
-			schema, schemaErr := c.schema.GetSchema(table)
+			schema, schemaErr := session.GetSchema(table)
 			if schemaErr != nil || schema.UsesSyntheticRowID() {
 				continue
 			}
@@ -812,7 +835,7 @@ func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
 		}
 	case "PG_INDEXES":
 		for _, table := range tables {
-			indexes, _ := c.schema.ListTableIndexes(table)
+			indexes, _ := session.ListTableIndexes(table)
 			for _, index := range indexes {
 				columns := make([]string, len(index.Columns))
 				for i, column := range index.Columns {

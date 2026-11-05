@@ -394,7 +394,12 @@ func (m *SchemaManager) indexListDurable() ([]string, uint64, error) {
 // readers: every cache derived from the catalog is dropped and the version is
 // bumped so the foreign-key metadata and session analyzers reload. The caches
 // are rebuilt lazily from the durable catalog, which the commit already wrote.
-func (m *SchemaManager) invalidateCommittedDDL() {
+//
+// Only the touched tables lose their ROWID allocator. Wiping every allocator
+// would let a concurrent transaction that staged a TEXT/composite-key insert
+// (whose ROWID is not durable yet) derive the same ROWID again and publish a
+// duplicate, so untouched tables keep their derived counters.
+func (m *SchemaManager) invalidateCommittedDDL(tables []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cache = make(map[string]*Schema)
@@ -402,7 +407,9 @@ func (m *SchemaManager) invalidateCommittedDDL() {
 	m.indexListCache = nil
 	m.indexListCached = false
 	m.rowIDMu.Lock()
-	m.rowIDAlloc = make(map[string]*rowIDAllocator)
+	for _, table := range tables {
+		delete(m.rowIDAlloc, strings.ToLower(table))
+	}
 	m.rowIDMu.Unlock()
 	m.fkCatalogMu.Lock()
 	m.fkCatalog = nil

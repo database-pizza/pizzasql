@@ -161,23 +161,67 @@ func (tx *SchemaTx) snapshot() schemaTxSnapshot {
 }
 
 // restore returns the overlay to a snapshot and undoes the overlay re-keyings
-// performed after it. The caller holds the session lock.
+// performed after it. Every collection is copied rather than aliased: the
+// snapshot is retained for a later ROLLBACK TO SAVEPOINT, and DDL staged after
+// this restore must not mutate the retained state. Staged schema and index
+// definitions are immutable once stored, so a shallow copy of the maps is
+// enough. The caller holds the session lock.
 func (tx *SchemaTx) restore(snap schemaTxSnapshot) {
 	for i := len(tx.rekeys) - 1; i >= snap.rekeys; i-- {
 		tx.sess.rekeyOverlayLocked(tx.rekeys[i].to, tx.rekeys[i].from)
 	}
 	tx.rekeys = tx.rekeys[:snap.rekeys]
 	tx.version = snap.version
-	tx.staged = snap.staged
-	tx.stagedIndexes = snap.stagedIndexes
-	tx.tables = snap.tables
-	tx.indexList = snap.indexList
+	tx.staged = copySchemaMap(snap.staged)
+	tx.stagedIndexes = copyIndexMap(snap.stagedIndexes)
+	tx.tables = append([]string(nil), snap.tables...)
+	tx.indexList = append([]string(nil), snap.indexList...)
 	tx.catalogDirty = snap.catalogDirty
 	tx.indexListDirty = snap.indexListDirty
-	tx.rewrites = snap.rewrites
-	tx.dataSources = snap.dataSources
-	tx.drops = snap.drops
-	tx.renames = snap.renames
+	tx.rewrites = copyRewriteMap(snap.rewrites)
+	tx.dataSources = copyStringMap(snap.dataSources)
+	tx.drops = copyBoolMap(snap.drops)
+	tx.renames = copyStringMap(snap.renames)
+}
+
+func copySchemaMap(source map[string]*Schema) map[string]*Schema {
+	cloned := make(map[string]*Schema, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func copyIndexMap(source map[string]*Index) map[string]*Index {
+	cloned := make(map[string]*Index, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func copyRewriteMap(source map[string][]rowRewrite) map[string][]rowRewrite {
+	cloned := make(map[string][]rowRewrite, len(source))
+	for key, value := range source {
+		cloned[key] = append([]rowRewrite(nil), value...)
+	}
+	return cloned
+}
+
+func copyStringMap(source map[string]string) map[string]string {
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func copyBoolMap(source map[string]bool) map[string]bool {
+	cloned := make(map[string]bool, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 // bump advances the transaction's catalog version so the executor's analyzer
@@ -201,6 +245,9 @@ func (tx *SchemaTx) recordRead(key string, lsn uint64) {
 func (tx *SchemaTx) refreshCommitted() {
 	tx.committedSchemas = make(map[string]*Schema)
 	tx.committedIndexes = make(map[string]*Index)
+	if !tx.catalogDirty {
+		tx.tables = nil
+	}
 	if !tx.indexListDirty {
 		tx.indexList = nil
 	}
@@ -520,6 +567,11 @@ func (tx *SchemaTx) addColumn(table string, column Column, checks []CheckConstra
 	}
 
 	now := tx.base.defaultNow()
+	// Pin the table generation before scanning: a concurrent commit that lands
+	// between the scan and the generation capture would otherwise be invisible,
+	// so a durable row the scan did not validate could violate the new
+	// constraint. Recording first turns that interleaving into 40001 at COMMIT.
+	tx.sess.markTableScanned(strings.ToLower(table))
 	// Validation covers the committed rows, mirroring the autocommit DDL path:
 	// rows this transaction staged are re-validated against the staged schema at
 	// commit (applyOverlaySchemaDefaults), because a staged row may still be
@@ -599,7 +651,6 @@ func (tx *SchemaTx) addColumn(table string, column Column, checks []CheckConstra
 			})
 		}
 	}
-	tx.sess.markTableScanned(strings.ToLower(table))
 	return nil
 }
 
@@ -742,7 +793,14 @@ func (tx *SchemaTx) renameTable(oldName, newName string) error {
 		tx.dataSources[newLower] = ""
 	} else {
 		tx.dataSources[newLower] = source
-		tx.renames[source] = newName
+		if strings.EqualFold(source, newLower) {
+			// Renaming back to the committed name cancels the pending move: the
+			// rows already live under the destination prefix, so emitting a
+			// put+delete for the same key would be order-dependent.
+			delete(tx.renames, source)
+		} else {
+			tx.renames[source] = newName
+		}
 	}
 	delete(tx.dataSources, oldLower)
 	// A drop staged before the rename keeps its durable source; the rename
@@ -842,13 +900,15 @@ func (tx *SchemaTx) commitCatalogOps() ([]BatchOp, []CompareCheck, error) {
 		keys = append(keys, key)
 	}
 	// A staged table definition whose name replaced an older one deletes the
-	// old record in the same batch.
+	// old record in the same batch. A rename whose destination is the committed
+	// name (renamed away and back) has no move to publish.
 	for source, newName := range tx.renames {
+		if strings.EqualFold(source, newName) {
+			continue
+		}
 		ops = append(ops, BatchOp{Op: batchDelete, Key: []byte(tx.base.schemaKey(source))})
 		keys = append(keys, tx.base.schemaKey(source))
-		if !strings.EqualFold(source, newName) {
-			ops = append(ops, BatchOp{Op: batchDelete, Key: []byte(tx.base.rowIDKey(source))})
-		}
+		ops = append(ops, BatchOp{Op: batchDelete, Key: []byte(tx.base.rowIDKey(source))})
 	}
 
 	for lower, index := range tx.stagedIndexes {
@@ -901,7 +961,7 @@ func (tx *SchemaTx) commitCatalogOps() ([]BatchOp, []CompareCheck, error) {
 // session staged in its overlay are published from the overlay instead, so they
 // are skipped here. The caller holds the session lock and the exclusive table
 // gates of every affected table.
-func (tx *SchemaTx) commitDataOps() ([]BatchOp, map[string]map[string]*overlayEntry, error) {
+func (tx *SchemaTx) commitDataOps(budget *ddlBatchBudget) ([]BatchOp, map[string]map[string]*overlayEntry, error) {
 	entries := make(map[string]map[string]*overlayEntry)
 	var ops []BatchOp
 	if len(tx.drops) == 0 && len(tx.renames) == 0 && len(tx.rewrites) == 0 {
@@ -928,7 +988,7 @@ func (tx *SchemaTx) commitDataOps() ([]BatchOp, map[string]map[string]*overlayEn
 
 	for _, source := range names {
 		if tx.drops[source] {
-			dropped, err := tx.scanRowsForDDL(source, func(key string, row Row) (bool, Row, error) {
+			dropped, err := tx.scanRowsForDDL(source, budget, func(key string, row Row) (bool, Row, error) {
 				if tx.sess.overlayHolds(strings.ToLower(source), key) {
 					return false, nil, nil
 				}
@@ -942,17 +1002,13 @@ func (tx *SchemaTx) commitDataOps() ([]BatchOp, map[string]map[string]*overlayEn
 		}
 
 		newName, renamed := tx.renames[source]
+		if renamed && strings.EqualFold(source, newName) {
+			// A rename that returned to the committed name has no row move; the
+			// table still owes its pending ALTER rewrites.
+			renamed = false
+		}
 		if renamed {
-			updated, err := tx.scanRowsForDDL(source, func(key string, row Row) (bool, Row, error) {
-				if _, err := tx.rewriteRow(newName, row); err != nil {
-					return false, nil, err
-				}
-				newKey := tx.sess.table.dataKey(newName, mustRowPK(tx, newName, row))
-				if tx.sess.overlayHolds(strings.ToLower(newName), newKey) {
-					return false, nil, nil
-				}
-				return true, row, nil
-			})
+			moved, movedEntries, err := tx.renameRowOps(source, newName, budget)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -960,20 +1016,10 @@ func (tx *SchemaTx) commitDataOps() ([]BatchOp, map[string]map[string]*overlayEn
 			if entries[lower] == nil {
 				entries[lower] = make(map[string]*overlayEntry)
 			}
-			for _, op := range updated {
-				oldKey := op.Key
-				suffix := strings.TrimPrefix(string(oldKey), tx.sess.table.dataPrefix(source))
-				newKey := []byte(tx.sess.table.dataPrefix(newName) + suffix)
-				row, err := decodeRow(op.Value)
-				if err != nil {
-					return nil, nil, err
-				}
-				entries[lower][string(newKey)] = &overlayEntry{row: row}
-				ops = append(ops,
-					BatchOp{Op: batchPut, Key: newKey, Value: op.Value},
-					BatchOp{Op: batchDelete, Key: oldKey},
-				)
+			for key, entry := range movedEntries {
+				entries[lower][key] = entry
 			}
+			ops = append(ops, moved...)
 			continue
 		}
 
@@ -981,7 +1027,7 @@ func (tx *SchemaTx) commitDataOps() ([]BatchOp, map[string]map[string]*overlayEn
 		if len(rewrites) == 0 {
 			continue
 		}
-		updated, err := tx.scanRowsForDDL(source, func(key string, row Row) (bool, Row, error) {
+		updated, err := tx.scanRowsForDDL(source, budget, func(key string, row Row) (bool, Row, error) {
 			if tx.sess.overlayHolds(strings.ToLower(source), key) {
 				return false, nil, nil
 			}
@@ -1010,24 +1056,94 @@ func (tx *SchemaTx) commitDataOps() ([]BatchOp, map[string]map[string]*overlayEn
 	return ops, entries, nil
 }
 
-// mustRowPK derives the primary-key string of a row the transaction's staged
-// schema describes.
-func mustRowPK(tx *SchemaTx, table string, row Row) string {
-	schema, err := tx.getSchema(table)
-	if err != nil {
-		return ""
+// renameRowOps builds the row move of one RENAME TABLE: every committed row of
+// source is written under the destination prefix and its old key deleted. A row
+// the transaction already re-staged under the destination (an UPDATE, DELETE,
+// or re-INSERT after the rename) is owned by the session overlay, so only the
+// stale committed key is deleted; without that delete the rename would leave an
+// unreachable row under the dropped table name.
+func (tx *SchemaTx) renameRowOps(source, newName string, budget *ddlBatchBudget) ([]BatchOp, map[string]*overlayEntry, error) {
+	entries := make(map[string]*overlayEntry)
+	var ops []BatchOp
+	oldPrefix := tx.sess.table.dataPrefix(source)
+	newPrefix := tx.sess.table.dataPrefix(newName)
+	lowerNew := strings.ToLower(newName)
+	err := tx.sess.table.scanRowsAtPrefix(oldPrefix, func(oldKey string, row Row, _ uint64) (bool, error) {
+		if _, err := tx.rewriteRow(newName, row); err != nil {
+			return true, err
+		}
+		suffix := strings.TrimPrefix(oldKey, oldPrefix)
+		newKey := newPrefix + suffix
+		if tx.sess.overlayHolds(lowerNew, newKey) {
+			deleted := BatchOp{Op: batchDelete, Key: []byte(oldKey)}
+			if err := budget.reserve(source, 1, batchOpBytes(deleted)); err != nil {
+				return true, err
+			}
+			ops = append(ops, deleted)
+			return false, nil
+		}
+		value, err := encodeRow(row)
+		if err != nil {
+			return true, err
+		}
+		put := BatchOp{Op: batchPut, Key: []byte(newKey), Value: value}
+		del := BatchOp{Op: batchDelete, Key: []byte(oldKey)}
+		if err := budget.reserve(source, 2, batchOpBytes(put)+batchOpBytes(del)); err != nil {
+			return true, err
+		}
+		entries[newKey] = &overlayEntry{row: row}
+		ops = append(ops, put, del)
+		return false, nil
+	})
+	return ops, entries, err
+}
+
+// ddlBatchBudget bounds the row operations one transactional DDL commit may add
+// to its single compare-batch. The whole transaction is published atomically as
+// one storage transaction, so it cannot page its writes the way autocommit DDL
+// does: a rewrite that would exceed the operation or byte ceiling fails with an
+// explicit limit error while the table is still being scanned, instead of
+// buffering every row and failing inside CompareBatchWrite.
+type ddlBatchBudget struct {
+	ops   int
+	bytes int
+}
+
+// reserve counts one table's pending operations and fails as soon as the batch
+// ceiling is crossed.
+func (b *ddlBatchBudget) reserve(table string, ops, bytes int) error {
+	b.ops += ops
+	b.bytes += bytes
+	if b.ops > maxOperations || b.bytes > maxTransactionSize {
+		return &ddlBatchLimitError{Table: table, Operations: b.ops, Bytes: b.bytes}
 	}
-	pk, err := schema.PrimaryKeyForRow(row)
-	if err != nil {
-		return ""
-	}
-	return pk
+	return nil
+}
+
+// ddlBatchLimitError reports that a transactional DDL row rewrite cannot fit in
+// the single storage transaction the commit publishes.
+type ddlBatchLimitError struct {
+	Table      string
+	Operations int
+	Bytes      int
+}
+
+func (e *ddlBatchLimitError) Error() string {
+	return fmt.Sprintf(
+		"transactional DDL on %s cannot be published atomically: the rewrite needs more than the storage batch limit (%d operations / %d bytes, reached %d operations / %d bytes); run the statement outside a transaction so it can page its writes, or split the migration",
+		e.Table, maxOperations, maxTransactionSize, e.Operations, e.Bytes)
+}
+
+// batchOpBytes is the wire size of one operation (header, key, and value), used
+// to bound a commit batch before it is encoded.
+func batchOpBytes(op BatchOp) int {
+	return 12 + len(op.Key) + len(op.Value)
 }
 
 // scanRowsForDDL streams a durable table's rows through transform. When
 // transform reports a change the row is re-encoded and returned as a put under
 // its existing key; when it reports removal the key is returned as a delete.
-func (tx *SchemaTx) scanRowsForDDL(table string, transform func(key string, row Row) (write bool, replacement Row, err error)) ([]BatchOp, error) {
+func (tx *SchemaTx) scanRowsForDDL(table string, budget *ddlBatchBudget, transform func(key string, row Row) (write bool, replacement Row, err error)) ([]BatchOp, error) {
 	var ops []BatchOp
 	prefix := []byte(tx.sess.table.dataPrefix(table))
 	err := tx.base.pool.WithClient(func(client *KVClient) (retErr error) {
@@ -1058,14 +1174,22 @@ func (tx *SchemaTx) scanRowsForDDL(table string, transform func(key string, row 
 					continue
 				}
 				if replacement == nil {
-					ops = append(ops, BatchOp{Op: batchDelete, Key: append([]byte(nil), entry.Key...)})
+					op := BatchOp{Op: batchDelete, Key: append([]byte(nil), entry.Key...)}
+					if err := budget.reserve(table, 1, batchOpBytes(op)); err != nil {
+						return err
+					}
+					ops = append(ops, op)
 					continue
 				}
 				value, err := encodeRow(replacement)
 				if err != nil {
 					return err
 				}
-				ops = append(ops, BatchOp{Op: batchPut, Key: append([]byte(nil), entry.Key...), Value: value})
+				op := BatchOp{Op: batchPut, Key: append([]byte(nil), entry.Key...), Value: value}
+				if err := budget.reserve(table, 1, batchOpBytes(op)); err != nil {
+					return err
+				}
+				ops = append(ops, op)
 			}
 			if done {
 				return nil
