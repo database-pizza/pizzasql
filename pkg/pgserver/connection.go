@@ -69,13 +69,43 @@ type preparedStatement struct {
 	paramOIDs []int32
 }
 
+// portal is one Bind result. Its lifetime follows PostgreSQL: a portal is
+// reusable until Close('P'), a Bind of the same name, or the end of the
+// transaction it was created in (see Connection.clearPortals).
 type portal struct {
-	query    string
-	executed bool
+	query string
 	// resultFormats is the Bind result format list exactly as the client sent
 	// it: empty (all text), one entry that repeats for every column, or one
-	// entry per column. It is resolved against the produced result at Execute.
+	// entry per column. It is resolved once, when the first Execute produces the
+	// result.
 	resultFormats []int16
+	// execution is nil until the first Execute. Materializing once lets a
+	// resumed portal stream rows from execution.result instead of running the
+	// statement again.
+	execution *portalExecution
+}
+
+// portalExecution is the result a portal materialized on its first Execute,
+// plus the stream cursor a later Execute continues from.
+type portalExecution struct {
+	result *executor.Result
+	// columnTypes, oids, and formats are the result metadata resolved once for
+	// every Execute of this portal.
+	columnTypes []string
+	oids        []int32
+	formats     []int16
+	// commandTag is the completion tag sent when the rows are exhausted.
+	commandTag string
+	// endsTransaction reports that this statement ended the explicit
+	// transaction, so every portal is destroyed with it.
+	endsTransaction bool
+	rowOffset       int
+	// described is true once the RowDescription was sent, so a resumed Execute
+	// sends only DataRows.
+	described bool
+	// completed is true once CommandComplete was sent; a further Execute
+	// repeats the tag without re-running the statement.
+	completed bool
 }
 
 // NewConnection creates a new connection handler
@@ -669,14 +699,11 @@ func (c *Connection) handleExecute(msg *Message) error {
 	}
 	portal, ok := c.portals[name]
 	if !ok {
-		return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("portal %q does not exist", name))
-	}
-	if portal.executed {
-		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("portal can only be executed once"))
+		return c.failExtended(ErrCodeUndefinedCursor, fmt.Errorf("portal %q does not exist", name))
 	}
 	maxRows := int32(binary.BigEndian.Uint32(msg.Data[pos : pos+4]))
 	if maxRows < 0 {
-		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Execute row limit"))
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Execute row limit: %d", maxRows))
 	}
 	// Check the transaction state before catalog emulation. Catalog queries do
 	// not all parse as regular PizzaSQL statements, but must still return 25P02
@@ -684,116 +711,202 @@ func (c *Connection) handleExecute(msg *Message) error {
 	if c.txStatus == TxStatusFailed && !isRollbackStatement(portal.query) {
 		return c.failExtended(ErrCodeTransactionAborted, fmt.Errorf("current transaction is aborted, commands ignored until end of transaction block"))
 	}
-	if maxRows != 0 {
-		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("bounded Execute is not supported; use maxRows=0"))
+	if portal.execution == nil {
+		if failure := c.materializePortal(portal); failure != nil {
+			return c.failExtended(failure.code, failure.err)
+		}
 	}
-	portal.executed = true
+	if err := c.sendPortalRows(portal, maxRows); err != nil {
+		return err
+	}
+	if portal.execution.endsTransaction {
+		// PostgreSQL destroys the portals of the transaction that just ended.
+		c.clearPortals()
+	}
+	return nil
+}
+
+// executeError is a rejected Execute. Its transaction-state effects have already
+// been applied by the time it is built, so handleExecute only reports it.
+type executeError struct {
+	code string
+	err  error
+}
+
+// materializePortal runs a portal's statement once and stores everything the
+// Execute responses need. The executor already produces a complete result, so a
+// resumed Execute stays a slice of that result and never runs the SQL again;
+// column metadata and the completion tag are also computed once. A nil return
+// means the portal is ready to stream.
+func (c *Connection) materializePortal(portal *portal) *executeError {
+	execution := &portalExecution{}
 	if result, handled, catalogErr := c.catalogResult(portal.query); handled {
 		if catalogErr != nil {
-			return c.failExtended(ErrCodeInternalError, catalogErr)
+			return &executeError{code: ErrCodeInternalError, err: catalogErr}
 		}
-		return c.sendTabularResult(result, "SELECT", portal.resultFormats)
-	}
-	l := lexer.New(portal.query)
-	stmt, err := parser.New(l).Parse()
-	if err != nil {
-		code := ErrCodeSyntaxError
-		if errors.Is(err, pgerror.ErrFeatureNotSupported) {
-			code = ErrCodeFeatureNotSupported
-			if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
+		execution.result = result
+		execution.commandTag = fmt.Sprintf("SELECT %d", len(result.Rows))
+	} else {
+		stmt, err := parser.New(lexer.New(portal.query)).Parse()
+		if err != nil {
+			code := ErrCodeSyntaxError
+			if errors.Is(err, pgerror.ErrFeatureNotSupported) {
+				code = ErrCodeFeatureNotSupported
+				if c.txStatus == TxStatusInBlock {
+					c.txStatus = TxStatusFailed
+				}
 			}
+			return &executeError{code: code, err: fmt.Errorf("syntax error: %w", err)}
 		}
-		return c.failExtended(code, fmt.Errorf("syntax error: %w", err))
+		result, err := c.executor.Execute(stmt)
+		if err != nil && isIdleRollback(stmt, c.txStatus, err) {
+			result, err = executor.NewResult("ROLLBACK"), nil
+		}
+		if err != nil {
+			return c.classifyExecuteError(stmt, err)
+		}
+		execution.result = result
+		// getCommandTag applies the statement's transaction transition, so it
+		// belongs here: a repeated Execute must not replay BEGIN/COMMIT/ROLLBACK.
+		execution.commandTag = c.getCommandTag(stmt, result)
+		switch s := stmt.(type) {
+		case *parser.CommitStmt:
+			execution.endsTransaction = true
+		case *parser.RollbackStmt:
+			execution.endsTransaction = s.Savepoint == ""
+		}
 	}
-	result, err := c.executor.Execute(stmt)
-	if err != nil && isIdleRollback(stmt, c.txStatus, err) {
-		result, err = executor.NewResult("ROLLBACK"), nil
+	columnTypes := wireColumnTypes(execution.result)
+	formats, formatErr := c.resolveResultFormats(portal.resultFormats, columnTypes, len(execution.result.Columns))
+	if formatErr != nil {
+		return &executeError{code: resultFormatSQLState(formatErr), err: formatErr}
 	}
-	if err != nil {
-		code := ErrCodeInternalError
-		var primaryKeyErr *storage.PrimaryKeyViolationError
-		var uniqueErr *storage.UniqueViolationError
-		var notNullErr *storage.NotNullViolationError
-		var checkErr *storage.CheckViolationError
-		var foreignKeyErr *storage.ForeignKeyViolationError
-		if errors.Is(err, storage.ErrSerialization) {
-			code = ErrCodeSerializationFailure
-			c.txStatus = TxStatusIdle
-		} else if errors.Is(err, pgerror.ErrInvalidText) {
-			code = ErrCodeInvalidText
-			if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if errors.Is(err, pgerror.ErrInvalidParameter) {
-			code = ErrCodeInvalidParameter
-			if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
-			code = ErrCodeDatatypeMismatch
-			if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if analysisTypeMismatch(err) {
-			code = ErrCodeDatatypeMismatch
-			if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if errors.As(err, &notNullErr) {
-			code = "23502"
-			if _, commit := stmt.(*parser.CommitStmt); commit {
-				c.txStatus = TxStatusIdle
-			} else if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if errors.As(err, &checkErr) {
-			code = ErrCodeCheckViolation
-			if _, commit := stmt.(*parser.CommitStmt); commit {
-				c.txStatus = TxStatusIdle
-			} else if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if errors.As(err, &foreignKeyErr) {
-			code = ErrCodeForeignKeyViolation
-			if _, commit := stmt.(*parser.CommitStmt); commit {
-				c.txStatus = TxStatusIdle
-			} else if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if errors.As(err, &uniqueErr) || errors.As(err, &primaryKeyErr) {
-			code = ErrCodeUniqueViolation
-			if _, commit := stmt.(*parser.CommitStmt); commit {
-				c.txStatus = TxStatusIdle
-			} else if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if errors.Is(err, pgerror.ErrFeatureNotSupported) || errors.Is(err, executor.ErrUnsupportedFeature) {
-			code = ErrCodeFeatureNotSupported
-			if c.txStatus == TxStatusInBlock {
-				c.txStatus = TxStatusFailed
-			}
-		} else if _, commit := stmt.(*parser.CommitStmt); commit {
+	execution.columnTypes = columnTypes
+	execution.oids = c.resultColumnOIDs(columnTypes, len(execution.result.Columns))
+	execution.formats = formats
+	portal.execution = execution
+	return nil
+}
+
+// classifyExecuteError maps a statement execution error to the SQLSTATE the
+// client receives and leaves the transaction state consistent.
+func (c *Connection) classifyExecuteError(stmt parser.Statement, err error) *executeError {
+	code := ErrCodeInternalError
+	var primaryKeyErr *storage.PrimaryKeyViolationError
+	var uniqueErr *storage.UniqueViolationError
+	var notNullErr *storage.NotNullViolationError
+	var checkErr *storage.CheckViolationError
+	var foreignKeyErr *storage.ForeignKeyViolationError
+	if errors.Is(err, storage.ErrSerialization) {
+		code = ErrCodeSerializationFailure
+		c.txStatus = TxStatusIdle
+	} else if errors.Is(err, pgerror.ErrInvalidText) {
+		code = ErrCodeInvalidText
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.Is(err, pgerror.ErrInvalidParameter) {
+		code = ErrCodeInvalidParameter
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.Is(err, pgerror.ErrDatatypeMismatch) {
+		code = ErrCodeDatatypeMismatch
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if analysisTypeMismatch(err) {
+		code = ErrCodeDatatypeMismatch
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.As(err, &notNullErr) {
+		code = "23502"
+		if _, commit := stmt.(*parser.CommitStmt); commit {
 			c.txStatus = TxStatusIdle
 		} else if c.txStatus == TxStatusInBlock {
 			c.txStatus = TxStatusFailed
 		}
-		if uniqueErr != nil {
-			return c.failExtended(code, fmt.Errorf("execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint))
+	} else if errors.As(err, &checkErr) {
+		code = ErrCodeCheckViolation
+		if _, commit := stmt.(*parser.CommitStmt); commit {
+			c.txStatus = TxStatusIdle
+		} else if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
 		}
-		return c.failExtended(code, fmt.Errorf("execution error: %w", err))
+	} else if errors.As(err, &foreignKeyErr) {
+		code = ErrCodeForeignKeyViolation
+		if _, commit := stmt.(*parser.CommitStmt); commit {
+			c.txStatus = TxStatusIdle
+		} else if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.As(err, &uniqueErr) || errors.As(err, &primaryKeyErr) {
+		code = ErrCodeUniqueViolation
+		if _, commit := stmt.(*parser.CommitStmt); commit {
+			c.txStatus = TxStatusIdle
+		} else if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if errors.Is(err, pgerror.ErrFeatureNotSupported) || errors.Is(err, executor.ErrUnsupportedFeature) {
+		code = ErrCodeFeatureNotSupported
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+	} else if _, commit := stmt.(*parser.CommitStmt); commit {
+		c.txStatus = TxStatusIdle
+	} else if c.txStatus == TxStatusInBlock {
+		c.txStatus = TxStatusFailed
 	}
-	columnTypes := wireColumnTypes(result)
-	formats, formatErr := c.resolveResultFormats(portal.resultFormats, columnTypes, len(result.Columns))
-	if formatErr != nil {
-		return c.failResultFormat(formatErr)
+	if uniqueErr != nil {
+		return &executeError{code: code, err: fmt.Errorf("execution error: UNIQUE constraint failed: %s", uniqueErr.Constraint)}
 	}
-	if err := c.sendResult(result, stmt, columnTypes, formats); err != nil {
+	return &executeError{code: code, err: fmt.Errorf("execution error: %w", err)}
+}
+
+// sendPortalRows writes one Execute response from the portal's materialized
+// result. The RowDescription is sent once, by the first Execute that has
+// columns, so a resumed Execute emits only DataRows. With maxRows > 0 the
+// response is PortalSuspended once the limit was reached; PostgreSQL reports
+// PortalSuspended even when the last row falls exactly on the limit and
+// completes on the next Execute, which is what this does too.
+func (c *Connection) sendPortalRows(portal *portal, maxRows int32) error {
+	execution := portal.execution
+	if len(execution.result.Columns) > 0 && !execution.described {
+		if err := c.sendRowDescriptionFormats(execution.result.Columns, execution.columnTypes, execution.oids, execution.formats); err != nil {
+			return err
+		}
+		execution.described = true
+	}
+	remaining := len(execution.result.Rows) - execution.rowOffset
+	limit := remaining
+	if maxRows > 0 && int(maxRows) < remaining {
+		limit = int(maxRows)
+	}
+	for i := 0; i < limit; i++ {
+		if err := c.sendDataRowFormats(execution.result.Rows[execution.rowOffset+i], execution.oids, execution.formats); err != nil {
+			return c.failBinaryEncode(err)
+		}
+	}
+	execution.rowOffset += limit
+	if maxRows > 0 && limit == int(maxRows) {
+		return c.sendPortalSuspended()
+	}
+	firstCompletion := !execution.completed
+	execution.completed = true
+	if err := c.sendCommandComplete(execution.commandTag); err != nil {
 		return err
 	}
-	if result.LSN > 0 {
-		return c.sendLSN(result.LSN)
+	if firstCompletion && execution.result.LSN > 0 {
+		if err := c.sendLSN(execution.result.LSN); err != nil {
+			return err
+		}
 	}
+	// The portal is exhausted: keep its metadata for a repeated Execute, but
+	// release the row data so a transaction that leaves portals open does not
+	// retain every result.
+	execution.result.Rows = nil
+	execution.rowOffset = 0
 	return nil
 }
 
@@ -1030,6 +1143,14 @@ func (c *Connection) handleClose(msg *Message) error {
 		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Close target"))
 	}
 	return c.writeMessage(MsgCloseComplete, nil)
+}
+
+// clearPortals drops every portal. PostgreSQL binds a portal to the transaction
+// that created it: Sync ends the implicit transaction outside an explicit
+// block, and COMMIT/ROLLBACK end an explicit one. Prepared statements are not
+// affected, so a client re-binds after the transaction ends.
+func (c *Connection) clearPortals() {
+	clear(c.portals)
 }
 
 func (c *Connection) failExtended(code string, err error) error {
@@ -1408,6 +1529,13 @@ func isIdleRollback(stmt parser.Statement, status byte, err error) bool {
 
 // sendReadyForQuery sends ready for query message
 func (c *Connection) sendReadyForQuery() error {
+	if c.txStatus == TxStatusIdle {
+		// The transaction this cycle ran in ends here, so its portals do too.
+		// A portal inside an explicit block survives (status T) until
+		// COMMIT/ROLLBACK, and a failed block (status E) keeps its portals so
+		// Execute still reports 25P02 until the transaction is rolled back.
+		c.clearPortals()
+	}
 	mb := NewMessageBuilder()
 	mb.AppendByte(c.txStatus)
 	if err := c.writeMessage(MsgReadyForQuery, mb.Bytes()); err != nil {
@@ -1528,6 +1656,12 @@ func (c *Connection) sendCommandComplete(tag string) error {
 	mb := NewMessageBuilder()
 	mb.WriteString(tag)
 	return c.writeMessage(MsgCommandComplete, mb.Bytes())
+}
+
+// sendPortalSuspended reports that a bounded Execute stopped at its row limit
+// with rows left to fetch.
+func (c *Connection) sendPortalSuspended() error {
+	return c.writeMessage(MsgPortalSuspended, nil)
 }
 
 // sendError sends an error response

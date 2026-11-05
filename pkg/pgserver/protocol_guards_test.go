@@ -42,7 +42,6 @@ func TestUnsupportedExtendedRequestsFailBeforeSideEffects(t *testing.T) {
 		{"invalid_result_format", &Message{Type: MsgBind, Data: guardBind(nil, []int16{2})}, ErrCodeProtocolViolation},
 		{"invalid_parameter_format", &Message{Type: MsgBind, Data: guardBind([]int16{2}, nil)}, ErrCodeProtocolViolation},
 		{"parameter_format_count", &Message{Type: MsgBind, Data: guardBind([]int16{0, 0}, nil)}, ErrCodeProtocolViolation},
-		{"bounded_execute", &Message{Type: MsgExecute, Data: []byte{'p', 0, 0, 0, 0, 1}}, ErrCodeFeatureNotSupported},
 		{"negative_execute", &Message{Type: MsgExecute, Data: []byte{'p', 0, 255, 255, 255, 255}}, ErrCodeProtocolViolation},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

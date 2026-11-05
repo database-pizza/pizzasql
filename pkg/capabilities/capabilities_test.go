@@ -323,3 +323,27 @@ func TestBinaryResultsAreAdvertised(t *testing.T) {
 		}
 	}
 }
+
+// Bounded Execute is advertised with its resume semantics, portal lifetime, and
+// limits. pkg/pgserver covers each claim with raw-protocol portal tests.
+func TestBoundedExecuteIsAdvertised(t *testing.T) {
+	bounded := Current().Protocol.BoundedExecute
+	if !bounded.Supported {
+		t.Fatalf("bounded_execute = %+v, want supported", bounded)
+	}
+	if bounded.Status != "supported" {
+		t.Fatalf("bounded_execute status = %q, want supported", bounded.Status)
+	}
+	if bounded.SQLState != "34000" {
+		t.Fatalf("bounded_execute sqlstate = %q, want 34000", bounded.SQLState)
+	}
+	for _, claim := range []string{
+		"PortalSuspended", "maxRows = 0", "materialized once", "no scroll",
+		"WITH HOLD", "RowDescription is sent by the first Execute only",
+		"Close('P')", "34000", "25P02", "08P01", "RETURNING",
+	} {
+		if !strings.Contains(bounded.Notes, claim) {
+			t.Errorf("bounded_execute notes do not mention %q", claim)
+		}
+	}
+}

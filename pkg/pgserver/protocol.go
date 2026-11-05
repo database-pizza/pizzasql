@@ -46,6 +46,7 @@ const (
 	MsgNoticeResponse       = 'N' // Notice response
 	MsgParameterDescription = 't' // Parameter description
 	MsgParameterStatus      = 'S' // Parameter status
+	MsgPortalSuspended      = 's' // Portal suspended
 	MsgParseComplete        = '1' // Parse complete
 	MsgReadyForQuery        = 'Z' // Ready for query
 	MsgRowDescription       = 'T' // Row description
@@ -96,6 +97,7 @@ const (
 	ErrCodeConnectionFailure    = "08006"
 	ErrCodeProtocolViolation    = "08P01"
 	ErrCodeFeatureNotSupported  = "0A000"
+	ErrCodeUndefinedCursor      = "34000"
 	ErrCodeTransactionAborted   = "25P02"
 	ErrCodeSerializationFailure = "40001"
 	ErrCodeUniqueViolation      = "23505"
