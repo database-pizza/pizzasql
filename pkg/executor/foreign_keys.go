@@ -78,18 +78,6 @@ func (e *Executor) resolveForeignKey(table string, schema *storage.Schema, uniqu
 			label, table,
 		)
 	}
-	for _, action := range []struct {
-		clause string
-		value  parser.ReferentialAction
-	}{{"ON DELETE", declaration.onDelete}, {"ON UPDATE", declaration.onUpdate}} {
-		switch action.value {
-		case parser.RefActionCascade, parser.RefActionSetNull, parser.RefActionSetDefault:
-			return storage.ForeignKeyConstraint{}, pgerror.Unsupported(
-				"foreign key %s on table %s uses %s %s; cascades are not implemented, use NO ACTION or RESTRICT",
-				label, table, action.clause, action.value,
-			)
-		}
-	}
 
 	childColumns := make([]string, 0, len(declaration.columns))
 	seen := make(map[string]bool, len(declaration.columns))

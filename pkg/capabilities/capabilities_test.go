@@ -149,8 +149,8 @@ func TestCompositePrimaryKeyIsAdvertised(t *testing.T) {
 }
 
 // Foreign keys are advertised as enforced, with the SQLSTATE callers should
-// expect for a dangling reference and the explicit exclusions for cascades and
-// deferred enforcement.
+// expect for a dangling reference, the referential actions that execute
+// immediately, and the explicit exclusions for deferred enforcement.
 func TestForeignKeyIsAdvertised(t *testing.T) {
 	doc := Current()
 	fk := doc.Constraints.ForeignKey
@@ -164,7 +164,9 @@ func TestForeignKeyIsAdvertised(t *testing.T) {
 		t.Fatalf("foreign_key SQLSTATE = %q, want %q", fk.SQLState, pgerror.CodeForeignKeyViolation)
 	}
 	for _, want := range []string{
-		"UNIQUE", "COMMIT", "MATCH SIMPLE", "MATCH keyword", "self", "CASCADE", "DEFERRABLE", "0A000",
+		"UNIQUE", "COMMIT", "MATCH SIMPLE", "MATCH keyword", "self",
+		"CASCADE", "SET NULL", "SET DEFAULT", "NOT NULL", "immediately", "transitively",
+		"DEFERRABLE", "0A000",
 		"PRAGMA foreign_keys", "rejects OFF", "foreign_key_list", "database-wide foreign-key write gate",
 		"DROP/RENAME COLUMN", "DROP TABLE", "pg_constraint",
 	} {

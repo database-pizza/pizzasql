@@ -116,23 +116,7 @@ func (s *Session) Snapshot() int {
 func (s *Session) RollbackTo(pos int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := len(s.log) - 1; i >= pos && i >= 0; i-- {
-		m := s.log[i]
-		if m.prev == nil {
-			delete(s.overlay[m.table], m.key)
-			if len(s.overlay[m.table]) == 0 {
-				delete(s.overlay, m.table)
-			}
-		} else {
-			if s.overlay[m.table] == nil {
-				s.overlay[m.table] = make(map[string]*overlayEntry)
-			}
-			s.overlay[m.table][m.key] = m.prev
-		}
-	}
-	if pos < len(s.log) {
-		s.log = s.log[:pos]
-	}
+	s.rollbackToLocked(pos)
 	s.aborted = false
 }
 
@@ -795,20 +779,56 @@ func (s *Session) insertLocked(table string, row Row) (int64, error) {
 	return rowid, nil
 }
 
-// UpdateByPK stages or durably applies a single-row update.
+// UpdateByPK stages or durably applies a single-row update. A table that is the
+// parent of a cascading constraint runs in an implicit transaction so the parent
+// rewrite and every cascaded row publish in one commit.
 func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
 	s.mu.Lock()
 	if !s.inTx {
 		s.mu.Unlock()
-		return s.table.UpdateByPK(table, pk, updateFn)
+		cascades, err := s.schema.HasCascadingReference(table, false)
+		if err != nil {
+			return nil, false, err
+		}
+		if !cascades {
+			return s.table.UpdateByPK(table, pk, updateFn)
+		}
+		return s.updateByPKImplicit(table, pk, updateFn)
 	}
 	defer s.mu.Unlock()
+	return s.updateByPKLocked(table, pk, updateFn)
+}
 
+// updateByPKImplicit runs a cascading point update inside an implicit
+// transaction, so a failed cascade leaves no durable parent change behind.
+func (s *Session) updateByPKImplicit(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
+	if err := s.Begin(); err != nil {
+		return nil, false, err
+	}
+	oldRow, updated, err := s.updateByPKStaged(table, pk, updateFn)
+	if err != nil {
+		_ = s.Rollback()
+		return nil, false, err
+	}
+	if err := s.Commit(); err != nil {
+		return nil, false, err
+	}
+	return oldRow, updated, nil
+}
+
+func (s *Session) updateByPKStaged(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.updateByPKLocked(table, pk, updateFn)
+}
+
+// updateByPKLocked stages a point update. The caller holds the session lock and
+// a transaction.
+func (s *Session) updateByPKLocked(table, pk string, updateFn func(Row) (Row, error)) (Row, bool, error) {
 	schema, err := s.schema.GetSchema(table)
 	if err != nil {
 		return nil, false, err
 	}
-	key := s.table.dataKey(table, pk)
 
 	row, err := s.getByPKLocked(table, pk)
 	if err == ErrKeyNotFound {
@@ -835,7 +855,11 @@ func (s *Session) UpdateByPK(table, pk string, updateFn func(Row) (Row, error)) 
 	if err := s.schema.validateRowConstraints(schema, row); err != nil {
 		return nil, false, err
 	}
-	s.stagePut(table, key, row)
+	pos := len(s.log)
+	if err := s.stageCascadeUpdate(table, oldRow, row, newCascadeExpansion(s.schema)); err != nil {
+		s.rollbackToLocked(pos)
+		return nil, false, err
+	}
 	return oldRow, true, nil
 }
 
@@ -850,14 +874,50 @@ func (s *Session) runUpdateFn(updateFn func(Row) (Row, error), row Row) (Row, er
 	return updateFn(row)
 }
 
-// DeleteByPK stages or durably applies a single-row delete.
+// DeleteByPK stages or durably applies a single-row delete. A table that is the
+// parent of a cascading constraint runs in an implicit transaction so the
+// parent delete and every cascaded row publish in one commit.
 func (s *Session) DeleteByPK(table, pk string) (Row, bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.inTx {
-		return s.table.DeleteByPK(table, pk)
+		s.mu.Unlock()
+		cascades, err := s.schema.HasCascadingReference(table, true)
+		if err != nil {
+			return nil, false, err
+		}
+		if !cascades {
+			return s.table.DeleteByPK(table, pk)
+		}
+		return s.deleteByPKImplicit(table, pk)
 	}
+	defer s.mu.Unlock()
+	return s.deleteByPKLocked(table, pk)
+}
 
+func (s *Session) deleteByPKImplicit(table, pk string) (Row, bool, error) {
+	if err := s.Begin(); err != nil {
+		return nil, false, err
+	}
+	row, deleted, err := s.deleteByPKStaged(table, pk)
+	if err != nil {
+		_ = s.Rollback()
+		return nil, false, err
+	}
+	if err := s.Commit(); err != nil {
+		return nil, false, err
+	}
+	return row, deleted, nil
+}
+
+func (s *Session) deleteByPKStaged(table, pk string) (Row, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteByPKLocked(table, pk)
+}
+
+// deleteByPKLocked stages a point delete. The caller holds the session lock and
+// a transaction.
+func (s *Session) deleteByPKLocked(table, pk string) (Row, bool, error) {
 	key := s.table.dataKey(table, pk)
 	row, err := s.getByPKLocked(table, pk)
 	if err == ErrKeyNotFound {
@@ -866,7 +926,11 @@ func (s *Session) DeleteByPK(table, pk string) (Row, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	s.stageDelete(table, key, row)
+	pos := len(s.log)
+	if err := s.stageCascadeDelete(table, key, row, newCascadeExpansion(s.schema)); err != nil {
+		s.rollbackToLocked(pos)
+		return nil, false, err
+	}
 	return row, true, nil
 }
 
@@ -910,15 +974,13 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 		return 0, err
 	}
 	count := 0
+	exp := newCascadeExpansion(s.schema)
+	pos := len(s.log)
 	for _, row := range rows {
 		oldRow := cloneRow(row)
-		oldPK, err := schema.PrimaryKeyForRow(row)
-		if err != nil {
-			return count, err
-		}
-		oldKey := s.table.dataKey(table, oldPK)
 		updates, err := s.runUpdateFn(updateFn, row)
 		if err != nil {
+			s.rollbackToLocked(pos)
 			return count, err
 		}
 		for name, value := range updates {
@@ -930,24 +992,13 @@ func (s *Session) UpdateFunc(table string, updateFn func(Row) (Row, error), filt
 			}
 		}
 		if err := s.schema.validateRowConstraints(schema, row); err != nil {
+			s.rollbackToLocked(pos)
 			return count, err
 		}
-		newPK, err := schema.PrimaryKeyForRow(row)
-		if err != nil {
+		if err := s.stageCascadeUpdate(table, oldRow, row, exp); err != nil {
+			s.rollbackToLocked(pos)
 			return count, err
 		}
-		newKey := s.table.dataKey(table, newPK)
-		if newKey != oldKey {
-			// The primary key changed: move the staged row instead of leaving a
-			// stale copy under the old key, and refuse to overwrite another row.
-			if _, gerr := s.getByPKLocked(table, newPK); gerr == nil {
-				return count, &PrimaryKeyViolationError{Table: table, Key: newPK}
-			} else if gerr != ErrKeyNotFound {
-				return count, gerr
-			}
-			s.stageDelete(table, oldKey, oldRow)
-		}
-		s.stagePut(table, newKey, row)
 		count++
 	}
 	return count, nil
@@ -971,12 +1022,18 @@ func (s *Session) Delete(table string, filter func(Row) bool) (int, error) {
 		return 0, err
 	}
 	count := 0
+	exp := newCascadeExpansion(s.schema)
+	pos := len(s.log)
 	for _, row := range rows {
 		pk, err := schema.PrimaryKeyForRow(row)
 		if err != nil {
+			s.rollbackToLocked(pos)
 			return count, err
 		}
-		s.stageDelete(table, s.table.dataKey(table, pk), row)
+		if err := s.stageCascadeDelete(table, s.table.dataKey(table, pk), row, exp); err != nil {
+			s.rollbackToLocked(pos)
+			return count, err
+		}
 		count++
 	}
 	return count, nil

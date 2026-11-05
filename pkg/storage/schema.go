@@ -38,8 +38,10 @@ type Schema struct {
 	// level alike. Inline and table-level declarations are equivalent once
 	// parsed, so both live in this one list.
 	Checks []CheckConstraint `json:"checks,omitempty"`
-	// ForeignKeys holds the immediate FOREIGN KEY declarations. Each constraint
-	// is enforced on every write and re-validated at transaction commit.
+	// ForeignKeys holds the FOREIGN KEY declarations. Each constraint is
+	// enforced on every write and re-validated at transaction commit; a
+	// cascading action rewrites or removes the referencing rows as part of the
+	// same statement.
 	ForeignKeys []ForeignKeyConstraint `json:"foreign_keys,omitempty"`
 }
 
@@ -52,9 +54,10 @@ type ForeignKeyConstraint struct {
 	Columns    []string `json:"columns"`
 	RefTable   string   `json:"ref_table"`
 	RefColumns []string `json:"ref_columns"`
-	// OnDelete and OnUpdate hold the declared referential action text (only
-	// NO ACTION and RESTRICT are accepted). They are empty when the clause was
-	// omitted and are kept so sqlite_master can reproduce the declaration.
+	// OnDelete and OnUpdate hold the declared referential action text (NO
+	// ACTION, RESTRICT, CASCADE, SET NULL, or SET DEFAULT). They are empty when
+	// the clause was omitted and are kept so sqlite_master can reproduce the
+	// declaration.
 	OnDelete string `json:"on_delete,omitempty"`
 	OnUpdate string `json:"on_update,omitempty"`
 }

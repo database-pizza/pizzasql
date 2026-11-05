@@ -1536,10 +1536,9 @@ func (p *Parser) parseOnConflictAction() (ConflictAction, bool, error) {
 
 // parseForeignKeyClauses parses the optional ON DELETE/ON UPDATE referential
 // actions and the optional DEFERRABLE clause that follow a REFERENCES target.
-// The engine enforces foreign keys immediately, so the parsed actions are kept
-// for the DDL layer to accept (NO ACTION/RESTRICT) or reject (cascades), and a
-// DEFERRABLE clause is recorded so it can be rejected instead of silently
-// weakening the constraint.
+// Every action is parsed and persisted; the storage layer executes the
+// cascading forms, and a DEFERRABLE clause is recorded so the DDL layer can
+// reject it instead of silently weakening the constraint.
 func (p *Parser) parseForeignKeyClauses(onDelete, onUpdate *ReferentialAction, deferrable *bool) error {
 	for p.curTokenIs(lexer.TokenON) {
 		p.nextToken()
