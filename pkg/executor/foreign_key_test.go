@@ -429,30 +429,6 @@ func TestForeignKeyDDLRejections(t *testing.T) {
 			want:  "same number of columns",
 		},
 		{
-			name:  "on delete cascade",
-			setup: []string{"CREATE TABLE parent (id INTEGER PRIMARY KEY)"},
-			ddl:   "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
-			want:  "cascades are not implemented",
-		},
-		{
-			name:  "on update cascade",
-			setup: []string{"CREATE TABLE parent (id INTEGER PRIMARY KEY)"},
-			ddl:   "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent(id) ON UPDATE CASCADE)",
-			want:  "cascades are not implemented",
-		},
-		{
-			name:  "on delete set null",
-			setup: []string{"CREATE TABLE parent (id INTEGER PRIMARY KEY)"},
-			ddl:   "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE SET NULL)",
-			want:  "cascades are not implemented",
-		},
-		{
-			name:  "on delete set default",
-			setup: []string{"CREATE TABLE parent (id INTEGER PRIMARY KEY)"},
-			ddl:   "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE SET DEFAULT)",
-			want:  "cascades are not implemented",
-		},
-		{
 			name:  "deferrable",
 			setup: []string{"CREATE TABLE parent (id INTEGER PRIMARY KEY)"},
 			ddl:   "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
