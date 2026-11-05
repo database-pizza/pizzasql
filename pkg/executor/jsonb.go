@@ -961,15 +961,13 @@ func jsonbContains(container, candidate interface{}) bool {
 	case []interface{}:
 		containerArray, ok := container.([]interface{})
 		if ok {
-			used := make([]bool, len(containerArray))
+			// PostgreSQL array containment does not require multiplicity: each
+			// candidate element only needs some container element, and duplicates
+			// may match the same element.
 			for _, candidateElement := range candidateValue {
 				matched := false
-				for i, containerElement := range containerArray {
-					if used[i] {
-						continue
-					}
+				for _, containerElement := range containerArray {
 					if jsonbContains(containerElement, candidateElement) {
-						used[i] = true
 						matched = true
 						break
 					}

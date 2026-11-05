@@ -765,8 +765,6 @@ func TestJSONBExactEqualityAndAggregateAgreement(t *testing.T) {
 	}
 }
 
-// Containment tracks consumed array matches, as required by the review gate:
-// a candidate with duplicates needs a distinct container element per copy.
 // A jsonb extraction result must not be silently compared with a SQL number.
 func TestJSONBExtractionComparisonTypeError(t *testing.T) {
 	_, schema, table := newTestDB(t)
@@ -784,17 +782,21 @@ func TestJSONBExtractionComparisonTypeError(t *testing.T) {
 	}
 }
 
-func TestJSONBArrayContainmentMultiplicity(t *testing.T) {
+// PostgreSQL array containment is duplicate-insensitive: each candidate
+// element only needs some matching container element, and duplicates may
+// consume the same match.
+func TestJSONBArrayContainmentDuplicates(t *testing.T) {
 	_, schema, table := newTestDB(t)
 	e := newExec(schema, table)
 	cases := []struct {
 		sql  string
 		want interface{}
 	}{
-		{`SELECT '[1]'::jsonb @> '[1,1]'::jsonb`, false},
+		{`SELECT '[1]'::jsonb @> '[1,1]'::jsonb`, true},
 		{`SELECT '[1,1]'::jsonb @> '[1]'::jsonb`, true},
 		{`SELECT '[1,2,2]'::jsonb @> '[2,2]'::jsonb`, true},
-		{`SELECT '[1,2]'::jsonb @> '[2,2]'::jsonb`, false},
+		{`SELECT '[1,2]'::jsonb @> '[2,2]'::jsonb`, true},
+		{`SELECT '[1,2]'::jsonb @> '[2,3]'::jsonb`, false},
 		{`SELECT '[1]'::jsonb @> '1'::jsonb`, true},
 	}
 	for _, tc := range cases {
