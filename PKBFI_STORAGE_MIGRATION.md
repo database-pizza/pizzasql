@@ -39,6 +39,17 @@ The migration command exits after writing and verifying the destination. It refu
   pre-CHECK engine ignores it on read and drops it on the next schema write, so
   rolling back to such an engine silently stops enforcing CHECK constraints;
   restore the newer engine (or re-create the constraints) after a rollback.
+- `Schema.PrimaryKeyColumns` (`primary_key_columns`) is an additive, optional
+  JSON field for composite primary keys. A single-column catalog still carries
+  only `primary_key`; a composite catalog persists `primary_key` as an empty
+  string plus the per-column `primary_key` flags and the ordered
+  `primary_key_columns` list. A pre-composite engine ignores the new field, so
+  rolling back to one collapses key derivation: reads, duplicate detection, and
+  updates then address the row by at most one column (or by the hidden rowid),
+  which can return the wrong row or report spurious duplicates. Restore the
+  newer engine before serving traffic from such a tenant. No row migration is
+  needed moving forward: rows written by this engine keep their keys, and
+  single-column key bytes are unchanged for older engines.
 - Successful PKBFI writes are acknowledged only after PizzaKV's durability sync completes.
 - A `.pkvdb` file must have one PizzaSQL process owner. Optimistic scan and
   predicate conflict detection uses process-local generations and is not safe

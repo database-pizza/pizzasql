@@ -316,3 +316,33 @@ func TestLegacySingleColumnSchemaLoads(t *testing.T) {
 		t.Fatalf("GetByPK = %v, err %v", row, err)
 	}
 }
+
+// Insert resolves catalog defaults for key components and writes every resolved
+// key value back into the caller's row, so callers (RETURNING, conflict
+// matching) observe the key the row was stored under.
+func TestCompositePrimaryKeyInsertWritesResolvedKeyBack(t *testing.T) {
+	_, _, schemas, tables := newTestSession(t)
+	if err := schemas.CreateTable(&Schema{
+		Name:              "t",
+		PrimaryKeyColumns: []string{"a", "b"},
+		Columns: []Column{
+			{Name: "a", Type: "TEXT", Default: "d"},
+			{Name: "b", Type: "TEXT"},
+			{Name: "v", Type: "TEXT"},
+		},
+	}); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	row := Row{"b": "y", "v": "one"}
+	if err := tables.Insert("t", row); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if row["a"] != "d" || row["b"] != "y" {
+		t.Fatalf("caller row after insert = %v, want a='d' b='y'", row)
+	}
+	stored, err := tables.GetByPK("t", "1:d1:y")
+	if err != nil || stored["v"] != "one" {
+		t.Fatalf("stored row = %v, err %v", stored, err)
+	}
+}

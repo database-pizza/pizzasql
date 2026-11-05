@@ -565,12 +565,13 @@ func (m *TableManager) normalizeInsertRow(table string, schema *Schema, row Row)
 	if err := m.schema.validateRowConstraints(schema, normalizedRow); err != nil {
 		return nil, "", 0, err
 	}
-	// Callers that read the assigned key back from the row they passed in (for
-	// example RETURNING on an auto-assigned INTEGER PRIMARY KEY) need the
-	// generated value; a composite key is never generated.
-	if columns := schema.PrimaryKeyList(); len(columns) == 1 {
-		if value, ok := normalizedRow[columns[0]]; ok {
-			row[columns[0]] = value
+	// Callers read the resolved key back from the row they passed in: RETURNING
+	// needs an auto-assigned INTEGER PRIMARY KEY, and a composite table needs key
+	// components that came from a catalog DEFAULT because the conflict-matching
+	// and fetch paths run before the next storage call.
+	for _, column := range schema.PrimaryKeyList() {
+		if value, ok := normalizedRow[column]; ok {
+			row[column] = value
 		}
 	}
 	return normalizedRow, m.dataKey(table, key), rowid, nil

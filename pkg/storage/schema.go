@@ -670,15 +670,26 @@ func (s *Schema) IsPrimaryKeyColumn(name string) bool {
 	return false
 }
 
-// PrimaryKeyMatches reports whether columns is the complete primary-key column
-// list in declaration order.
-func (s *Schema) PrimaryKeyMatches(columns []string) bool {
+// PrimaryKeyTargetMatches reports whether columns names the complete
+// primary-key column set. Order is not significant: ON CONFLICT (b, a) on a
+// PRIMARY KEY (a, b) addresses the same key, because the encoded key is built
+// in declaration order either way. SQLite instead requires the declaration
+// order of a constraint; this engine already accepts arbitrary conflict-target
+// lists, so it matches the set rather than raising.
+func (s *Schema) PrimaryKeyTargetMatches(columns []string) bool {
 	primary := s.PrimaryKeyList()
 	if len(primary) != len(columns) {
 		return false
 	}
-	for i := range primary {
-		if !strings.EqualFold(primary[i], columns[i]) {
+	for _, column := range primary {
+		found := false
+		for _, candidate := range columns {
+			if strings.EqualFold(column, candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}

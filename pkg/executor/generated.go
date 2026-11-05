@@ -111,7 +111,6 @@ func isIntegerColumnType(typeName string) bool {
 // conflictMatcher describes one uniqueness constraint used to resolve an
 // INSERT conflict. index is nil for the primary key.
 type conflictMatcher struct {
-	name       string
 	index      *storage.Index
 	primaryKey bool
 }
@@ -123,7 +122,7 @@ type conflictMatcher struct {
 func (e *Executor) insertConflictMatchers(tableName string, schema *storage.Schema, stmtReplace bool) ([]conflictMatcher, error) {
 	var matchers []conflictMatcher
 	if stmtReplace {
-		matchers = append(matchers, conflictMatcher{name: schema.PrimaryKey, primaryKey: true})
+		matchers = append(matchers, conflictMatcher{primaryKey: true})
 	}
 	indexes, err := e.schema.ListTableIndexes(tableName)
 	if err != nil {
@@ -136,7 +135,7 @@ func (e *Executor) insertConflictMatchers(tableName string, schema *storage.Sche
 		if !stmtReplace && !strings.EqualFold(idx.OnConflict, "REPLACE") {
 			continue
 		}
-		matchers = append(matchers, conflictMatcher{name: idx.Name, index: idx})
+		matchers = append(matchers, conflictMatcher{index: idx})
 	}
 	return matchers, nil
 }
@@ -180,14 +179,14 @@ func (e *Executor) matcherConflicts(tableName string, schema *storage.Schema, m 
 // statement-level OR IGNORE and targetless DO NOTHING apply to any conflict,
 // not just the primary key.
 func (e *Executor) hasAnyInsertConflict(tableName string, schema *storage.Schema, candidate storage.Row) (bool, error) {
-	matchers := []conflictMatcher{{name: schema.PrimaryKey, primaryKey: true}}
+	matchers := []conflictMatcher{{primaryKey: true}}
 	indexes, err := e.schema.ListTableIndexes(tableName)
 	if err != nil {
 		return false, err
 	}
 	for _, index := range indexes {
 		if index.Unique {
-			matchers = append(matchers, conflictMatcher{name: index.Name, index: index})
+			matchers = append(matchers, conflictMatcher{index: index})
 		}
 	}
 	for _, matcher := range matchers {

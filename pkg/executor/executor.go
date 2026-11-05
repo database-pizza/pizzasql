@@ -2621,7 +2621,7 @@ func isConflictError(err error) bool {
 // target uses an indexed lookup; only an unindexed composite target falls back
 // to a scan.
 func (e *Executor) findConflictRow(table string, schema *storage.Schema, row storage.Row, columns []string) (storage.Row, bool, error) {
-	if schema.PrimaryKeyMatches(columns) {
+	if schema.PrimaryKeyTargetMatches(columns) {
 		pk, err := schema.PrimaryKeyForRow(row)
 		if err != nil {
 			// A missing or NULL key component cannot conflict: the insert itself
@@ -2755,9 +2755,24 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 			}
 		}
 	}
-	// Expression defaults are evaluated once per statement, so all rows of a
-	// multi-row INSERT share one value and the next statement reads the clock
-	// again. Constant defaults are applied by storage from the catalog.
+	// An upsert is applied as an in-place update of the conflicting row, so it
+	// cannot move that row to a new primary key. Accepting the assignment would
+	// leave the durable row under its old key with the new key values in its
+	// body, which makes later full-key reads and updates split the row in two.
+	for _, assignment := range stmt.ConflictUpdate {
+		if schema.IsPrimaryKeyColumn(assignment.Column) {
+			return nil, pgerror.Unsupported(
+				"ON CONFLICT DO UPDATE cannot assign primary key column %q of table %s; delete and re-insert the row to change its key",
+				assignment.Column, tableName,
+			)
+		}
+	}
+	// Defaults are resolved once per statement: expression defaults are
+	// evaluated at the statement instant so a multi-row INSERT shares one value,
+	// and constant catalog defaults are copied into the candidate row. Resolving
+	// both here lets conflict matching and RETURNING see the same key the storage
+	// layer will write; storage still applies them as a fallback for rows that
+	// reach it another way.
 	defaults, err := e.statementDefaults(schema)
 	if err != nil {
 		return nil, err
@@ -3740,6 +3755,12 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		for _, constraint := range colDef.Constraints {
 			switch constraint.Type {
 			case parser.ConstraintPrimaryKey:
+				if col.GeneratedExpr != "" {
+					return nil, pgerror.Unsupported(
+						"generated column %q cannot be part of a PRIMARY KEY",
+						col.Name,
+					)
+				}
 				col.PrimaryKey = true
 				col.Nullable = false
 				inlinePrimaryKeyColumns = append(inlinePrimaryKeyColumns, col.Name)
@@ -3799,6 +3820,12 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 					return nil, pgerror.Unsupported(
 						"PRIMARY KEY column %q does not exist in table %s",
 						name, stmt.Table.Name,
+					)
+				}
+				if column.GeneratedExpr != "" {
+					return nil, pgerror.Unsupported(
+						"generated column %q cannot be part of a PRIMARY KEY",
+						column.Name,
 					)
 				}
 				if seen[strings.ToLower(column.Name)] {
@@ -4232,8 +4259,10 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 	for _, constraint := range action.Column.Constraints {
 		switch constraint.Type {
 		case parser.ConstraintPrimaryKey:
-			col.PrimaryKey = true
-			col.Nullable = false
+			return nil, pgerror.Unsupported(
+				"ALTER TABLE ADD COLUMN cannot declare PRIMARY KEY on column %q; declare the key in CREATE TABLE (SQLite also rejects adding a PRIMARY KEY column)",
+				col.Name,
+			)
 		case parser.ConstraintNotNull:
 			col.Nullable = false
 		case parser.ConstraintUnique:

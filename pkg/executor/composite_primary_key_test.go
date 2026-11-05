@@ -411,3 +411,293 @@ func TestCompositePrimaryKeyAlterTable(t *testing.T) {
 		t.Fatalf("DROP COLUMN error = %v, want a primary-key rejection", err)
 	}
 }
+
+// An upsert updates the conflicting row in place, so it cannot move that row to
+// a different key. Accepting the assignment would leave the durable row under
+// the old key while its body carries the new key values, and a later full-key
+// update would create a second row.
+func TestUpsertRejectsPrimaryKeyAssignment(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE pairs (a TEXT, b TEXT, v TEXT, PRIMARY KEY (a, b))")
+	execMust(t, e, "INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'one')")
+
+	for _, sql := range []string{
+		"INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'two') ON CONFLICT (a, b) DO UPDATE SET v = excluded.v, a = 'moved'",
+		"INSERT INTO pairs (a, b, v) VALUES ('new', 'key', 'v') ON CONFLICT (a, b) DO UPDATE SET b = excluded.b",
+	} {
+		_, err := execSQL(e, sql)
+		if err == nil {
+			t.Fatalf("%q succeeded, want a primary-key rejection", sql)
+		}
+		if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			t.Fatalf("%q error = %v, want SQLSTATE 0A000", sql, err)
+		}
+		if !strings.Contains(err.Error(), "cannot assign primary key column") {
+			t.Fatalf("%q error = %v, want a primary-key assignment message", sql, err)
+		}
+	}
+
+	// No ghost row: the original row kept both its key and its value.
+	if res := execMust(t, e, "SELECT a, b, v FROM pairs"); res.RowCount != 1 || res.Rows[0][0] != "x" || res.Rows[0][1] != "y" || res.Rows[0][2] != "one" {
+		t.Fatalf("rows after rejected upserts = %#v, want the original ('x','y','one')", res.Rows)
+	}
+	if res := execMust(t, e, "SELECT v FROM pairs WHERE a = 'x' AND b = 'y'"); res.RowCount != 1 || res.Rows[0][0] != "one" {
+		t.Fatalf("full-key read after rejected upserts = %#v", res.Rows)
+	}
+	execMust(t, e, "UPDATE pairs SET v = 'updated' WHERE a = 'x' AND b = 'y'")
+	if res := execMust(t, e, "SELECT count(*) FROM pairs"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("row count after full-key update = %v, want 1 (no split row)", res.Rows[0][0])
+	}
+
+	// A single-column key gets the same rejection.
+	execMust(t, e, "CREATE TABLE single (id INTEGER PRIMARY KEY, v TEXT)")
+	execMust(t, e, "INSERT INTO single (v) VALUES ('one')")
+	if _, err := execSQL(e, "INSERT INTO single (id, v) VALUES (1, 'two') ON CONFLICT (id) DO UPDATE SET id = excluded.id"); err == nil {
+		t.Fatal("single-column upsert key assignment succeeded, want a rejection")
+	} else if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+		t.Fatalf("single-column upsert error = %v, want SQLSTATE 0A000", err)
+	}
+}
+
+// A key column that takes its value from a constant DEFAULT must be resolved
+// before conflict matching, otherwise the candidate key is encoded from a
+// missing component and the upsert misses its own row.
+func TestUpsertWithConstantDefaultKeyColumns(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE konst (a TEXT DEFAULT 'd', b TEXT DEFAULT 'e', v TEXT, PRIMARY KEY (a, b))")
+
+	execMust(t, e, "INSERT INTO konst (b, v) VALUES ('y', 'two')")
+	if res := execMust(t, e, "SELECT a, b, v FROM konst"); res.RowCount != 1 || res.Rows[0][0] != "d" || res.Rows[0][1] != "y" {
+		t.Fatalf("defaulted key row = %#v, want ('d','y')", res.Rows)
+	}
+
+	// DO UPDATE hits the row whose key came from the DEFAULT.
+	execMust(t, e, "INSERT INTO konst (b, v) VALUES ('y', 'updated') ON CONFLICT (a, b) DO UPDATE SET v = excluded.v")
+	if res := execMust(t, e, "SELECT v FROM konst WHERE a = 'd' AND b = 'y'"); res.RowCount != 1 || res.Rows[0][0] != "updated" {
+		t.Fatalf("DO UPDATE result = %#v, want one row 'updated'", res.Rows)
+	}
+	// DO NOTHING suppresses the duplicate.
+	execMust(t, e, "INSERT INTO konst (b, v) VALUES ('y', 'ignored') ON CONFLICT (a, b) DO NOTHING")
+	if res := execMust(t, e, "SELECT v FROM konst WHERE a = 'd' AND b = 'y'"); res.RowCount != 1 || res.Rows[0][0] != "updated" {
+		t.Fatalf("DO NOTHING result = %#v, want the existing 'updated' row", res.Rows)
+	}
+	// Targetless ON CONFLICT uses the defaulted key too.
+	execMust(t, e, "INSERT INTO konst (b, v) VALUES ('y', 'ignored') ON CONFLICT DO NOTHING")
+	if res := execMust(t, e, "SELECT count(*) FROM konst"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("targetless DO NOTHING inserted a row: count = %v", res.Rows[0][0])
+	}
+	// INSERT OR REPLACE replaces the defaulted-key row instead of duplicating it.
+	execMust(t, e, "INSERT OR REPLACE INTO konst (b, v) VALUES ('y', 'replaced')")
+	if res := execMust(t, e, "SELECT count(*) FROM konst"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("OR REPLACE left %v rows, want 1", res.Rows[0][0])
+	}
+	if res := execMust(t, e, "SELECT v FROM konst WHERE a = 'd' AND b = 'y'"); res.RowCount != 1 || res.Rows[0][0] != "replaced" {
+		t.Fatalf("OR REPLACE result = %#v, want one row 'replaced'", res.Rows)
+	}
+
+	// A single-column TEXT key with a DEFAULT follows the same path and must not
+	// fall back to an engine-assigned rowid key.
+	execMust(t, e, "CREATE TABLE single (id TEXT DEFAULT 'k', v TEXT, PRIMARY KEY (id))")
+	execMust(t, e, "INSERT INTO single (v) VALUES ('a')")
+	if res := execMust(t, e, "SELECT id FROM single"); res.RowCount != 1 || res.Rows[0][0] != "k" {
+		t.Fatalf("single defaulted key = %#v, want one row with id 'k'", res.Rows)
+	}
+	execMust(t, e, "INSERT INTO single (v) VALUES ('b') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+	if res := execMust(t, e, "SELECT v FROM single"); res.RowCount != 1 || res.Rows[0][0] != "b" {
+		t.Fatalf("single DO UPDATE = %#v, want one row 'b'", res.Rows)
+	}
+	execMust(t, e, "INSERT INTO single (v) VALUES ('c') ON CONFLICT DO NOTHING")
+	if res := execMust(t, e, "SELECT count(*) FROM single"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("single targetless DO NOTHING count = %v, want 1", res.Rows[0][0])
+	}
+	execMust(t, e, "INSERT OR REPLACE INTO single (v) VALUES ('d')")
+	if res := execMust(t, e, "SELECT v FROM single"); res.RowCount != 1 || res.Rows[0][0] != "d" {
+		t.Fatalf("single OR REPLACE = %#v, want one row 'd'", res.Rows)
+	}
+}
+
+func TestAlterTableAddColumnPrimaryKeyRejected(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE t (a TEXT)")
+	execMust(t, e, "INSERT INTO t (a) VALUES ('x')")
+
+	_, err := execSQL(e, "ALTER TABLE t ADD COLUMN id INTEGER PRIMARY KEY")
+	if err == nil {
+		t.Fatal("ALTER TABLE ADD COLUMN PRIMARY KEY succeeded, want a rejection")
+	}
+	if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+		t.Fatalf("error = %v, want SQLSTATE 0A000", err)
+	}
+	if !strings.Contains(err.Error(), "cannot declare PRIMARY KEY") {
+		t.Fatalf("error = %v, want an ADD COLUMN PRIMARY KEY message", err)
+	}
+	got, err := schema.GetSchema("t")
+	if err != nil {
+		t.Fatalf("get schema: %v", err)
+	}
+	if _, exists := got.GetColumn("id"); exists {
+		t.Fatal("rejected ADD COLUMN published the column")
+	}
+}
+
+func TestGeneratedColumnInPrimaryKeyRejected(t *testing.T) {
+	for _, sql := range []string{
+		"CREATE TABLE g (a TEXT, b TEXT GENERATED ALWAYS AS (a) STORED, PRIMARY KEY (b))",
+		"CREATE TABLE g (a TEXT, b TEXT GENERATED ALWAYS AS (a) STORED PRIMARY KEY)",
+	} {
+		_, schema, table := newTestDB(t)
+		e := newExec(schema, table)
+		_, err := execSQL(e, sql)
+		if err == nil {
+			t.Fatalf("%q succeeded, want a generated-column rejection", sql)
+		}
+		if !errors.Is(err, pgerror.ErrFeatureNotSupported) {
+			t.Fatalf("%q error = %v, want SQLSTATE 0A000", sql, err)
+		}
+		if !strings.Contains(err.Error(), "cannot be part of a PRIMARY KEY") {
+			t.Fatalf("%q error = %v, want a PRIMARY KEY message", sql, err)
+		}
+		if schema.TableExists("g") {
+			t.Fatalf("%q left a schema behind", sql)
+		}
+	}
+}
+
+// RETURNING must observe key components that the storage layer resolved from a
+// catalog DEFAULT; the candidate row does not carry them until then.
+func TestCompositePrimaryKeyReturningWithDefaultedKey(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE pairs (a TEXT DEFAULT 'd', b TEXT DEFAULT 'e', v TEXT, PRIMARY KEY (a, b))")
+
+	res := execMust(t, e, "INSERT INTO pairs (v) VALUES ('one') RETURNING a, b, v")
+	if res.RowCount != 1 || res.Rows[0][0] != "d" || res.Rows[0][1] != "e" || res.Rows[0][2] != "one" {
+		t.Fatalf("RETURNING = %#v, want ('d','e','one')", res.Rows)
+	}
+
+	// A partially defaulted key also returns the stored values.
+	res = execMust(t, e, "INSERT INTO pairs (b, v) VALUES ('y', 'two') RETURNING *")
+	if res.RowCount != 1 {
+		t.Fatalf("RETURNING * rows = %d, want 1", res.RowCount)
+	}
+	values := map[string]interface{}{}
+	for i, name := range res.Columns {
+		values[name] = res.Rows[0][i]
+	}
+	if values["a"] != "d" || values["b"] != "y" || values["v"] != "two" {
+		t.Fatalf("RETURNING * row = %#v, want a='d' b='y' v='two'", values)
+	}
+}
+
+// ON CONFLICT targets address the key column set, not its declaration order:
+// (b, a) and (a, b) name the same PRIMARY KEY (a, b). SQLite requires the
+// constraint's order; this engine already accepts arbitrary target lists and
+// documents the set match here.
+func TestOnConflictReorderedPrimaryKeyTarget(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE pairs (a TEXT, b TEXT, v TEXT, PRIMARY KEY (a, b))")
+	execMust(t, e, "INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'one')")
+
+	execMust(t, e, "INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'two') ON CONFLICT (b, a) DO UPDATE SET v = excluded.v")
+	res := execMust(t, e, "SELECT count(*) FROM pairs")
+	if res.Rows[0][0] != int64(1) {
+		t.Fatalf("reordered target left %v rows, want 1", res.Rows[0][0])
+	}
+	res = execMust(t, e, "SELECT v FROM pairs WHERE a = 'x' AND b = 'y'")
+	if res.RowCount != 1 || res.Rows[0][0] != "two" {
+		t.Fatalf("reordered target result = %#v, want the updated row 'two'", res.Rows)
+	}
+
+	execMust(t, e, "INSERT INTO pairs (a, b, v) VALUES ('x', 'y', 'three') ON CONFLICT (b, a) DO NOTHING")
+	res = execMust(t, e, "SELECT v FROM pairs WHERE a = 'x' AND b = 'y'")
+	if res.RowCount != 1 || res.Rows[0][0] != "two" {
+		t.Fatalf("reordered DO NOTHING result = %#v, want the existing 'two' row", res.Rows)
+	}
+}
+
+// A composite primary key must coexist with scan-validated UNIQUE indexes:
+// key moves keep index lookups correct, ON CONFLICT (unique_col) upserts the
+// row, and INSERT OR REPLACE resolves both the unique index and the primary key.
+func TestCompositePrimaryKeyWithUniqueIndex(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE members (org TEXT, user_id INTEGER, email TEXT UNIQUE, v TEXT, PRIMARY KEY (org, user_id))")
+	execMust(t, e, "INSERT INTO members (org, user_id, email, v) VALUES ('o', 1, 'a@x', 'one')")
+
+	// ON CONFLICT (unique_col) updates the row under its composite key.
+	execMust(t, e, "INSERT INTO members (org, user_id, email, v) VALUES ('o', 1, 'a@x', 'two') ON CONFLICT (email) DO UPDATE SET v = excluded.v")
+	if res := execMust(t, e, "SELECT v FROM members WHERE org = 'o' AND user_id = 1"); res.RowCount != 1 || res.Rows[0][0] != "two" {
+		t.Fatalf("unique-target upsert = %#v, want one row 'two'", res.Rows)
+	}
+
+	// A unique conflict on a different key is suppressed by DO NOTHING.
+	execMust(t, e, "INSERT INTO members (org, user_id, email, v) VALUES ('o', 2, 'a@x', 'duplicate email') ON CONFLICT (email) DO NOTHING")
+	if res := execMust(t, e, "SELECT count(*) FROM members"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("unique DO NOTHING count = %v, want 1", res.Rows[0][0])
+	}
+
+	// Moving a key component keeps the unique index entry attached to the row.
+	execMust(t, e, "UPDATE members SET user_id = 3 WHERE org = 'o' AND user_id = 1")
+	if res := execMust(t, e, "SELECT v FROM members WHERE org = 'o' AND user_id = 3"); res.RowCount != 1 || res.Rows[0][0] != "two" {
+		t.Fatalf("row after key move = %#v, want one row 'two'", res.Rows)
+	}
+	if res := execMust(t, e, "SELECT v FROM members WHERE email = 'a@x'"); res.RowCount != 1 || res.Rows[0][0] != "two" {
+		t.Fatalf("unique index after key move = %#v, want one row 'two'", res.Rows)
+	}
+
+	// OR REPLACE resolves the unique index by removing the old row and keeping
+	// exactly the new key.
+	execMust(t, e, "INSERT OR REPLACE INTO members (org, user_id, email, v) VALUES ('o', 9, 'a@x', 'replaced')")
+	if res := execMust(t, e, "SELECT count(*) FROM members"); res.Rows[0][0] != int64(1) {
+		t.Fatalf("unique OR REPLACE count = %v, want 1", res.Rows[0][0])
+	}
+	if res := execMust(t, e, "SELECT v FROM members WHERE org = 'o' AND user_id = 9"); res.RowCount != 1 || res.Rows[0][0] != "replaced" {
+		t.Fatalf("unique OR REPLACE row = %#v, want one row 'replaced'", res.Rows)
+	}
+	if res := execMust(t, e, "SELECT v FROM members WHERE org = 'o' AND user_id = 3"); res.RowCount != 0 {
+		t.Fatalf("old composite key still resolves %d rows", res.RowCount)
+	}
+
+	// OR REPLACE resolving the primary key works with a unique index present.
+	execMust(t, e, "INSERT OR REPLACE INTO members (org, user_id, email, v) VALUES ('o', 9, 'b@x', 'key replaced')")
+	if res := execMust(t, e, "SELECT email, v FROM members WHERE org = 'o' AND user_id = 9"); res.RowCount != 1 || res.Rows[0][0] != "b@x" || res.Rows[0][1] != "key replaced" {
+		t.Fatalf("PK OR REPLACE row = %#v, want ('b@x','key replaced')", res.Rows)
+	}
+	if res := execMust(t, e, "SELECT v FROM members WHERE email = 'a@x'"); res.RowCount != 0 {
+		t.Fatalf("stale unique index entry still resolves %d rows", res.RowCount)
+	}
+}
+
+// A composite table has no INTEGER PRIMARY KEY alias, so last_insert_rowid()
+// reports the engine-assigned hidden rowid and advances per inserted row.
+func TestLastInsertRowIDOnCompositeTable(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE pairs (a TEXT, b TEXT, PRIMARY KEY (a, b))")
+
+	res := execMust(t, e, "INSERT INTO pairs (a, b) VALUES ('x', 'y')")
+	if res.LastInsertID != 1 {
+		t.Fatalf("first LastInsertID = %d, want 1", res.LastInsertID)
+	}
+	if res := execMust(t, e, "SELECT last_insert_rowid()"); res.RowCount != 1 || res.Rows[0][0] != int64(1) {
+		t.Fatalf("last_insert_rowid() = %#v, want 1", res.Rows)
+	}
+
+	res = execMust(t, e, "INSERT INTO pairs (a, b) VALUES ('x', 'z')")
+	if res.LastInsertID != 2 {
+		t.Fatalf("second LastInsertID = %d, want 2", res.LastInsertID)
+	}
+	if res := execMust(t, e, "SELECT last_insert_rowid()"); res.RowCount != 1 || res.Rows[0][0] != int64(2) {
+		t.Fatalf("last_insert_rowid() after second insert = %#v, want 2", res.Rows)
+	}
+
+	// A suppressed conflict does not advance last_insert_rowid().
+	execMust(t, e, "INSERT INTO pairs (a, b) VALUES ('x', 'z') ON CONFLICT (a, b) DO NOTHING")
+	if res := execMust(t, e, "SELECT last_insert_rowid()"); res.Rows[0][0] != int64(2) {
+		t.Fatalf("last_insert_rowid() after upsert = %v, want 2", res.Rows[0][0])
+	}
+}

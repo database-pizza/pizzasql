@@ -1,6 +1,7 @@
 package pgserver
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -79,10 +80,53 @@ func TestCompositePrimaryKeyDDLRejections(t *testing.T) {
 		"CREATE TABLE t1 (a TEXT PRIMARY KEY, b TEXT PRIMARY KEY)",
 		"CREATE TABLE t2 (a TEXT PRIMARY KEY, b TEXT, PRIMARY KEY (b))",
 		"CREATE TABLE t3 (a TEXT, PRIMARY KEY (a, a))",
+		"CREATE TABLE t4 (a TEXT, b TEXT GENERATED ALWAYS AS (a) STORED, PRIMARY KEY (b))",
+		"CREATE TABLE t5 (a TEXT)",
+		"ALTER TABLE t5 ADD COLUMN id INTEGER PRIMARY KEY",
 	} {
 		msgs := runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(sql), 0)})
+		if strings.HasPrefix(sql, "CREATE TABLE t5") {
+			if code := errorCode(msgs[0]); code != "" {
+				t.Fatalf("%s SQLSTATE = %q, want success", sql, code)
+			}
+			continue
+		}
 		if code := errorCode(msgs[0]); code != ErrCodeFeatureNotSupported {
 			t.Fatalf("%s SQLSTATE = %q, want 0A000", sql, code)
 		}
+	}
+}
+
+// A key column that takes its value from a constant DEFAULT must resolve before
+// conflict matching, including over the wire.
+func TestCompositePrimaryKeyDefaultedKeyUpsertOverWire(t *testing.T) {
+	c, client := newDataConnection(t)
+	query := func(sql string) []*Message {
+		return runQuery(t, c, client, &Message{Type: MsgQuery, Data: append([]byte(sql), 0)})
+	}
+
+	query("CREATE TABLE konst (a TEXT DEFAULT 'd', b TEXT DEFAULT 'e', v TEXT, PRIMARY KEY (a, b))")
+	query("INSERT INTO konst (b, v) VALUES ('y', 'one')")
+	if code := errorCode(query("INSERT INTO konst (b, v) VALUES ('y', 'two') ON CONFLICT (a, b) DO UPDATE SET v = excluded.v")[0]); code != "" {
+		t.Fatalf("defaulted-key upsert SQLSTATE = %q, want success", code)
+	}
+
+	rows := query("SELECT v FROM konst WHERE a = 'd' AND b = 'y'")
+	var dataRows []*Message
+	for _, msg := range rows {
+		if msg.Type == MsgDataRow {
+			dataRows = append(dataRows, msg)
+		}
+	}
+	if len(dataRows) != 1 {
+		t.Fatalf("upsert read returned %d rows, want 1", len(dataRows))
+	}
+	if values := dataRowValues(t, dataRows[0]); len(values) != 1 || values[0] != "two" {
+		t.Fatalf("upsert result = %v, want [two]", values)
+	}
+
+	// Assigning a key column is rejected, not applied as a ghost row.
+	if code := errorCode(query("INSERT INTO konst (b, v) VALUES ('y', 'x') ON CONFLICT (a, b) DO UPDATE SET a = 'other'")[0]); code != ErrCodeFeatureNotSupported {
+		t.Fatalf("key-assignment upsert SQLSTATE = %q, want 0A000", code)
 	}
 }

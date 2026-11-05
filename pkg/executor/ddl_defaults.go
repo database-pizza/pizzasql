@@ -154,29 +154,41 @@ func evalDefaultExpressionAt(text string, now time.Time) (interface{}, error) {
 	return nil, pgerror.Unsupported("stored DEFAULT expression %q is not supported", text)
 }
 
-// statementDefaults evaluates every expression default in the schema once for
-// the statement. A multi-row INSERT therefore stamps all its rows with one
-// value, while a later statement reads the clock again. Constant defaults stay
-// in the catalog and are applied by the storage layer.
+// statementDefaults resolves every default in the schema for the statement.
+// Expression defaults are evaluated once, so a multi-row INSERT stamps all its
+// rows with one value while a later statement reads the clock again. Constant
+// catalog defaults are included too: the conflict-matching and RETURNING paths
+// inspect the candidate row before storage fills missing columns, so a key
+// column that comes from a DEFAULT must already be present in it.
 func (e *Executor) statementDefaults(schema *storage.Schema) (map[string]interface{}, error) {
 	// One instant per statement: two clock-default columns in the same row must
 	// not disagree because the loop sampled the clock twice. The clock is read
 	// lazily so a schema without expression defaults never samples it.
 	var now time.Time
+	sampledClock := false
 	var defaults map[string]interface{}
+	add := func(name string, value interface{}) {
+		if defaults == nil {
+			defaults = make(map[string]interface{})
+		}
+		defaults[name] = value
+	}
 	for _, column := range schema.Columns {
 		if column.DefaultExpr == "" {
+			if column.Default != nil {
+				add(column.Name, column.Default)
+			}
 			continue
 		}
-		if defaults == nil {
+		if !sampledClock {
 			now = e.statementNow()
-			defaults = make(map[string]interface{})
+			sampledClock = true
 		}
 		value, err := evalDefaultExpressionAt(column.DefaultExpr, now)
 		if err != nil {
 			return nil, fmt.Errorf("evaluate DEFAULT for column %q: %w", column.Name, err)
 		}
-		defaults[column.Name] = value
+		add(column.Name, value)
 	}
 	return defaults, nil
 }
@@ -191,8 +203,8 @@ func (e *Executor) statementNow() time.Time {
 	return time.Now().UTC()
 }
 
-// applyRowDefaults fills the expression-defaulted columns a statement omitted.
-// An explicit NULL is already present in the row, so it wins over the default.
+// applyRowDefaults fills the defaulted columns a statement omitted. An explicit
+// NULL is already present in the row, so it wins over the default.
 func applyRowDefaults(row storage.Row, defaults map[string]interface{}) {
 	for name, value := range defaults {
 		if _, present := lookupRowValue(row, name); present {
