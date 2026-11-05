@@ -117,8 +117,9 @@ func TestArrayParameterOverExtendedQuery(t *testing.T) {
 		t.Fatalf("text[] ANY($1) returned %v", row)
 	}
 
-	// An unspecified parameter OID keeps the array literal untyped; ANY still
-	// reads it as array text, which is what drivers that omit OIDs rely on.
+	// With no declared OID the server infers int4[] from id = ANY($1). The
+	// text-format value still binds as array text, which is what drivers that
+	// send text parameters rely on.
 	conn.reset()
 	messages = runExtendedParseBindExecute(t, c, conn, `SELECT id FROM t WHERE id = ANY($1) ORDER BY id`, 0, "{2,3}")
 	if errMsg := findError(messages); errMsg != nil {
@@ -227,31 +228,44 @@ func TestArrayResultMetadataOIDs(t *testing.T) {
 	}
 }
 
-func TestArrayParameterBinaryFormatRejected(t *testing.T) {
+// A binary int4[] parameter is decoded from PostgreSQL's array envelope, so
+// drivers that always encode arrays in binary (pgx) can bind ANY($1).
+func TestArrayParameterBinaryFormatAccepted(t *testing.T) {
 	c, conn := arrayConnection(t)
-	if _, err := c.executor.Execute(parseStmt(t, `CREATE TABLE t (id INTEGER PRIMARY KEY)`)); err != nil {
-		t.Fatal(err)
+	for _, sql := range []string{
+		`CREATE TABLE t (id INTEGER PRIMARY KEY)`,
+		`INSERT INTO t VALUES (1), (2), (3)`,
+	} {
+		if _, err := c.executor.Execute(parseStmt(t, sql)); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
 	}
 
 	parse := NewMessageBuilder()
 	parse.WriteString("s1")
-	parse.WriteString(`SELECT id FROM t WHERE id = ANY($1)`)
+	parse.WriteString(`SELECT id FROM t WHERE id = ANY($1) ORDER BY id`)
 	parse.WriteInt16(1)
 	parse.WriteInt32(1007) // int4[]
 
+	value := encodeBinaryArray(23, [][]byte{encodeInt4(1), encodeInt4(3)})
 	bind := NewMessageBuilder()
 	bind.WriteString("p1")
 	bind.WriteString("s1")
 	bind.WriteInt16(1) // one parameter format code
 	bind.WriteInt16(1) // binary
 	bind.WriteInt16(1) // one parameter
-	bind.WriteInt32(8)
-	bind.WriteBytes([]byte{0, 0, 0, 1, 0, 0, 0, 2})
+	bind.WriteInt32(int32(len(value)))
+	bind.WriteBytes(value)
 	bind.WriteInt16(0)
+
+	execute := NewMessageBuilder()
+	execute.WriteString("p1")
+	execute.WriteInt32(0)
 
 	for _, msg := range []*Message{
 		{Type: MsgParse, Data: parse.Bytes()},
 		{Type: MsgBind, Data: bind.Bytes()},
+		{Type: MsgExecute, Data: execute.Bytes()},
 		{Type: MsgSync},
 	} {
 		if err := c.handleMessage(msg); err != nil {
@@ -259,12 +273,17 @@ func TestArrayParameterBinaryFormatRejected(t *testing.T) {
 		}
 	}
 	messages := readAllMessages(t, conn.bytes())
-	errMsg := findError(messages)
-	if errMsg == nil {
-		t.Fatal("binary array parameter was accepted")
+	if errMsg := findError(messages); errMsg != nil {
+		t.Fatalf("binary array parameter failed: %s", errorCode(errMsg))
 	}
-	if code := errorCode(errMsg); code != ErrCodeFeatureNotSupported {
-		t.Fatalf("binary array error code = %q, want %q", code, ErrCodeFeatureNotSupported)
+	rows := [][]string{}
+	for _, message := range messages {
+		if message.Type == MsgDataRow {
+			rows = append(rows, dataRowValues(t, message))
+		}
+	}
+	if len(rows) != 2 || rows[0][0] != "1" || rows[1][0] != "3" {
+		t.Fatalf("binary ANY($1) rows = %v, want [[1] [3]]", rows)
 	}
 }
 
@@ -327,7 +346,8 @@ func TestArraySubscriptParameterBinding(t *testing.T) {
 		t.Fatalf("tags[$1] row = %v, want [b]", row)
 	}
 
-	// An untyped parameter binds the same way.
+	// A parameter with no declared OID is inferred as INTEGER from the
+	// subscript and binds the same way.
 	conn.reset()
 	messages = runExtendedParseBindExecute(t, c, conn, `SELECT tags[$1] FROM t`, 0, "3")
 	if errMsg := findError(messages); errMsg != nil {

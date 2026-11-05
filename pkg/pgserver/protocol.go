@@ -84,6 +84,7 @@ const (
 const (
 	ErrCodeSuccess              = "00000"
 	ErrCodeSyntaxError          = "42601"
+	ErrCodeProgramLimitExceeded = "54000"
 	ErrCodeUndefinedTable       = "42P01"
 	ErrCodeUndefinedColumn      = "42703"
 	ErrCodeDuplicateTable       = "42P07"

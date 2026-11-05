@@ -160,7 +160,7 @@ func Current() *Document {
 			SQLiteCompat:   "3.35.0",
 			SimpleQuery:    true,
 			ExtendedQuery:  true,
-			Describe:       Feature{Supported: true, Status: "compatibility_no_data", Notes: "statement Describe returns ParameterDescription then NoData; portal Describe returns NoData; Execute still emits the real RowDescription"},
+			Describe:       Feature{Supported: true, Status: "compatibility_no_data", Notes: "statement Describe returns ParameterDescription with the negotiated parameter types (a client Parse OID wins; an OID of 0 is inferred from casts, comparisons, assignment targets, and ANY/ALL operands, and falls back to TEXT rather than 0) then NoData; portal Describe returns NoData without a ParameterDescription, matching PostgreSQL; Execute still emits the real RowDescription; a placeholder number above the 65535-parameter protocol limit fails Parse with 54000 before any allocation"},
 			BinaryResults:  Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "all-text result formats only; per-column format lists are also rejected"},
 			BoundedExecute: Feature{Supported: false, Status: "rejected", SQLState: "0A000", Notes: "Execute maxRows must be zero; portals are one-shot, not resumable"},
 			ProxyErrors:    true,
@@ -225,7 +225,7 @@ func Current() *Document {
 		Parameters: Parameters{
 			Positional:    true,
 			MaxOID:        "int8/text/bool/bytea/float plus OID 3802 jsonb and the array OIDs text[]/varchar[]/int4[]/int8[]/int2[]/bool[]/float4[]/float8[]/numeric[]",
-			Arrays:        Feature{Supported: true, Status: "text_format", SQLState: "0A000", Notes: "a text-format array parameter is bound as a typed array literal, so id = ANY($1) works with OIDs 1009 text[], 1015 varchar[], 1007 int4[], 1016 int8[], 1005 int2[], 1000 bool[], 1021 float4[], 1022 float8[], and 1231 numeric[]; elements are validated and canonicalized; binary-format array parameters are rejected with 0A000 instead of being misread"},
+			Arrays:        Feature{Supported: true, Status: "text_and_binary", SQLState: "0A000", Notes: "a text-format array parameter is bound as a typed array literal and a PostgreSQL binary array parameter is decoded from its envelope, so id = ANY($1) works with OIDs 1009 text[], 1015 varchar[], 1007 int4[], 1016 int8[], 1005 int2[], 1000 bool[], 1021 float4[], 1022 float8[], and 1231 numeric[]; elements are validated and canonicalized in both formats, and binary numeric elements are decoded exactly to decimal text; a malformed binary envelope reports 22P02 and a binary array with an unsupported element OID (for example bytea[] 1014 or date[] 1182) is rejected with 0A000 instead of being misread"},
 			BinaryNumeric: true,
 		},
 
