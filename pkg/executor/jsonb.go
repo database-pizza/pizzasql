@@ -765,10 +765,9 @@ func jsonbKeyExists(left, right interface{}) (interface{}, error) {
 			}
 		}
 		return false, nil
-	case string:
-		// A scalar JSON string counts as the key itself: '"x"' ? 'x' is true.
-		return value == key, nil
 	default:
+		// Scalar strings never match: jsonb_exists only looks at object keys and
+		// top-level string array elements.
 		return false, nil
 	}
 }
@@ -1572,6 +1571,24 @@ func (e *Executor) toJSONBNode(expr parser.Expr, value interface{}) (interface{}
 	return jsonbNodeFromSQLValue(value)
 }
 
+// jsonbPatchNode converts a JSON1 $ path patch value to a JSON tree node. A
+// float64 must become a json.Number before it reaches the encoder, and NaN and
+// infinity are rejected instead of producing invalid JSON.
+func jsonbPatchNode(value interface{}) (interface{}, error) {
+	switch typed := value.(type) {
+	case jsonText:
+		if node, err := jsonDecode(string(typed)); err == nil {
+			return node, nil
+		}
+		return string(typed), nil
+	case nil, bool, int, int8, int16, int32, int64,
+		uint, uint32, uint64, float32, float64, string, []byte:
+		return jsonbNodeFromSQLValue(value)
+	default:
+		return jsonArgToNode(value), nil
+	}
+}
+
 // evalJSONBPatch evaluates the jsonb_set/jsonb_insert/jsonb_replace/
 // jsonb_remove family. A $ path keeps the JSON1 semantics the engine already
 // exposed; a PostgreSQL text[] path uses PostgreSQL's jsonb_set/jsonb_insert
@@ -1651,7 +1668,7 @@ func (e *Executor) evalJSONBPatch(name string, fn *parser.FunctionCall, args []i
 			if e.isJSONBExpr(functionArgAt(fn, i+1)) {
 				patchValue, err = jsonbNodeFromArg(args[i+1])
 			} else {
-				patchValue = jsonArgToNode(args[i+1])
+				patchValue, err = jsonbPatchNode(args[i+1])
 			}
 			if err != nil {
 				return nil, err

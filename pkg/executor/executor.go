@@ -7186,7 +7186,13 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			condVal, _ := e.evalExprWithAggregates(when.Condition, rows)
 			var matched bool
 			if ex.Operand != nil {
-				matched = operand != nil && condVal != nil && compare(operand, condVal) == 0
+				if operand != nil && condVal != nil {
+					equal, cmpErr := e.compareExprValues(lexer.TokenEq, ex.Operand, when.Condition, operand, condVal)
+					if cmpErr != nil {
+						return nil, cmpErr
+					}
+					matched = equal
+				}
 			} else {
 				matched = toBool(condVal)
 			}
@@ -7217,6 +7223,10 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if err != nil {
 			return nil, err
 		}
+		left, right, err = e.canonicalizeArrayComparison(ex.Left, ex.Right, left, right)
+		if err != nil {
+			return nil, err
+		}
 		distinct := false
 		switch {
 		case left == nil && right == nil:
@@ -7224,7 +7234,11 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		case left == nil || right == nil:
 			distinct = true
 		default:
-			distinct = compare(left, right) != 0
+			equal, cmpErr := e.compareExprValues(lexer.TokenEq, ex.Left, ex.Right, left, right)
+			if cmpErr != nil {
+				return nil, cmpErr
+			}
+			distinct = !equal
 		}
 		if ex.Not {
 			return !distinct, nil

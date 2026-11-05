@@ -256,7 +256,7 @@ func TestJSONBIsAdvertised(t *testing.T) {
 	if !jsonb.Operators.Supported || jsonb.Operators.SQLState != pgerror.CodeDatatypeMismatch {
 		t.Fatalf("json.jsonb.operators = %+v", jsonb.Operators)
 	}
-	for _, want := range []string{"@>", "<@", "?|", "?&", "#>", "#>>", "#-", "||", "SQL NULL"} {
+	for _, want := range []string{"@>", "<@", "?|", "?&", "#>", "#>>", "#-", "||", "scalar string never matches", "SQL NULL"} {
 		if !strings.Contains(jsonb.Operators.Notes, want) {
 			t.Errorf("json.jsonb.operators notes do not mention %q", want)
 		}

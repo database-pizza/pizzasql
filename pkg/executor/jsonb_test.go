@@ -249,7 +249,7 @@ func TestJSONBContainmentAndExistence(t *testing.T) {
 		{`SELECT '{"a":1}'::jsonb ? 'b'`, false},
 		{`SELECT '[1,"x"]'::jsonb ? 'x'`, true},
 		{`SELECT '[1,"x"]'::jsonb ? '1'`, false},
-		{`SELECT '"x"'::jsonb ? 'x'`, true},
+		{`SELECT '"x"'::jsonb ? 'x'`, false},
 		{`SELECT 'null'::jsonb ? 'x'`, false},
 		{`SELECT '{"a":1,"b":2}'::jsonb ?| '{b,c}'`, true},
 		{`SELECT '{"a":1,"b":2}'::jsonb ?| '{c,d}'`, false},
@@ -367,6 +367,9 @@ func TestJSONBScalarFunctions(t *testing.T) {
 		{`SELECT jsonb_set('{"a":1}', '$.b', '2')`, `{"a":1,"b":"2"}`},
 		{`SELECT jsonb_set('{"a":1}', '$.a', '2')`, `{"a":"2"}`},
 		{`SELECT jsonb_set('{"a":1}', '$.b', '{"x":1}'::jsonb)`, `{"a":1,"b":{"x":1}}`},
+		{`SELECT jsonb_set('{"a":1}', '$.b', 1.5)`, `{"a":1,"b":1.5}`},
+		{`SELECT jsonb_insert('{}', '$.b', 2.5)`, `{"b":2.5}`},
+		{`SELECT jsonb_replace('{"b":0}', '$.b', 2.5)`, `{"b":2.5}`},
 		{`SELECT jsonb_insert('{"a":1}', '$.b', '2')`, `{"a":1,"b":"2"}`},
 		{`SELECT jsonb_replace('{"a":1}', '$.a', '2')`, `{"a":"2"}`},
 		{`SELECT jsonb_remove('{"a":1,"b":2}', '$.a')`, `{"b":2}`},
@@ -905,5 +908,57 @@ func TestJSONBTextSetReturningTypesOnNull(t *testing.T) {
 	res = execMust(t, e, `SELECT * FROM jsonb_array_elements_text(NULL)`)
 	if res.RowCount != 0 || len(res.ColumnTypes) != 1 || res.ColumnTypes[0] != "TEXT" {
 		t.Fatalf("jsonb_array_elements_text(NULL) = rows %d types %v, want 0 [TEXT]", res.RowCount, res.ColumnTypes)
+	}
+}
+
+// JSON1 $ path patch values may be non-integral numeric expressions. They are
+// normalized to json.Number before encoding, including values read from REAL
+// columns.
+func TestJSONBJSON1PatchFloatValues(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE realvals (id INTEGER PRIMARY KEY, r REAL)")
+	execMust(t, e, `INSERT INTO realvals VALUES (1, 1.5)`)
+
+	for _, tc := range []struct {
+		sql  string
+		want string
+	}{
+		{`SELECT jsonb_set('{"a":1}', '$.b', 1.5)`, `{"a":1,"b":1.5}`},
+		{`SELECT jsonb_set('{"a":1}', '$.b', 2.5)`, `{"a":1,"b":2.5}`},
+		{`SELECT jsonb_insert('{}', '$.b', 2.5)`, `{"b":2.5}`},
+		{`SELECT jsonb_replace('{"b":0}', '$.b', 2.5)`, `{"b":2.5}`},
+		{`SELECT jsonb_set('{"a":1}', '$.b', r) FROM realvals`, `{"a":1,"b":1.5}`},
+		{`SELECT jsonb_insert('{}', '$.b', r) FROM realvals`, `{"b":1.5}`},
+	} {
+		if got := jsonbValue(t, e, tc.sql); got != tc.want {
+			t.Errorf("%s = %v, want %s", tc.sql, got, tc.want)
+		}
+	}
+}
+
+// HAVING evaluates simple CASE and IS DISTINCT FROM through the aggregate
+// expression path; it must use the same exact jsonb comparison as the
+// top-level evaluators.
+func TestJSONBAggregateHavingExactJSONB(t *testing.T) {
+	_, schema, table := newTestDB(t)
+	e := newExec(schema, table)
+	execMust(t, e, "CREATE TABLE ex (id INTEGER PRIMARY KEY, doc JSONB)")
+	execMust(t, e, `INSERT INTO ex VALUES (1, '1'), (2, '1.0000000000000000001')`)
+
+	if got := jsonbValue(t, e, `SELECT COUNT(*) FROM ex GROUP BY doc HAVING '1'::jsonb IS DISTINCT FROM '1.0000000000000000001'::jsonb`); got != int64(1) {
+		t.Fatalf("HAVING IS DISTINCT FROM group count = %v, want 1", got)
+	}
+	res := execMust(t, e, `SELECT doc, COUNT(*) FROM ex GROUP BY doc HAVING '1'::jsonb IS DISTINCT FROM '1.0000000000000000001'::jsonb ORDER BY doc`)
+	if res.RowCount != 2 {
+		t.Fatalf("HAVING IS DISTINCT FROM rows = %v, want 2 groups", res.Rows)
+	}
+	res = execMust(t, e, `SELECT doc, COUNT(*) FROM ex GROUP BY doc HAVING '1'::jsonb IS NOT DISTINCT FROM '1.0000000000000000001'::jsonb`)
+	if res.RowCount != 0 {
+		t.Fatalf("HAVING IS NOT DISTINCT FROM rows = %v, want 0", res.Rows)
+	}
+	res = execMust(t, e, `SELECT doc, COUNT(*) FROM ex GROUP BY doc HAVING CASE '1'::jsonb WHEN '1.0000000000000000001'::jsonb THEN FALSE ELSE TRUE END ORDER BY doc`)
+	if res.RowCount != 2 {
+		t.Fatalf("HAVING CASE rows = %v, want 2 groups", res.Rows)
 	}
 }
